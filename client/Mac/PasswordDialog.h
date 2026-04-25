@@ -24,6 +24,7 @@
   @public
 	NSTextField *usernameText;
 	NSTextField *passwordText;
+	NSTextField *domainText;
 	NSTextField *messageLabel;
 	NSString *serverHostname;
 	NSString *username;
@@ -31,12 +32,13 @@
 	NSString *domain;
 	BOOL modalCode;
 }
-@property(retain) IBOutlet NSTextField *usernameText;
-@property(retain) IBOutlet NSTextField *passwordText;
-@property(retain) IBOutlet NSTextField *messageLabel;
+@property(retain) NSTextField *usernameText;
+@property(retain) NSTextField *passwordText;
+@property(retain) NSTextField *domainText;
+@property(retain) NSTextField *messageLabel;
 
-- (IBAction)onOK:(NSObject *)sender;
-- (IBAction)onCancel:(NSObject *)sender;
+- (void)onOK:(NSObject *)sender;
+- (void)onCancel:(NSObject *)sender;
 
 @property(retain) NSString *serverHostname;
 @property(retain) NSString *username;

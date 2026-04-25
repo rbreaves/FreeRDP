@@ -45,6 +45,7 @@ typedef struct
 	int client_y;
 	int client_width;
 	int client_height;
+	int fullscreen_mode;
 
 	HANDLE stopEvent;
 	HANDLE keyboardThread;

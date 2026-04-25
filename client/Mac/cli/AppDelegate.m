@@ -24,6 +24,7 @@ void AppDelegate_EmbedWindowEventHandler(void *context, const EmbedWindowEventAr
 void AppDelegate_ResizeWindowEventHandler(void *context, const ResizeWindowEventArgs *e);
 void mac_set_view_size(rdpContext *context, MRDPView *view);
 static void mac_position_window_top_left(NSWindow *window);
+static void mac_maximize_window_minus_menubar(NSWindow *window, MRDPView *view);
 static BOOL mac_is_point_on_left_screen_edge(NSPoint point);
 
 @interface MRDPClientWindow : NSWindow
@@ -121,6 +122,7 @@ static BOOL mac_is_point_on_left_screen_edge(NSPoint point);
 	if (!window || !context || !context->settings)
 		return;
 
+	mfContext *mfc = (mfContext *)context;
 	const BOOL decorated = freerdp_settings_get_bool(context->settings, FreeRDP_Decorations);
 	const BOOL fullscreen = freerdp_settings_get_bool(context->settings, FreeRDP_Fullscreen);
 	NSWindowStyleMask styleMask = NSWindowStyleMaskResizable;
@@ -145,7 +147,7 @@ static BOOL mac_is_point_on_left_screen_edge(NSPoint point);
 	[window setOpaque:NO];
 	[window setBackgroundColor:[NSColor clearColor]];
 
-	if (!decorated && !fullscreen)
+	if (!decorated && !fullscreen && mfc->fullscreen_mode != 2)
 		mac_position_window_top_left(window);
 }
 
@@ -418,6 +420,10 @@ static BOOL mac_is_point_on_left_screen_edge(NSPoint point);
 			j++;
 			mfc->chromaKeyTolerance = (float)atof(context->argv[j]);
 		}
+		else if (strcmp(context->argv[j], "/f:2") == 0 || strcmp(context->argv[j], "-f:2") == 0)
+		{
+			mfc->fullscreen_mode = 2;
+		}
 		else
 		{
 			context->argv[filtered_argc++] = context->argv[j];
@@ -595,6 +601,7 @@ void AppDelegate_ResizeWindowEventHandler(void *ctx, const ResizeWindowEventArgs
 
 void mac_set_view_size(rdpContext *context, MRDPView *view)
 {
+	mfContext *mfc = (mfContext *)context;
 	NSWindow *window = [view window];
 	// set client area to specified dimensions
 	NSRect innerRect;
@@ -611,7 +618,11 @@ void mac_set_view_size(rdpContext *context, MRDPView *view)
 	// set window to given area
 	[window setFrame:outerRect display:YES];
 
-	if (!freerdp_settings_get_bool(context->settings, FreeRDP_Decorations) &&
+	if (mfc->fullscreen_mode == 2)
+	{
+		mac_maximize_window_minus_menubar(window, view);
+	}
+	else if (!freerdp_settings_get_bool(context->settings, FreeRDP_Decorations) &&
 	    !freerdp_settings_get_bool(context->settings, FreeRDP_Fullscreen))
 	{
 		mac_position_window_top_left(window);
@@ -620,7 +631,7 @@ void mac_set_view_size(rdpContext *context, MRDPView *view)
 	// set window to front
 	[NSApp activateIgnoringOtherApps:YES];
 
-	if (freerdp_settings_get_bool(context->settings, FreeRDP_Fullscreen))
+	if (freerdp_settings_get_bool(context->settings, FreeRDP_Fullscreen) && mfc->fullscreen_mode != 2)
 		[window toggleFullScreen:nil];
 }
 
@@ -640,6 +651,30 @@ static void mac_position_window_top_left(NSWindow *window)
 	NSPoint topLeft = NSMakePoint(NSMinX(visibleFrame), NSMaxY(visibleFrame));
 	frame.origin.x = topLeft.x;
 	frame.origin.y = topLeft.y - NSHeight(frame);
+	[window setFrame:frame display:YES];
+}
+
+static void mac_maximize_window_minus_menubar(NSWindow *window, MRDPView *view)
+{
+	if (!window || !view)
+		return;
+
+	NSScreen *screen = [window screen];
+	if (!screen)
+		screen = [NSScreen mainScreen];
+	if (!screen)
+		return;
+
+	NSRect screenFrame = [screen frame];
+	NSRect visibleFrame = [screen visibleFrame];
+
+	NSRect frame = NSMakeRect(
+		NSMinX(visibleFrame),
+		NSMinY(visibleFrame),
+		NSWidth(visibleFrame),
+		NSHeight(visibleFrame)
+	);
+
 	[window setFrame:frame display:YES];
 }
 

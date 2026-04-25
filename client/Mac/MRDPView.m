@@ -106,14 +106,23 @@ static const NSEventMask MRDP_PASS_THROUGH_MONITOR_MASK =
 
 	NSScreen *screen = [[NSScreen screens] objectAtIndex:0];
 	NSRect screenFrame = [screen frame];
+	NSRect visibleFrame = [screen visibleFrame];
 
-	if (freerdp_settings_get_bool(settings, FreeRDP_Fullscreen))
+	if (freerdp_settings_get_bool(settings, FreeRDP_Fullscreen) && mfc->fullscreen_mode != 2)
 	{
 		if (!freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, screenFrame.size.width))
 			return -1;
 		if (!freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, screenFrame.size.height))
 			return -1;
 		[self enterFullScreenMode:[NSScreen mainScreen] withOptions:nil];
+	}
+	else if (mfc->fullscreen_mode == 2)
+	{
+		if (!freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, (UINT32)visibleFrame.size.width))
+			return -1;
+		if (!freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, (UINT32)visibleFrame.size.height))
+			return -1;
+		[self exitFullScreenModeWithOptions:nil];
 	}
 	else
 	{
