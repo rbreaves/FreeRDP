@@ -33,6 +33,8 @@
 #include <winpr/synch.h>
 #include <winpr/sysinfo.h>
 
+#include <math.h>
+#include <string.h>
 #include <freerdp/constants.h>
 
 #import "freerdp/freerdp.h"
@@ -244,6 +246,7 @@ DWORD WINAPI mac_client_thread(void *param)
 		[self addTrackingArea:trackingArea];
 		// Set the default cursor
 		currentCursor = [NSCursor arrowCursor];
+		[self setOpaque:NO];
 		initialized = YES;
 	}
 }
@@ -507,6 +510,8 @@ static DWORD fixKeyCode(DWORD keyCode, unichar keyChar, enum APPLE_KEYBOARD_TYPE
 	unichar keyChar;
 	NSString *characters;
 
+	NSLog(@"MRDPView keyDown called, is_connected=%d", is_connected);
+
 	if (!is_connected)
 		return;
 
@@ -684,6 +689,53 @@ static BOOL releaseFlagStates(rdpInput *input, UINT32 aKbdModFlags)
 	free(pixel_data);
 }
 
+- (CGImageRef)createChromaKeyImage
+{
+	if (!self->bitmap_context || !mfc->chromaKeyEnabled)
+		return CGBitmapContextCreateImage(self->bitmap_context);
+
+	rdpGdi *gdi = context->gdi;
+	uint32_t targetColor = mfc->chromaKeyColor;
+	float tolerance = mfc->chromaKeyTolerance;
+
+	uint8_t targetR = (targetColor >> 16) & 0xFF;
+	uint8_t targetG = (targetColor >> 8) & 0xFF;
+	uint8_t targetB = targetColor & 0xFF;
+
+	uint32_t *buffer = (uint32_t *)gdi->primary_buffer;
+	size_t pixelCount = gdi->width * gdi->height;
+	uint8_t *backup = (uint8_t *)malloc(pixelCount * sizeof(uint32_t));
+
+	if (!backup)
+		return CGBitmapContextCreateImage(self->bitmap_context);
+
+	memcpy(backup, buffer, pixelCount * sizeof(uint32_t));
+
+	for (size_t i = 0; i < pixelCount; i++)
+	{
+		uint32_t pixel = buffer[i];
+		uint8_t b = (pixel >> 0) & 0xFF;
+		uint8_t g = (pixel >> 8) & 0xFF;
+		uint8_t r = (pixel >> 16) & 0xFF;
+
+		float diffR = fabsf((float)r - (float)targetR);
+		float diffG = fabsf((float)g - (float)targetG);
+		float diffB = fabsf((float)b - (float)targetB);
+		float maxDiff = fmaxf(fmaxf(diffR, diffG), diffB);
+
+		if (maxDiff <= tolerance)
+		{
+			buffer[i] = 0x00000000;
+		}
+	}
+
+	CGImageRef cgImage = CGBitmapContextCreateImage(self->bitmap_context);
+	memcpy(buffer, backup, pixelCount * sizeof(uint32_t));
+	free(backup);
+
+	return cgImage;
+}
+
 - (void)drawRect:(NSRect)rect
 {
 	if (!context)
@@ -692,7 +744,7 @@ static BOOL releaseFlagStates(rdpInput *input, UINT32 aKbdModFlags)
 	if (self->bitmap_context)
 	{
 		CGContextRef cgContext = [[NSGraphicsContext currentContext] CGContext];
-		CGImageRef cgImage = CGBitmapContextCreateImage(self->bitmap_context);
+		CGImageRef cgImage = [self createChromaKeyImage];
 		CGContextSaveGState(cgContext);
 		CGContextClipToRect(
 		    cgContext, CGRectMake(rect.origin.x, rect.origin.y, rect.size.width, rect.size.height));
@@ -1382,7 +1434,7 @@ CGContextRef mac_create_bitmap_context(rdpContext *context)
 	{
 		bitmap_context = CGBitmapContextCreate(
 		    gdi->primary_buffer, gdi->width, gdi->height, 8, gdi->stride, colorSpace,
-		    kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst);
+		    kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
 	}
 
 	CGColorSpaceRelease(colorSpace);

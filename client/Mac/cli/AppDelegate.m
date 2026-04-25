@@ -14,12 +14,19 @@
 #import <winpr/assert.h>
 #import <freerdp/client/cmdline.h>
 
+#include <stdlib.h>
+#include <string.h>
+
 static AppDelegate *_singleDelegate = nil;
 void AppDelegate_ConnectionResultEventHandler(void *context, const ConnectionResultEventArgs *e);
 void AppDelegate_ErrorInfoEventHandler(void *ctx, const ErrorInfoEventArgs *e);
 void AppDelegate_EmbedWindowEventHandler(void *context, const EmbedWindowEventArgs *e);
 void AppDelegate_ResizeWindowEventHandler(void *context, const ResizeWindowEventArgs *e);
 void mac_set_view_size(rdpContext *context, MRDPView *view);
+
+@interface AppDelegate ()
+- (void)focusClientWindow;
+@end
 
 @implementation AppDelegate
 
@@ -38,6 +45,23 @@ void mac_set_view_size(rdpContext *context, MRDPView *view);
 	mfContext *mfc;
 	_singleDelegate = self;
 	[self CreateContext];
+
+	if (!window)
+	{
+		window = [[NSWindow alloc] initWithContentRect:NSMakeRect(100, 100, 1024, 768)
+		                                       styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+		                                                  NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
+		                                         backing:NSBackingStoreBuffered
+		                                           defer:NO];
+		[window setAcceptsMouseMovedEvents:YES];
+		[window setLevel:NSNormalWindowLevel];
+		[window setDelegate:self];
+		[window setOpaque:NO];
+		[window setBackgroundColor:[NSColor clearColor]];
+	}
+
+	[self focusClientWindow];
+
 	status = [self ParseCommandLineArguments];
 	mfc = (mfContext *)context;
 	WINPR_ASSERT(mfc);
@@ -95,6 +119,12 @@ void mac_set_view_size(rdpContext *context, MRDPView *view);
 - (void)applicationWillBecomeActive:(NSNotification *)notification
 {
 	[mrdpView resume];
+	[self focusClientWindow];
+}
+
+- (void)applicationDidBecomeActive:(NSNotification *)notification
+{
+	[self focusClientWindow];
 }
 
 - (void)applicationWillResignActive:(NSNotification *)notification
@@ -120,6 +150,36 @@ void mac_set_view_size(rdpContext *context, MRDPView *view);
 - (BOOL)applicationSupportsSecureRestorableState:(NSApplication *)app
 {
 	return YES;
+}
+
+- (void)windowDidBecomeKey:(NSNotification *)notification
+{
+	[self focusClientWindow];
+}
+
+- (void)focusClientWindow
+{
+	if (!window)
+		return;
+
+	[NSApp activateIgnoringOtherApps:YES];
+
+	if (![window isVisible])
+		[window orderFront:self];
+
+	if (![window isMainWindow])
+		[window makeMainWindow];
+
+	if (![window isKeyWindow])
+		[window makeKeyWindow];
+
+	if (mrdpView && ([window firstResponder] != mrdpView))
+	{
+		[window setInitialFirstResponder:mrdpView];
+		[window makeFirstResponder:mrdpView];
+	}
+
+	[[window contentView] setNeedsDisplay:YES];
 }
 
 - (int)ParseCommandLineArguments
@@ -148,11 +208,37 @@ void mac_set_view_size(rdpContext *context, MRDPView *view);
 		context->argv[i++] = cptr;
 	}
 
-	context->argc = i;
+	mfContext *mfc = (mfContext *)context;
+	int filtered_argc = 1;
+	for (int j = 1; j < i; j++)
+	{
+		if (strcmp(context->argv[j], "--chroma-key") == 0 && j + 1 < i)
+		{
+			mfc->chromaKeyEnabled = TRUE;
+			j++;
+			unsigned int colorVal;
+			if (sscanf(context->argv[j], "#%x", &colorVal) == 1 || sscanf(context->argv[j], "%x", &colorVal) == 1)
+			{
+				mfc->chromaKeyColor = colorVal;
+			}
+		}
+		else if (strcmp(context->argv[j], "--chroma-tolerance") == 0 && j + 1 < i)
+		{
+			j++;
+			mfc->chromaKeyTolerance = (float)atof(context->argv[j]);
+		}
+		else
+		{
+			context->argv[filtered_argc++] = context->argv[j];
+		}
+	}
+
+	context->argc = filtered_argc;
 	status = freerdp_client_settings_parse_command_line(context->settings, context->argc,
 	                                                    context->argv, FALSE);
 	freerdp_client_settings_command_line_status_print(context->settings, status, context->argc,
 	                                                  context->argv);
+
 	return status;
 }
 
@@ -279,11 +365,26 @@ void AppDelegate_EmbedWindowEventHandler(void *ctx, const EmbedWindowEventArgs *
 		if (_singleDelegate->window)
 		{
 			[[_singleDelegate->window contentView] addSubview:mfc->view];
-		}
 
-		dispatch_async(dispatch_get_main_queue(), ^{
-			mac_set_view_size(context, mfc->view);
-		});
+			dispatch_async(dispatch_get_main_queue(), ^{
+				[_singleDelegate focusClientWindow];
+
+				NSLog(@"Window: isKeyWindow=%d, isMainWindow=%d",
+					[_singleDelegate->window isKeyWindow],
+					[_singleDelegate->window isMainWindow]);
+				NSLog(@"View: acceptsFirstResponder=%d, isFirstResponder=%d",
+					[mfc->view acceptsFirstResponder],
+					[mfc->view isEqual:[_singleDelegate->window firstResponder]]);
+
+				mac_set_view_size(context, mfc->view);
+			});
+		}
+		else
+		{
+			dispatch_async(dispatch_get_main_queue(), ^{
+				mac_set_view_size(context, mfc->view);
+			});
+		}
 	}
 }
 

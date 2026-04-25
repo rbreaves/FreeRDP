@@ -81,6 +81,10 @@ typedef struct
 	int yMaxScroll;     // maximum vertical scroll value
 
 	CGEventFlags kbdFlags;
+
+	BOOL chromaKeyEnabled;
+	uint32_t chromaKeyColor;
+	float chromaKeyTolerance;
 } mfContext;
 
 #endif /* FREERDP_CLIENT_MAC_FREERDP_H */

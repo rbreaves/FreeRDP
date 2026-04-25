@@ -326,6 +326,9 @@ struct xf_context
 	bool exposeRequested;
 	GDI_RGN exposedArea;
 	Window exposedWindow;
+	BOOL chromaKeyEnabled;
+	UINT32 chromaKeyColor;
+	float chromaKeyTolerance;
 };
 
 BOOL xf_create_window(xfContext* xfc);

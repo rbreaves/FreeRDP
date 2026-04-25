@@ -10,7 +10,7 @@
 #import <MRDPView.h>
 #import <mfreerdp.h>
 
-@interface AppDelegate : NSObject <NSApplicationDelegate>
+@interface AppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
 {
   @public
 	NSWindow *window;

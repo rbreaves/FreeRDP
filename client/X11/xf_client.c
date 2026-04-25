@@ -403,6 +403,65 @@ static BOOL xf_desktop_resize(rdpContext* context)
 	return TRUE;
 }
 
+static void xf_apply_chroma_key(xfContext* xfc, const GDI_RGN* region, uint32_t* backup)
+{
+	rdpGdi* gdi = xfc->common.context.gdi;
+	uint32_t* buffer = (uint32_t*)gdi->primary_buffer;
+	const uint32_t targetColor = xfc->chromaKeyColor;
+	const float tolerance = xfc->chromaKeyTolerance;
+	const int imgWidth = gdi->width;
+
+	const uint8_t targetR = (uint8_t)((targetColor >> 16) & 0xFF);
+	const uint8_t targetG = (uint8_t)((targetColor >> 8) & 0xFF);
+	const uint8_t targetB = (uint8_t)(targetColor & 0xFF);
+
+	size_t k = 0;
+	for (int row = region->y; row < region->y + region->h; row++)
+	{
+		for (int col = region->x; col < region->x + region->w; col++)
+		{
+			const size_t idx = (size_t)row * (size_t)imgWidth + (size_t)col;
+			backup[k++] = buffer[idx];
+
+			const uint32_t pixel = buffer[idx];
+			uint8_t r, g, b;
+
+			if (xfc->invert)
+			{
+				/* BGRA32: memory [B,G,R,A] → uint32 = B | G<<8 | R<<16 | A<<24 */
+				b = (uint8_t)(pixel & 0xFF);
+				g = (uint8_t)((pixel >> 8) & 0xFF);
+				r = (uint8_t)((pixel >> 16) & 0xFF);
+			}
+			else
+			{
+				/* RGBA32: memory [R,G,B,A] → uint32 = R | G<<8 | B<<16 | A<<24 */
+				r = (uint8_t)(pixel & 0xFF);
+				g = (uint8_t)((pixel >> 8) & 0xFF);
+				b = (uint8_t)((pixel >> 16) & 0xFF);
+			}
+
+			const float maxDiff = fmaxf(fmaxf(fabsf((float)r - (float)targetR),
+			                                   fabsf((float)g - (float)targetG)),
+			                            fabsf((float)b - (float)targetB));
+			if (maxDiff <= tolerance)
+				buffer[idx] = 0x00000000;
+		}
+	}
+}
+
+static void xf_restore_chroma_key(xfContext* xfc, const GDI_RGN* region, const uint32_t* backup)
+{
+	rdpGdi* gdi = xfc->common.context.gdi;
+	uint32_t* buffer = (uint32_t*)gdi->primary_buffer;
+	const int imgWidth = gdi->width;
+
+	size_t k = 0;
+	for (int row = region->y; row < region->y + region->h; row++)
+		for (int col = region->x; col < region->x + region->w; col++)
+			buffer[(size_t)row * (size_t)imgWidth + (size_t)col] = backup[k++];
+}
+
 static BOOL xf_paint(xfContext* xfc, const GDI_RGN* region)
 {
 	WINPR_ASSERT(xfc);
@@ -420,10 +479,26 @@ static BOOL xf_paint(xfContext* xfc, const GDI_RGN* region)
 	}
 	else
 	{
+		uint32_t* backup = NULL;
+		if (xfc->chromaKeyEnabled)
+		{
+			const size_t count = (size_t)region->w * (size_t)region->h;
+			backup = (uint32_t*)malloc(count * sizeof(uint32_t));
+			if (backup)
+				xf_apply_chroma_key(xfc, region, backup);
+		}
+
 		LogDynAndXPutImage(xfc->log, xfc->display, xfc->primary, xfc->gc, xfc->image, region->x,
 		                   region->y, region->x, region->y,
 		                   WINPR_ASSERTING_INT_CAST(UINT16, region->w),
 		                   WINPR_ASSERTING_INT_CAST(UINT16, region->h));
+
+		if (backup)
+		{
+			xf_restore_chroma_key(xfc, region, backup);
+			free(backup);
+		}
+
 		xf_draw_screen(xfc, region->x, region->y, region->w, region->h);
 	}
 	return TRUE;
@@ -611,7 +686,7 @@ BOOL xf_create_window(xfContext* xfc)
 	const XSetWindowAttributes empty = WINPR_C_ARRAY_INIT;
 	xfc->attribs = empty;
 
-	if (xfc->remote_app)
+	if (xfc->remote_app || xfc->chromaKeyEnabled)
 		xfc->depth = 32;
 	else
 		xfc->depth = DefaultDepthOfScreen(xfc->screen);
@@ -626,10 +701,10 @@ BOOL xf_create_window(xfContext* xfc)
 	}
 	else
 	{
-		if (xfc->remote_app)
+		if (xfc->remote_app || xfc->chromaKeyEnabled)
 		{
-			WLog_WARN(TAG, "running in remote app mode, but XServer does not support transparency");
-			WLog_WARN(TAG, "display of remote applications might be distorted (black frames, ...)");
+			WLog_WARN(TAG, "transparency requested but XServer does not support depth 32");
+			WLog_WARN(TAG, "display may be distorted; chroma key transparency will not work");
 		}
 		xfc->depth = DefaultDepthOfScreen(xfc->screen);
 		xfc->visual = DefaultVisual(xfc->display, xfc->screen_number);
@@ -647,7 +722,8 @@ BOOL xf_create_window(xfContext* xfc)
 
 	if (!xfc->remote_app)
 	{
-		xfc->attribs.background_pixel = BlackPixelOfScreen(xfc->screen);
+		xfc->attribs.background_pixel =
+		    xfc->chromaKeyEnabled ? 0 : BlackPixelOfScreen(xfc->screen);
 		xfc->attribs.border_pixel = WhitePixelOfScreen(xfc->screen);
 		xfc->attribs.backing_store = xfc->primary ? NotUseful : Always;
 		xfc->attribs.override_redirect = False;

@@ -1,13 +1,6 @@
-//
-//  main.m
-//  MacClient2
-//
-//  Created by Benoît et Kathy on 2013-05-08.
-//
-//
-
 #import <Cocoa/Cocoa.h>
 #include <freerdp/client/cmdline.h>
+#import "AppDelegate.h"
 
 int main(int argc, char *argv[])
 {
@@ -21,6 +14,11 @@ int main(int argc, char *argv[])
 		}
 	}
 
-	const char **cargv = (const char **)argv;
-	return NSApplicationMain(argc, cargv);
+	NSApplication *app = [NSApplication sharedApplication];
+	[app setActivationPolicy:NSApplicationActivationPolicyRegular];
+	AppDelegate *delegate = [[AppDelegate alloc] init];
+	[app setDelegate:delegate];
+	[NSApp activateIgnoringOtherApps:YES];
+	[app run];
+	return 0;
 }

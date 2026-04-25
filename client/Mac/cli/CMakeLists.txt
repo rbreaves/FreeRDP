@@ -30,7 +30,7 @@ set(MACOSX_BUNDLE_COPYRIGHT "Copyright 2013-${VERSION_YEAR}. All Rights Reserved
 set(MACOSX_BUNDLE_NSMAIN_NIB_FILE "MainMenu")
 set(MACOSX_BUNDLE_NSPRINCIPAL_CLASS "NSApplication")
 
-set(XIBS MainMenu.xib)
+set(XIBS)  # XIB files require full Xcode (not CLT)
 
 set(SOURCES "")
 
@@ -64,23 +64,34 @@ target_link_libraries(
 )
 
 if(NOT IS_XCODE)
-  find_program(IBTOOL ibtool REQUIRED HINTS "/usr/bin" "${OSX_DEVELOPER_ROOT}/usr/bin")
+  find_program(IBTOOL ibtool HINTS "/usr/bin" "${OSX_DEVELOPER_ROOT}/usr/bin")
 
-  # Compile the .xib files using the 'ibtool' program with the destination being the app package
+  if(IBTOOL)
+    execute_process(COMMAND ${IBTOOL} -version RESULT_VARIABLE IBTOOL_RESULT OUTPUT_VARIABLE IBTOOL_OUTPUT ERROR_VARIABLE IBTOOL_ERROR)
+    if(NOT IBTOOL_RESULT EQUAL 0)
+      message(STATUS "ibtool found but not functional (full Xcode required, not CLT). Skipping XIB compilation.")
+      unset(IBTOOL)
+    endif()
+  endif()
 
-  foreach(xib ${XIBS})
-    get_filename_component(XIB_WE ${xib} NAME_WE)
-    set(NIB ${CMAKE_CURRENT_BINARY_DIR}/${XIB_WE}.nib)
-    list(APPEND NIBS ${NIB})
+  if(IBTOOL)
+    # Compile the .xib files using the 'ibtool' program with the destination being the app package
+    foreach(xib ${XIBS})
+      get_filename_component(XIB_WE ${xib} NAME_WE)
+      set(NIB ${CMAKE_CURRENT_BINARY_DIR}/${XIB_WE}.nib)
+      list(APPEND NIBS ${NIB})
 
-    add_custom_command(
-      TARGET ${PROJECT_NAME} POST_BUILD COMMAND ${IBTOOL} --errors --warnings --notices --output-format
-                                                human-readable-text --compile ${NIB} ${CMAKE_CURRENT_SOURCE_DIR}/${xib}
-      COMMENT "Compiling ${xib}"
-    )
-  endforeach()
+      add_custom_command(
+        TARGET ${PROJECT_NAME} POST_BUILD COMMAND ${IBTOOL} --errors --warnings --notices --output-format
+                                                  human-readable-text --compile ${NIB} ${CMAKE_CURRENT_SOURCE_DIR}/${xib}
+        COMMENT "Compiling ${xib}"
+      )
+    endforeach()
 
-  install(FILES ${NIBS} DESTINATION ${CMAKE_INSTALL_DATADIR})
+    install(FILES ${NIBS} DESTINATION ${CMAKE_INSTALL_DATADIR})
+  else()
+    message(STATUS "ibtool not found - skipping XIB compilation. Dialogs will not appear.")
+  endif()
 endif()
 
 install(TARGETS ${PROJECT_NAME} COMPONENT client RESOURCE DESTINATION ${CMAKE_INSTALL_DATADIR})

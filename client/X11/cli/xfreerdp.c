@@ -75,7 +75,38 @@ int main(int argc, char* argv[])
 	settings = context->settings;
 	xfc = (xfContext*)context;
 
-	status = freerdp_client_settings_parse_command_line(context->settings, argc, argv, FALSE);
+	{
+		int fargc = 0;
+		char** fargv = (char**)malloc(sizeof(char*) * (size_t)argc);
+		if (fargv)
+		{
+			for (int i = 0; i < argc; i++)
+			{
+				if (strcmp(argv[i], "--chroma-key") == 0 && i + 1 < argc)
+				{
+					xfc->chromaKeyEnabled = TRUE;
+					i++;
+					unsigned int colorVal = 0;
+					if (sscanf(argv[i], "#%x", &colorVal) == 1 ||
+					    sscanf(argv[i], "%x", &colorVal) == 1)
+						xfc->chromaKeyColor = (UINT32)colorVal;
+				}
+				else if (strcmp(argv[i], "--chroma-tolerance") == 0 && i + 1 < argc)
+				{
+					i++;
+					xfc->chromaKeyTolerance = (float)atof(argv[i]);
+				}
+				else
+				{
+					fargv[fargc++] = argv[i];
+				}
+			}
+			status = freerdp_client_settings_parse_command_line(settings, fargc, fargv, FALSE);
+			free(fargv);
+		}
+		else
+			status = freerdp_client_settings_parse_command_line(context->settings, argc, argv, FALSE);
+	}
 	if (status)
 	{
 		rc = freerdp_client_settings_command_line_status_print(settings, status, argc, argv);
