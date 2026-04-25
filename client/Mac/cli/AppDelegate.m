@@ -23,15 +23,48 @@ void AppDelegate_ErrorInfoEventHandler(void *ctx, const ErrorInfoEventArgs *e);
 void AppDelegate_EmbedWindowEventHandler(void *context, const EmbedWindowEventArgs *e);
 void AppDelegate_ResizeWindowEventHandler(void *context, const ResizeWindowEventArgs *e);
 void mac_set_view_size(rdpContext *context, MRDPView *view);
+static void mac_position_window_top_left(NSWindow *window);
+static BOOL mac_is_point_on_left_screen_edge(NSPoint point);
+
+@interface MRDPClientWindow : NSWindow
+@end
+
+@implementation MRDPClientWindow
+
+- (BOOL)canBecomeKeyWindow
+{
+	return YES;
+}
+
+- (BOOL)canBecomeMainWindow
+{
+	return YES;
+}
+
+@end
 
 @interface AppDelegate ()
+{
+	id leftEdgeMouseMonitor;
+	NSTimer *leftEdgeFocusTimer;
+}
+- (void)ensureClientWindow;
+- (void)startLeftEdgeFocusMonitor;
+- (void)stopLeftEdgeFocusMonitor;
+- (void)handleGlobalMouseEvent:(NSEvent *)event;
+- (void)cancelLeftEdgeFocusTimer;
+- (void)scheduleLeftEdgeFocusTimer;
+- (void)leftEdgeFocusTimerFired:(NSTimer *)timer;
 - (void)focusClientWindow;
+- (void)applyWindowDecorationsFromSettings;
 @end
 
 @implementation AppDelegate
 
 - (void)dealloc
 {
+	[self stopLeftEdgeFocusMonitor];
+	[self cancelLeftEdgeFocusTimer];
 	[super dealloc];
 }
 
@@ -39,20 +72,177 @@ void mac_set_view_size(rdpContext *context, MRDPView *view);
 
 @synthesize context = context;
 
+- (void)ensureClientWindow
+{
+	if ([window isKindOfClass:[MRDPClientWindow class]])
+		return;
+
+	NSRect contentRect = NSMakeRect(100, 100, 1024, 768);
+	NSWindowStyleMask styleMask = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+	                             NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable;
+	NSRect frameRect = NSZeroRect;
+	BOOL wasVisible = NO;
+
+	if (window)
+	{
+		contentRect = [window contentRectForFrameRect:[window frame]];
+		styleMask = [window styleMask];
+		frameRect = [window frame];
+		wasVisible = [window isVisible];
+	}
+
+	MRDPClientWindow *newWindow = [[MRDPClientWindow alloc] initWithContentRect:contentRect
+	                                                            styleMask:styleMask
+	                                                              backing:NSBackingStoreBuffered
+	                                                                defer:NO];
+	[newWindow setAcceptsMouseMovedEvents:YES];
+	[newWindow setLevel:NSNormalWindowLevel];
+	[newWindow setDelegate:self];
+	[newWindow setOpaque:NO];
+	[newWindow setBackgroundColor:[NSColor clearColor]];
+
+	if (!NSIsEmptyRect(frameRect))
+		[newWindow setFrame:frameRect display:NO];
+
+	if (window)
+	{
+		[window orderOut:self];
+		[window setDelegate:nil];
+	}
+
+	window = newWindow;
+
+	if (wasVisible)
+		[window orderFront:self];
+}
+
+- (void)applyWindowDecorationsFromSettings
+{
+	if (!window || !context || !context->settings)
+		return;
+
+	const BOOL decorated = freerdp_settings_get_bool(context->settings, FreeRDP_Decorations);
+	const BOOL fullscreen = freerdp_settings_get_bool(context->settings, FreeRDP_Fullscreen);
+	NSWindowStyleMask styleMask = NSWindowStyleMaskResizable;
+
+	if (decorated)
+	{
+		styleMask |= NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+		             NSWindowStyleMaskMiniaturizable;
+		[window setTitleVisibility:NSWindowTitleVisible];
+		[window setTitlebarAppearsTransparent:NO];
+	}
+	else
+	{
+		styleMask = NSWindowStyleMaskBorderless;
+		[window setTitleVisibility:NSWindowTitleHidden];
+		[window setTitlebarAppearsTransparent:YES];
+	}
+
+	[window setStyleMask:styleMask];
+	[window setMovable:decorated];
+	[window setMovableByWindowBackground:NO];
+	[window setOpaque:NO];
+	[window setBackgroundColor:[NSColor clearColor]];
+
+	if (!decorated && !fullscreen)
+		mac_position_window_top_left(window);
+}
+
+- (void)startLeftEdgeFocusMonitor
+{
+	if (leftEdgeMouseMonitor)
+		return;
+
+	leftEdgeMouseMonitor = [NSEvent
+	    addGlobalMonitorForEventsMatchingMask:(NSEventMaskMouseMoved | NSEventMaskLeftMouseDragged |
+	                                         NSEventMaskRightMouseDragged |
+	                                         NSEventMaskOtherMouseDragged)
+	                            handler:^(NSEvent *event) {
+		                            dispatch_async(dispatch_get_main_queue(), ^{
+			                            [self handleGlobalMouseEvent:event];
+		                            });
+	                            }];
+}
+
+- (void)stopLeftEdgeFocusMonitor
+{
+	if (!leftEdgeMouseMonitor)
+		return;
+
+	[NSEvent removeMonitor:leftEdgeMouseMonitor];
+	leftEdgeMouseMonitor = nil;
+}
+
+- (void)handleGlobalMouseEvent:(NSEvent *)event
+{
+	(void)event;
+
+	if ([NSApp isActive])
+	{
+		[self cancelLeftEdgeFocusTimer];
+		return;
+	}
+
+	if (mac_is_point_on_left_screen_edge([NSEvent mouseLocation]))
+		[self scheduleLeftEdgeFocusTimer];
+	else
+		[self cancelLeftEdgeFocusTimer];
+}
+
+- (void)cancelLeftEdgeFocusTimer
+{
+	if (!leftEdgeFocusTimer)
+		return;
+
+	[leftEdgeFocusTimer invalidate];
+	leftEdgeFocusTimer = nil;
+}
+
+- (void)scheduleLeftEdgeFocusTimer
+{
+	if (leftEdgeFocusTimer || [NSApp isActive])
+		return;
+
+	leftEdgeFocusTimer = [NSTimer scheduledTimerWithTimeInterval:0.5
+	                                                     target:self
+	                                                   selector:@selector(leftEdgeFocusTimerFired:)
+	                                                   userInfo:nil
+	                                                    repeats:NO];
+}
+
+- (void)leftEdgeFocusTimerFired:(NSTimer *)timer
+{
+	if (leftEdgeFocusTimer != timer)
+		return;
+
+	leftEdgeFocusTimer = nil;
+
+	if ([NSApp isActive])
+		return;
+
+	if (!mac_is_point_on_left_screen_edge([NSEvent mouseLocation]))
+		return;
+
+	[self focusClientWindow];
+}
+
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification
 {
 	int status;
 	mfContext *mfc;
 	_singleDelegate = self;
 	[self CreateContext];
+	[self ensureClientWindow];
 
 	if (!window)
 	{
-		window = [[NSWindow alloc] initWithContentRect:NSMakeRect(100, 100, 1024, 768)
-		                                       styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
-		                                                  NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
-		                                         backing:NSBackingStoreBuffered
-		                                           defer:NO];
+		window = [[MRDPClientWindow alloc]
+		    initWithContentRect:NSMakeRect(100, 100, 1024, 768)
+		            styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+		                       NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
+		              backing:NSBackingStoreBuffered
+		                defer:NO];
 		[window setAcceptsMouseMovedEvents:YES];
 		[window setLevel:NSNormalWindowLevel];
 		[window setDelegate:self];
@@ -60,11 +250,12 @@ void mac_set_view_size(rdpContext *context, MRDPView *view);
 		[window setBackgroundColor:[NSColor clearColor]];
 	}
 
-	[self focusClientWindow];
-
 	status = [self ParseCommandLineArguments];
 	mfc = (mfContext *)context;
 	WINPR_ASSERT(mfc);
+	[self applyWindowDecorationsFromSettings];
+	[self startLeftEdgeFocusMonitor];
+	[self focusClientWindow];
 
 	mfc->view = (void *)mrdpView;
 
@@ -404,6 +595,7 @@ void AppDelegate_ResizeWindowEventHandler(void *ctx, const ResizeWindowEventArgs
 
 void mac_set_view_size(rdpContext *context, MRDPView *view)
 {
+	NSWindow *window = [view window];
 	// set client area to specified dimensions
 	NSRect innerRect;
 	innerRect.origin.x = 0;
@@ -412,15 +604,55 @@ void mac_set_view_size(rdpContext *context, MRDPView *view)
 	innerRect.size.height = freerdp_settings_get_uint32(context->settings, FreeRDP_DesktopHeight);
 	[view setFrame:innerRect];
 	// calculate window of same size, but keep position
-	NSRect outerRect = [[view window] frame];
-	outerRect.size = [[view window] frameRectForContentRect:innerRect].size;
+	NSRect outerRect = [window frame];
+	outerRect.size = [window frameRectForContentRect:innerRect].size;
 	// we are not in RemoteApp mode, disable larger than resolution
-	[[view window] setContentMaxSize:innerRect.size];
+	[window setContentMaxSize:innerRect.size];
 	// set window to given area
-	[[view window] setFrame:outerRect display:YES];
+	[window setFrame:outerRect display:YES];
+
+	if (!freerdp_settings_get_bool(context->settings, FreeRDP_Decorations) &&
+	    !freerdp_settings_get_bool(context->settings, FreeRDP_Fullscreen))
+	{
+		mac_position_window_top_left(window);
+	}
+
 	// set window to front
 	[NSApp activateIgnoringOtherApps:YES];
 
 	if (freerdp_settings_get_bool(context->settings, FreeRDP_Fullscreen))
-		[[view window] toggleFullScreen:nil];
+		[window toggleFullScreen:nil];
+}
+
+static void mac_position_window_top_left(NSWindow *window)
+{
+	if (!window)
+		return;
+
+	NSScreen *screen = [window screen];
+	if (!screen)
+		screen = [NSScreen mainScreen];
+	if (!screen)
+		return;
+
+	NSRect visibleFrame = [screen visibleFrame];
+	NSRect frame = [window frame];
+	NSPoint topLeft = NSMakePoint(NSMinX(visibleFrame), NSMaxY(visibleFrame));
+	frame.origin.x = topLeft.x;
+	frame.origin.y = topLeft.y - NSHeight(frame);
+	[window setFrame:frame display:YES];
+}
+
+static BOOL mac_is_point_on_left_screen_edge(NSPoint point)
+{
+	for (NSScreen *screen in [NSScreen screens])
+	{
+		NSRect frame = [screen frame];
+		if (!NSPointInRect(point, frame))
+			continue;
+
+		return (point.x <= (NSMinX(frame) + 1.0)) ? YES : NO;
+	}
+
+	return NO;
 }
