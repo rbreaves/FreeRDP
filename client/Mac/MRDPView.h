@@ -51,6 +51,9 @@
 	BOOL skipResizeOnce;
 	BOOL saveInitialDragLoc;
 	BOOL skipMoveWindowOnce;
+	id mousePassThroughMonitor;
+	BOOL mousePassThroughArmed;
+	BOOL mousePassThroughSyncScheduled;
   @public
 	NSPasteboard *pasteboard_rd;
 	NSPasteboard *pasteboard_wr;

@@ -69,6 +69,13 @@ static void input_activity_cb(freerdp *instance);
 static DWORD WINAPI mac_client_thread(void *param);
 static void windows_to_apple_cords(MRDPView *view, NSRect *r);
 static CGContextRef mac_create_bitmap_context(rdpContext *context);
+static BOOL mac_is_chroma_key_pixel(const mfContext *mfc, uint32_t pixel);
+
+static const int64_t MRDP_PASS_THROUGH_EVENT_TAG = 0x4D52445050544852LL;
+static const NSEventMask MRDP_PASS_THROUGH_MONITOR_MASK =
+	NSEventMaskMouseMoved | NSEventMaskLeftMouseDragged | NSEventMaskRightMouseDragged |
+	NSEventMaskOtherMouseDragged | NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown |
+	NSEventMaskOtherMouseDown;
 
 @implementation MRDPView
 
@@ -83,6 +90,7 @@ static CGContextRef mac_create_bitmap_context(rdpContext *context);
 	WINPR_ASSERT(rdp_context);
 	context = rdp_context;
 	mfc = (mfContext *)rdp_context;
+	[self startMousePassThroughMonitor];
 
 	instance = context->instance;
 	WINPR_ASSERT(instance);
@@ -251,6 +259,40 @@ DWORD WINAPI mac_client_thread(void *param)
 	}
 }
 
+	- (void)startMousePassThroughMonitor
+	{
+		if (mousePassThroughMonitor)
+			return;
+
+		__block MRDPView *blockSelf = self;
+		mousePassThroughMonitor = [NSEvent
+		    addGlobalMonitorForEventsMatchingMask:MRDP_PASS_THROUGH_MONITOR_MASK
+		                            handler:^(NSEvent *event) {
+			                            [blockSelf handleGlobalMouseEvent:event];
+		                            }];
+	}
+
+	- (void)stopMousePassThroughMonitor
+	{
+		if (!mousePassThroughMonitor)
+			return;
+
+		[NSEvent removeMonitor:mousePassThroughMonitor];
+		mousePassThroughMonitor = nil;
+	}
+
+	- (void)scheduleMousePassThroughSync
+	{
+		if (mousePassThroughSyncScheduled)
+			return;
+
+		mousePassThroughSyncScheduled = YES;
+		dispatch_async(dispatch_get_main_queue(), ^{
+			self->mousePassThroughSyncScheduled = NO;
+			[self syncMousePassThroughStateForScreenPoint:[NSEvent mouseLocation]];
+		});
+	}
+
 - (void)setCursor:(NSCursor *)cursor
 {
 	self->currentCursor = cursor;
@@ -269,9 +311,181 @@ DWORD WINAPI mac_client_thread(void *param)
 	return YES;
 }
 
+- (void)passMouseEventThrough:(NSEvent *)event
+{
+	NSWindow *window = [self window];
+	CGEventRef sourceEvent = [event CGEvent];
+
+	if (!window || !sourceEvent)
+		return;
+
+	CGEventRef forwardedEvent = CGEventCreateCopy(sourceEvent);
+	if (!forwardedEvent)
+		return;
+
+	CGEventSetIntegerValueField(forwardedEvent, kCGEventSourceUserData,
+	                            MRDP_PASS_THROUGH_EVENT_TAG);
+	[window setIgnoresMouseEvents:YES];
+	CGEventPost(kCGHIDEventTap, forwardedEvent);
+	CFRelease(forwardedEvent);
+
+	dispatch_async(dispatch_get_main_queue(), ^{
+		[window setIgnoresMouseEvents:NO];
+	});
+}
+
+- (void)syncMousePassThroughStateForScreenPoint:(NSPoint)screenPoint
+{
+	NSWindow *window = [self window];
+	BOOL shouldIgnore = NO;
+	NSPoint viewPoint = NSZeroPoint;
+
+	if (window && mfc && mfc->chromaKeyEnabled && NSPointInRect(screenPoint, [window frame]))
+	{
+		NSPoint windowPoint = [window convertPointFromScreen:screenPoint];
+		viewPoint = [self convertPoint:windowPoint fromView:nil];
+		shouldIgnore = [self isPixelTransparent:viewPoint];
+	}
+
+	if (mousePassThroughArmed == shouldIgnore)
+		return;
+
+	mousePassThroughArmed = shouldIgnore;
+	[window setIgnoresMouseEvents:shouldIgnore];
+
+	if (shouldIgnore)
+	{
+		NSLog(@"MRDP pass-through armed view=(%.1f, %.1f)", viewPoint.x, viewPoint.y);
+	}
+	else
+	{
+		NSLog(@"MRDP pass-through disarmed");
+	}
+}
+
+- (void)handleGlobalMouseEvent:(NSEvent *)event
+{
+	NSWindow *window = [self window];
+	if (!window)
+		return;
+
+	NSPoint screenPoint = [NSEvent mouseLocation];
+	if (mousePassThroughArmed && NSPointInRect(screenPoint, [window frame]) &&
+	    (([event type] == NSEventTypeLeftMouseDown) || ([event type] == NSEventTypeRightMouseDown) ||
+	     ([event type] == NSEventTypeOtherMouseDown)))
+	{
+		NSLog(@"MRDP pass-through click observed while armed screen=(%.1f, %.1f)", screenPoint.x,
+		      screenPoint.y);
+	}
+
+	[self syncMousePassThroughStateForScreenPoint:screenPoint];
+}
+
+- (void)logTransparentClickForEvent:(NSEvent *)event viewPoint:(NSPoint)viewPoint
+{
+	if (([event type] != NSEventTypeLeftMouseDown) && ([event type] != NSEventTypeRightMouseDown) &&
+	    ([event type] != NSEventTypeOtherMouseDown))
+	{
+		return;
+	}
+
+	rdpGdi *gdi = context->gdi;
+	if (!gdi || !gdi->primary_buffer)
+		return;
+
+	NSRect bounds = [self bounds];
+	if (!NSPointInRect(viewPoint, bounds))
+	{
+		NSLog(@"MRDP pass-through click attempt: point outside view bounds view=(%.1f, %.1f)",
+		      viewPoint.x, viewPoint.y);
+		return;
+	}
+
+	CGFloat width = NSWidth(bounds);
+	CGFloat height = NSHeight(bounds);
+	if (width <= 0 || height <= 0)
+		return;
+
+	CGFloat xScale = (CGFloat)gdi->width / width;
+	CGFloat yScale = (CGFloat)gdi->height / height;
+	int bx = (int)floor(viewPoint.x * xScale);
+	int by = (int)floor((height - viewPoint.y) * yScale);
+
+	if (bx < 0 || bx >= (int)gdi->width || by < 0 || by >= (int)gdi->height)
+	{
+		NSLog(@"MRDP pass-through click attempt: point outside buffer view=(%.1f, %.1f) buffer=(%d, %d)",
+		      viewPoint.x, viewPoint.y, bx, by);
+		return;
+	}
+
+	uint32_t *buffer = (uint32_t *)gdi->primary_buffer;
+	uint32_t pixel = buffer[(size_t)by * (size_t)gdi->width + (size_t)bx];
+	BOOL alphaTransparent = (((pixel >> 24) & 0xFF) == 0);
+	BOOL chromaTransparent = mac_is_chroma_key_pixel(mfc, pixel);
+
+	NSLog(@"MRDP pass-through click attempt: pixel=0x%08X buffer=(%d,%d) view=(%.1f,%.1f) "
+	      @"alphaTransparent=%d chromaTransparent=%d chromaKey=0x%06X",
+	      pixel, bx, by, viewPoint.x, viewPoint.y, alphaTransparent, chromaTransparent,
+	      mfc->chromaKeyColor);
+}
+
+- (BOOL)isPixelTransparent:(NSPoint)viewPoint
+{
+	if (!mfc->chromaKeyEnabled)
+		return NO;
+
+	rdpGdi *gdi = context->gdi;
+	if (!gdi || !gdi->primary_buffer)
+		return NO;
+
+	NSRect bounds = [self bounds];
+	if (!NSPointInRect(viewPoint, bounds))
+		return NO;
+
+	CGFloat width = NSWidth(bounds);
+	CGFloat height = NSHeight(bounds);
+	if (width <= 0 || height <= 0)
+		return NO;
+
+	CGFloat xScale = (CGFloat)gdi->width / width;
+	CGFloat yScale = (CGFloat)gdi->height / height;
+	int bx = (int)floor(viewPoint.x * xScale);
+	int by = (int)floor((height - viewPoint.y) * yScale);
+
+	if (bx < 0 || bx >= (int)gdi->width || by < 0 || by >= (int)gdi->height)
+		return NO;
+
+	uint32_t *buffer = (uint32_t *)gdi->primary_buffer;
+	uint32_t pixel = buffer[(size_t)by * (size_t)gdi->width + (size_t)bx];
+
+	return mac_is_chroma_key_pixel(mfc, pixel);
+}
+
+- (BOOL)shouldPassMouseEventThrough:(NSEvent *)event
+{
+	CGEventRef cgEvent = [event CGEvent];
+	if (cgEvent &&
+	    (CGEventGetIntegerValueField(cgEvent, kCGEventSourceUserData) ==
+	     MRDP_PASS_THROUGH_EVENT_TAG))
+	{
+		return NO;
+	}
+
+	NSPoint windowLoc = [event locationInWindow];
+	NSPoint viewPoint = [self convertPoint:windowLoc fromView:nil];
+	BOOL transparent = [self isPixelTransparent:viewPoint];
+	if (transparent)
+		[self logTransparentClickForEvent:event viewPoint:viewPoint];
+
+	[self syncMousePassThroughStateForScreenPoint:[NSEvent mouseLocation]];
+
+	return transparent;
+}
+
 - (void)mouseMoved:(NSEvent *)event
 {
 	[super mouseMoved:event];
+	[self syncMousePassThroughStateForScreenPoint:[NSEvent mouseLocation]];
 
 	if (!self.is_connected)
 		return;
@@ -284,80 +498,122 @@ DWORD WINAPI mac_client_thread(void *param)
 
 - (void)mouseDown:(NSEvent *)event
 {
+	if ([self shouldPassMouseEventThrough:event])
+	{
+		[self passMouseEventThrough:event];
+		return;
+	}
+
+	NSPoint windowLoc = [event locationInWindow];
+
 	[super mouseDown:event];
 
 	if (!self.is_connected)
 		return;
 
-	NSPoint loc = [event locationInWindow];
-	int x = (int)loc.x;
-	int y = (int)loc.y;
+	int x = (int)windowLoc.x;
+	int y = (int)windowLoc.y;
 	mf_press_mouse_button(context, 0, x, y, TRUE);
 }
 
 - (void)mouseUp:(NSEvent *)event
 {
+	if ([self shouldPassMouseEventThrough:event])
+	{
+		[self passMouseEventThrough:event];
+		return;
+	}
+
+	NSPoint windowLoc = [event locationInWindow];
+
 	[super mouseUp:event];
 
 	if (!self.is_connected)
 		return;
 
-	NSPoint loc = [event locationInWindow];
-	int x = (int)loc.x;
-	int y = (int)loc.y;
+	int x = (int)windowLoc.x;
+	int y = (int)windowLoc.y;
 	mf_press_mouse_button(context, 0, x, y, FALSE);
 }
 
 - (void)rightMouseDown:(NSEvent *)event
 {
+	if ([self shouldPassMouseEventThrough:event])
+	{
+		[self passMouseEventThrough:event];
+		return;
+	}
+
+	NSPoint windowLoc = [event locationInWindow];
+
 	[super rightMouseDown:event];
 
 	if (!self.is_connected)
 		return;
 
-	NSPoint loc = [event locationInWindow];
-	int x = (int)loc.x;
-	int y = (int)loc.y;
+	int x = (int)windowLoc.x;
+	int y = (int)windowLoc.y;
 	mf_press_mouse_button(context, 1, x, y, TRUE);
 }
 
 - (void)rightMouseUp:(NSEvent *)event
 {
+	if ([self shouldPassMouseEventThrough:event])
+	{
+		[self passMouseEventThrough:event];
+		return;
+	}
+
+	NSPoint windowLoc = [event locationInWindow];
+
 	[super rightMouseUp:event];
 
 	if (!self.is_connected)
 		return;
 
-	NSPoint loc = [event locationInWindow];
-	int x = (int)loc.x;
-	int y = (int)loc.y;
+	int x = (int)windowLoc.x;
+	int y = (int)windowLoc.y;
 	mf_press_mouse_button(context, 1, x, y, FALSE);
 }
 
 - (void)otherMouseDown:(NSEvent *)event
 {
+	if ([self shouldPassMouseEventThrough:event])
+	{
+		[self passMouseEventThrough:event];
+		return;
+	}
+
+	NSPoint windowLoc = [event locationInWindow];
+
 	[super otherMouseDown:event];
 
 	if (!self.is_connected)
 		return;
 
-	NSPoint loc = [event locationInWindow];
-	int x = (int)loc.x;
-	int y = (int)loc.y;
+	int x = (int)windowLoc.x;
+	int y = (int)windowLoc.y;
 	int pressed = [event buttonNumber];
 	mf_press_mouse_button(context, pressed, x, y, TRUE);
 }
 
 - (void)otherMouseUp:(NSEvent *)event
 {
+	if ([self shouldPassMouseEventThrough:event])
+	{
+		[self passMouseEventThrough:event];
+		return;
+	}
+
+	NSPoint windowLoc = [event locationInWindow];
+
 	[super otherMouseUp:event];
 
 	if (!self.is_connected)
 		return;
 
-	NSPoint loc = [event locationInWindow];
-	int x = (int)loc.x;
-	int y = (int)loc.y;
+	int x = (int)windowLoc.x;
+	int y = (int)windowLoc.y;
 	int pressed = [event buttonNumber];
 	mf_press_mouse_button(context, pressed, x, y, FALSE);
 }
@@ -413,15 +669,21 @@ DWORD WINAPI mac_client_thread(void *param)
 
 - (void)mouseDragged:(NSEvent *)event
 {
+	if ([self shouldPassMouseEventThrough:event])
+	{
+		[self passMouseEventThrough:event];
+		return;
+	}
+
+	NSPoint windowLoc = [event locationInWindow];
+
 	[super mouseDragged:event];
 
 	if (!self.is_connected)
 		return;
 
-	NSPoint loc = [event locationInWindow];
-	int x = (int)loc.x;
-	int y = (int)loc.y;
-	// send mouse motion event to RDP server
+	int x = (int)windowLoc.x;
+	int y = (int)windowLoc.y;
 	mf_scale_mouse_event(context, PTR_FLAGS_MOVE, x, y);
 }
 
@@ -678,8 +940,33 @@ static BOOL releaseFlagStates(rdpInput *input, UINT32 aKbdModFlags)
 	return updateFlagStates(input, 0, aKbdModFlags);
 }
 
+static BOOL mac_is_chroma_key_pixel(const mfContext *mfc, uint32_t pixel)
+{
+	if (!mfc || !mfc->chromaKeyEnabled)
+		return FALSE;
+
+	uint32_t targetColor = mfc->chromaKeyColor;
+	float tolerance = mfc->chromaKeyTolerance;
+	uint8_t targetR = (targetColor >> 16) & 0xFF;
+	uint8_t targetG = (targetColor >> 8) & 0xFF;
+	uint8_t targetB = targetColor & 0xFF;
+	uint8_t b = (pixel >> 0) & 0xFF;
+	uint8_t g = (pixel >> 8) & 0xFF;
+	uint8_t r = (pixel >> 16) & 0xFF;
+	float diffR = fabsf((float)r - (float)targetR);
+	float diffG = fabsf((float)g - (float)targetG);
+	float diffB = fabsf((float)b - (float)targetB);
+	float maxDiff = fmaxf(fmaxf(diffR, diffG), diffB);
+
+	return (maxDiff <= tolerance) ? TRUE : FALSE;
+}
+
 - (void)releaseResources
 {
+	[self stopMousePassThroughMonitor];
+	[[self window] setIgnoresMouseEvents:NO];
+	mousePassThroughArmed = NO;
+
 	for (int i = 0; i < argc; i++)
 		free(argv[i]);
 
@@ -695,12 +982,6 @@ static BOOL releaseFlagStates(rdpInput *input, UINT32 aKbdModFlags)
 		return CGBitmapContextCreateImage(self->bitmap_context);
 
 	rdpGdi *gdi = context->gdi;
-	uint32_t targetColor = mfc->chromaKeyColor;
-	float tolerance = mfc->chromaKeyTolerance;
-
-	uint8_t targetR = (targetColor >> 16) & 0xFF;
-	uint8_t targetG = (targetColor >> 8) & 0xFF;
-	uint8_t targetB = targetColor & 0xFF;
 
 	uint32_t *buffer = (uint32_t *)gdi->primary_buffer;
 	size_t pixelCount = gdi->width * gdi->height;
@@ -714,16 +995,8 @@ static BOOL releaseFlagStates(rdpInput *input, UINT32 aKbdModFlags)
 	for (size_t i = 0; i < pixelCount; i++)
 	{
 		uint32_t pixel = buffer[i];
-		uint8_t b = (pixel >> 0) & 0xFF;
-		uint8_t g = (pixel >> 8) & 0xFF;
-		uint8_t r = (pixel >> 16) & 0xFF;
 
-		float diffR = fabsf((float)r - (float)targetR);
-		float diffG = fabsf((float)g - (float)targetG);
-		float diffB = fabsf((float)b - (float)targetB);
-		float maxDiff = fmaxf(fmaxf(diffR, diffG), diffB);
-
-		if (maxDiff <= tolerance)
+		if (mac_is_chroma_key_pixel(mfc, pixel))
 		{
 			buffer[i] = 0x00000000;
 		}
@@ -760,6 +1033,8 @@ static BOOL releaseFlagStates(rdpInput *input, UINT32 aKbdModFlags)
 		[[NSColor blackColor] set];
 		NSRectFill([self bounds]);
 	}
+
+	[self scheduleMousePassThroughSync];
 }
 
 - (void)onPasteboardTimerFired:(NSTimer *)timer
