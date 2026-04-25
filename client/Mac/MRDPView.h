@@ -67,6 +67,7 @@
 - (void)setScrollOffset:(int)xOffset y:(int)yOffset w:(int)width h:(int)height;
 
 - (void)onPasteboardTimerFired:(NSTimer *)timer;
+- (void)parkRemotePointer;
 - (void)pause;
 - (void)resume;
 - (void)releaseResources;

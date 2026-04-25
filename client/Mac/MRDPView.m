@@ -429,6 +429,48 @@ DWORD WINAPI mac_client_thread(void *param)
 	      mfc->chromaKeyColor);
 }
 
+- (void)syncRemoteInputForTransparentClick:(NSEvent *)event
+{
+	if (!self.is_connected)
+		return;
+
+	NSEventType type = [event type];
+	if ((type != NSEventTypeLeftMouseDown) && (type != NSEventTypeRightMouseDown) &&
+	    (type != NSEventTypeOtherMouseDown))
+	{
+		return;
+	}
+
+	NSPoint windowLoc = [event locationInWindow];
+	int x = (int)windowLoc.x;
+	int y = (int)windowLoc.y;
+	mf_scale_mouse_event(context, PTR_FLAGS_MOVE, x, y);
+
+	int button = -1;
+	switch (type)
+	{
+		case NSEventTypeLeftMouseDown:
+			button = 0;
+			break;
+		case NSEventTypeRightMouseDown:
+			button = 1;
+			break;
+		case NSEventTypeOtherMouseDown:
+			button = (int)[event buttonNumber];
+			break;
+		default:
+			break;
+	}
+
+	if (button >= 0)
+	{
+		mf_press_mouse_button(context, button, x, y, TRUE);
+		mf_press_mouse_button(context, button, x, y, FALSE);
+		NSLog(@"MRDP remote pointer moved and clicked before pass-through x=%d y=%d button=%d",
+		      x, y, button);
+	}
+}
+
 - (BOOL)isPixelTransparent:(NSPoint)viewPoint
 {
 	if (!mfc->chromaKeyEnabled)
@@ -475,7 +517,10 @@ DWORD WINAPI mac_client_thread(void *param)
 	NSPoint viewPoint = [self convertPoint:windowLoc fromView:nil];
 	BOOL transparent = [self isPixelTransparent:viewPoint];
 	if (transparent)
+	{
 		[self logTransparentClickForEvent:event viewPoint:viewPoint];
+		[self syncRemoteInputForTransparentClick:event];
+	}
 
 	[self syncMousePassThroughStateForScreenPoint:[NSEvent mouseLocation]];
 
@@ -1100,6 +1145,8 @@ static BOOL mac_is_chroma_key_pixel(const mfContext *mfc, uint32_t pixel)
 
 - (void)pause
 {
+	[self parkRemotePointer];
+
 	dispatch_async(dispatch_get_main_queue(), ^{
 		[self->pasteboard_timer invalidate];
 	});
@@ -1111,6 +1158,28 @@ static BOOL mac_is_chroma_key_pixel(const mfContext *mfc, uint32_t pixel)
 	}
 	releaseFlagStates(instance->context->input, kbdModFlags);
 	kbdModFlags = 0;
+}
+
+- (void)parkRemotePointer
+{
+	if (!self.is_connected || !context)
+		return;
+
+	rdpSettings *settings = context->settings;
+	if (!settings)
+		return;
+
+	const UINT32 width = freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth);
+	const UINT32 height = freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
+	if ((width == 0) || (height == 0))
+		return;
+
+	const int inset = 64;
+	const int x = (width > (UINT32)(inset * 2)) ? inset : (int)(width / 2);
+	const int y = (height > (UINT32)(inset * 2)) ? inset : (int)(height / 2);
+
+	mf_scale_mouse_event(context, PTR_FLAGS_MOVE, x, y);
+	NSLog(@"MRDP parked remote pointer on focus loss x=%d y=%d", x, y);
 }
 
 - (void)resume
