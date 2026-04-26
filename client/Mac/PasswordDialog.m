@@ -26,8 +26,43 @@
 
 @property BOOL modalCode;
 - (void)createUI;
+- (void)centerWindowOnPreferredScreen;
 
 @end
+
+static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenIdentifier";
+
+static NSString *mac_password_dialog_screen_identifier(NSScreen *screen)
+{
+	if (!screen)
+		return nil;
+
+	NSNumber *screenNumber = [[screen deviceDescription] objectForKey:@"NSScreenNumber"];
+	if (screenNumber)
+		return [NSString stringWithFormat:@"display:%u", [screenNumber unsignedIntValue]];
+
+	NSRect frame = [screen frame];
+	return [NSString stringWithFormat:@"frame:%.0f:%.0f:%.0f:%.0f", frame.origin.x,
+	                                  frame.origin.y, frame.size.width, frame.size.height];
+}
+
+static NSScreen *mac_password_dialog_preferred_screen(void)
+{
+	NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+	NSString *identifier = [defaults stringForKey:MRDPPreferredScreenIdentifierKey];
+
+	if (identifier)
+	{
+		for (NSScreen *screen in [NSScreen screens])
+		{
+			NSString *candidate = mac_password_dialog_screen_identifier(screen);
+			if ([candidate isEqualToString:identifier])
+				return screen;
+		}
+	}
+
+	return [NSScreen mainScreen] ?: [[NSScreen screens] firstObject];
+}
 
 @implementation PasswordDialog
 
@@ -178,6 +213,22 @@
 	[self.window center];
 }
 
+- (void)centerWindowOnPreferredScreen
+{
+	NSScreen *screen = mac_password_dialog_preferred_screen();
+	if (!screen)
+	{
+		[self.window center];
+		return;
+	}
+
+	NSRect visibleFrame = [screen visibleFrame];
+	NSRect frame = [self.window frame];
+	frame.origin.x = NSMinX(visibleFrame) + floor((NSWidth(visibleFrame) - NSWidth(frame)) / 2.0);
+	frame.origin.y = NSMinY(visibleFrame) + floor((NSHeight(visibleFrame) - NSHeight(frame)) / 2.0);
+	[self.window setFrame:frame display:NO];
+}
+
 - (void)windowDidLoad
 {
 	[super windowDidLoad];
@@ -214,23 +265,12 @@
 
 - (BOOL)runModal:(NSWindow *)mainWindow
 {
+	(void)mainWindow;
 	[self windowDidLoad];
-	if ([mainWindow respondsToSelector:@selector(beginSheet:completionHandler:)])
-	{
-		[mainWindow beginSheet:self.window completionHandler:nil];
-		self.modalCode = [NSApp runModalForWindow:self.window];
-		[mainWindow endSheet:self.window];
-	}
-	else
-	{
-		[NSApp beginSheet:self.window
-		    modalForWindow:mainWindow
-		     modalDelegate:nil
-		    didEndSelector:nil
-		       contextInfo:nil];
-		self.modalCode = [NSApp runModalForWindow:self.window];
-		[NSApp endSheet:self.window];
-	}
+	[self centerWindowOnPreferredScreen];
+	[NSApp activateIgnoringOtherApps:YES];
+	[self.window makeKeyAndOrderFront:nil];
+	self.modalCode = [NSApp runModalForWindow:self.window];
 
 	[self.window orderOut:nil];
 	return self.modalCode;

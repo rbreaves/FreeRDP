@@ -70,6 +70,9 @@ static DWORD WINAPI mac_client_thread(void *param);
 static void windows_to_apple_cords(MRDPView *view, NSRect *r);
 static CGContextRef mac_create_bitmap_context(rdpContext *context);
 static BOOL mac_is_chroma_key_pixel(const mfContext *mfc, uint32_t pixel);
+static NSScreen *mac_startup_preferred_screen(void);
+
+static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenIdentifier";
 
 static const int64_t MRDP_PASS_THROUGH_EVENT_TAG = 0x4D52445050544852LL;
 static const NSEventMask MRDP_PASS_THROUGH_MONITOR_MASK =
@@ -104,7 +107,7 @@ static const NSEventMask MRDP_PASS_THROUGH_MONITOR_MASK =
 	if (PubSub_OnEmbedWindow(context->pubSub, context, &e) < 0)
 		return -1;
 
-	NSScreen *screen = [[NSScreen screens] objectAtIndex:0];
+	NSScreen *screen = mac_startup_preferred_screen();
 	NSRect screenFrame = [screen frame];
 	NSRect visibleFrame = [screen visibleFrame];
 
@@ -114,7 +117,6 @@ static const NSEventMask MRDP_PASS_THROUGH_MONITOR_MASK =
 			return -1;
 		if (!freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, screenFrame.size.height))
 			return -1;
-		[self enterFullScreenMode:[NSScreen mainScreen] withOptions:nil];
 	}
 	else if (mfc->fullscreen_mode == 2)
 	{
@@ -122,11 +124,6 @@ static const NSEventMask MRDP_PASS_THROUGH_MONITOR_MASK =
 			return -1;
 		if (!freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, (UINT32)visibleFrame.size.height))
 			return -1;
-		[self exitFullScreenModeWithOptions:nil];
-	}
-	else
-	{
-		[self exitFullScreenModeWithOptions:nil];
 	}
 
 	mfc->client_height = freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
@@ -140,6 +137,36 @@ static const NSEventMask MRDP_PASS_THROUGH_MONITOR_MASK =
 	}
 
 	return 0;
+}
+
+static NSScreen *mac_startup_preferred_screen(void)
+{
+	NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+	NSString *identifier = [defaults stringForKey:MRDPPreferredScreenIdentifierKey];
+
+	if (identifier)
+	{
+		for (NSScreen *screen in [NSScreen screens])
+		{
+			NSNumber *screenNumber = [[screen deviceDescription] objectForKey:@"NSScreenNumber"];
+			NSString *candidate = nil;
+
+			if (screenNumber)
+				candidate = [NSString stringWithFormat:@"display:%u", [screenNumber unsignedIntValue]];
+			else
+			{
+				NSRect frame = [screen frame];
+				candidate = [NSString stringWithFormat:@"frame:%.0f:%.0f:%.0f:%.0f",
+				                                   frame.origin.x, frame.origin.y,
+				                                   frame.size.width, frame.size.height];
+			}
+
+			if ([candidate isEqualToString:identifier])
+				return screen;
+		}
+	}
+
+	return [NSScreen mainScreen] ?: [[NSScreen screens] firstObject];
 }
 
 DWORD WINAPI mac_client_thread(void *param)

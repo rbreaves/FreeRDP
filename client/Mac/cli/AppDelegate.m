@@ -31,11 +31,15 @@ static NSURL *mac_find_resource_url(NSString *resourceName, NSString *extension)
 static NSImage *mac_load_svg_image(NSString *resourceName, CGFloat pointSize, BOOL templateImage);
 static NSInteger mac_screen_index_for_screen(NSScreen *screen);
 static NSScreen *mac_screen_for_index(NSInteger screenIndex);
+static NSString *mac_screen_identifier(NSScreen *screen);
+static NSScreen *mac_screen_for_identifier(NSString *identifier);
 static NSScreen *mac_preferred_screen(NSWindow *window);
 static NSString *mac_display_title(NSScreen *screen, NSInteger screenIndex);
 static DISPLAY_CONTROL_MONITOR_LAYOUT mac_display_layout_for_screen(NSScreen *screen,
 	                                                               BOOL useVisibleFrame,
 	                                                               rdpSettings *settings);
+
+static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenIdentifier";
 
 @interface MRDPClientWindow : NSWindow
 @end
@@ -76,11 +80,14 @@ static DISPLAY_CONTROL_MONITOR_LAYOUT mac_display_layout_for_screen(NSScreen *sc
 - (void)removeStatusItem;
 - (void)statusItemClicked:(id)sender;
 - (void)rebuildStatusMenu;
+- (void)focusSessionFromMenuItem:(id)sender;
 - (void)switchMonitorFromMenuItem:(NSMenuItem *)menuItem;
 - (void)moveSessionToScreen:(NSScreen *)screen screenIndex:(NSInteger)screenIndex;
 - (BOOL)requestRemoteResizeForScreen:(NSScreen *)screen;
 - (NSScreen *)preferredScreen;
 - (NSInteger)currentScreenIndex;
+- (void)loadPreferredScreenFromDefaults;
+- (void)savePreferredScreenToDefaults;
 @end
 
 @implementation AppDelegate
@@ -259,7 +266,7 @@ static DISPLAY_CONTROL_MONITOR_LAYOUT mac_display_layout_for_screen(NSScreen *sc
 	int status;
 	mfContext *mfc;
 	_singleDelegate = self;
-	preferredScreenIndex = mac_screen_index_for_screen([NSScreen mainScreen]);
+	[self loadPreferredScreenFromDefaults];
 	[self CreateContext];
 	[self ensureClientWindow];
 	[self configureApplicationIcon];
@@ -285,7 +292,6 @@ static DISPLAY_CONTROL_MONITOR_LAYOUT mac_display_layout_for_screen(NSScreen *sc
 	WINPR_ASSERT(mfc);
 	[self applyWindowDecorationsFromSettings];
 	[self startLeftEdgeFocusMonitor];
-	[self focusClientWindow];
 
 	mfc->view = (void *)mrdpView;
 
@@ -356,6 +362,7 @@ static DISPLAY_CONTROL_MONITOR_LAYOUT mac_display_layout_for_screen(NSScreen *sc
 - (void)applicationWillTerminate:(NSNotification *)notification
 {
 	NSLog(@"Stopping...\n");
+	[self savePreferredScreenToDefaults];
 	[self removeStatusItem];
 	freerdp_client_stop(context);
 	[mrdpView releaseResources];
@@ -366,7 +373,12 @@ static DISPLAY_CONTROL_MONITOR_LAYOUT mac_display_layout_for_screen(NSScreen *sc
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender
 {
-	return YES;
+	(void)sender;
+
+	if (!window || !mrdpView)
+		return NO;
+
+	return [window isVisible] && [mrdpView is_connected];
 }
 
 - (BOOL)applicationSupportsSecureRestorableState:(NSApplication *)app
@@ -379,12 +391,23 @@ static DISPLAY_CONTROL_MONITOR_LAYOUT mac_display_layout_for_screen(NSScreen *sc
 	[self focusClientWindow];
 }
 
+- (void)windowDidMove:(NSNotification *)notification
+{
+	(void)notification;
+	[self savePreferredScreenToDefaults];
+}
+
 - (void)focusClientWindow
 {
 	if (!window)
 		return;
 
+	const BOOL connected = !mrdpView || [mrdpView is_connected];
+
 	[NSApp activateIgnoringOtherApps:YES];
+
+	if (!connected && ![window isVisible])
+		return;
 
 	if (![window isVisible])
 		[window orderFront:self];
@@ -448,27 +471,10 @@ static DISPLAY_CONTROL_MONITOR_LAYOUT mac_display_layout_for_screen(NSScreen *sc
 
 - (void)statusItemClicked:(id)sender
 {
-	NSEvent *event = [NSApp currentEvent];
-	BOOL showMenu = NO;
-
 	(void)sender;
-
-	if (event)
-	{
-		showMenu = (event.type == NSEventTypeRightMouseUp) ||
-		           ((event.type == NSEventTypeLeftMouseUp) &&
-		            ((event.modifierFlags & NSEventModifierFlagControl) != 0));
-	}
-
-	if (showMenu)
-	{
-		[self rebuildStatusMenu];
-		[statusItem popUpStatusItemMenu:statusMenu];
-		[[statusItem button] setHighlighted:NO];
-		return;
-	}
-
-	[self focusClientWindow];
+	[self rebuildStatusMenu];
+	[statusItem popUpStatusItemMenu:statusMenu];
+	[[statusItem button] setHighlighted:NO];
 }
 
 - (void)rebuildStatusMenu
@@ -496,12 +502,27 @@ static DISPLAY_CONTROL_MONITOR_LAYOUT mac_display_layout_for_screen(NSScreen *sc
 	if ([screens count] > 0)
 		[statusMenu addItem:[NSMenuItem separatorItem]];
 
+	NSMenuItem *focusItem =
+	    [[[NSMenuItem alloc] initWithTitle:@"Focus Session"
+	                                 action:@selector(focusSessionFromMenuItem:)
+	                          keyEquivalent:@""] autorelease];
+	[focusItem setTarget:self];
+	[statusMenu addItem:focusItem];
+
+	[statusMenu addItem:[NSMenuItem separatorItem]];
+
 	NSMenuItem *quitItem =
 	    [[[NSMenuItem alloc] initWithTitle:@"Quit MacFreeRDP"
 	                                 action:@selector(terminate:)
 	                          keyEquivalent:@""] autorelease];
 	[quitItem setTarget:NSApp];
 	[statusMenu addItem:quitItem];
+}
+
+- (void)focusSessionFromMenuItem:(id)sender
+{
+	(void)sender;
+	[self focusClientWindow];
 }
 
 - (void)switchMonitorFromMenuItem:(NSMenuItem *)menuItem
@@ -518,6 +539,7 @@ static DISPLAY_CONTROL_MONITOR_LAYOUT mac_display_layout_for_screen(NSScreen *sc
 		return;
 
 	preferredScreenIndex = screenIndex;
+	[self savePreferredScreenToDefaults];
 
 	if (!window)
 		return;
@@ -602,6 +624,35 @@ static DISPLAY_CONTROL_MONITOR_LAYOUT mac_display_layout_for_screen(NSScreen *sc
 		return currentScreen;
 
 	return preferredScreenIndex;
+}
+
+- (void)loadPreferredScreenFromDefaults
+{
+	NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+	NSString *identifier = [defaults stringForKey:MRDPPreferredScreenIdentifierKey];
+	NSScreen *screen = mac_screen_for_identifier(identifier);
+
+	if (!screen)
+		screen = [NSScreen mainScreen];
+
+	preferredScreenIndex = mac_screen_index_for_screen(screen);
+	if (preferredScreenIndex == NSNotFound)
+		preferredScreenIndex = 0;
+}
+
+- (void)savePreferredScreenToDefaults
+{
+	NSScreen *screen = [window screen];
+	if (!screen)
+		screen = [self preferredScreen];
+
+	NSString *identifier = mac_screen_identifier(screen);
+	if (!identifier)
+		return;
+
+	NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+	[defaults setObject:identifier forKey:MRDPPreferredScreenIdentifierKey];
+	[defaults synchronize];
 }
 
 - (int)ParseCommandLineArguments
@@ -734,7 +785,21 @@ void AppDelegate_ConnectionResultEventHandler(void *ctx, const ConnectionResultE
 
 	if (_singleDelegate)
 	{
-		if (e->result != 0)
+		if (e->result == 0)
+		{
+			mfContext *mfc = (mfContext *)context;
+			dispatch_async(dispatch_get_main_queue(), ^{
+				if (mfc && mfc->view)
+				{
+					NSScreen *screen = [_singleDelegate preferredScreen];
+					NSInteger screenIndex = mac_screen_index_for_screen(screen);
+					mac_set_view_size(context, mfc->view);
+					[_singleDelegate moveSessionToScreen:screen screenIndex:screenIndex];
+					[_singleDelegate focusClientWindow];
+				}
+			});
+		}
+		else
 		{
 			NSString *message = nil;
 			DWORD code = freerdp_get_last_error(context);
@@ -848,7 +913,7 @@ void mac_set_view_size(rdpContext *context, MRDPView *view)
 	// set window to given area
 	[window setFrame:outerRect display:YES];
 
-	if (mfc->fullscreen_mode == 2)
+	if ((mfc->fullscreen_mode == 2) && [view is_connected])
 	{
 		mac_maximize_window_minus_menubar(window, view);
 	}
@@ -861,7 +926,8 @@ void mac_set_view_size(rdpContext *context, MRDPView *view)
 	// set window to front
 	[NSApp activateIgnoringOtherApps:YES];
 
-	if (freerdp_settings_get_bool(context->settings, FreeRDP_Fullscreen) && mfc->fullscreen_mode != 2 &&
+	if ([view is_connected] && freerdp_settings_get_bool(context->settings, FreeRDP_Fullscreen) &&
+	    mfc->fullscreen_mode != 2 &&
 	    view && screen && ![view isInFullScreenMode])
 	{
 		[view enterFullScreenMode:screen withOptions:nil];
@@ -995,6 +1061,35 @@ static NSScreen *mac_screen_for_index(NSInteger screenIndex)
 		return [NSScreen mainScreen];
 
 	return ([screens count] > 0) ? [screens objectAtIndex:0] : nil;
+}
+
+static NSString *mac_screen_identifier(NSScreen *screen)
+{
+	if (!screen)
+		return nil;
+
+	NSNumber *screenNumber = [[screen deviceDescription] objectForKey:@"NSScreenNumber"];
+	if (screenNumber)
+		return [NSString stringWithFormat:@"display:%u", [screenNumber unsignedIntValue]];
+
+	NSRect frame = [screen frame];
+	return [NSString stringWithFormat:@"frame:%.0f:%.0f:%.0f:%.0f", frame.origin.x,
+	                                  frame.origin.y, frame.size.width, frame.size.height];
+}
+
+static NSScreen *mac_screen_for_identifier(NSString *identifier)
+{
+	if (!identifier)
+		return nil;
+
+	for (NSScreen *screen in [NSScreen screens])
+	{
+		NSString *candidate = mac_screen_identifier(screen);
+		if ([candidate isEqualToString:identifier])
+			return screen;
+	}
+
+	return nil;
 }
 
 static NSScreen *mac_preferred_screen(NSWindow *window)
