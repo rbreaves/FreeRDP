@@ -14,6 +14,7 @@
 #import <winpr/assert.h>
 #import <freerdp/client/cmdline.h>
 #import <freerdp/client/disp.h>
+#import <freerdp/version.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +30,8 @@ static void mac_maximize_window_minus_menubar(NSWindow *window, MRDPView *view);
 static BOOL mac_is_point_on_left_screen_edge(NSPoint point);
 static NSURL *mac_find_resource_url(NSString *resourceName, NSString *extension);
 static NSImage *mac_load_svg_image(NSString *resourceName, CGFloat pointSize, BOOL templateImage);
+static NSImage *mac_render_image_for_size(NSImage *source, CGFloat pointSize, BOOL templateImage);
+static NSImage *mac_create_freerdp_vector_icon(CGFloat pointSize, BOOL monochrome, BOOL templateImage);
 static NSInteger mac_screen_index_for_screen(NSScreen *screen);
 static NSScreen *mac_screen_for_index(NSInteger screenIndex);
 static NSString *mac_screen_identifier(NSScreen *screen);
@@ -86,6 +89,7 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 - (void)sendCtrlAltDelFromMenuItem:(id)sender;
 - (void)sendRemoteKeyFromMenuItem:(NSMenuItem *)menuItem;
 - (void)sendRemoteBreakFromMenuItem:(id)sender;
+- (void)showAboutPanel:(id)sender;
 - (void)switchMonitorFromMenuItem:(NSMenuItem *)menuItem;
 - (void)moveSessionToScreen:(NSScreen *)screen screenIndex:(NSInteger)screenIndex;
 - (BOOL)requestRemoteResizeForScreen:(NSScreen *)screen;
@@ -449,16 +453,49 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 		return;
 
 	NSMenuItem *appMenuItem = ([mainMenu numberOfItems] > 0) ? [mainMenu itemAtIndex:0] : nil;
-	NSMenu *appMenu = [appMenuItem submenu];
+	NSMenu *appMenu = nil;
 
 	if (appMenuItem)
 		[appMenuItem setTitle:@"MacFreeRDP"];
-	if (appMenu)
-		[appMenu setTitle:@"MacFreeRDP"];
-	if (appMenu && ([appMenu numberOfItems] > 0))
+	if (appMenuItem)
 	{
-		NSMenuItem *quitItem = [appMenu itemAtIndex:[appMenu numberOfItems] - 1];
-		[quitItem setTitle:@"Quit MacFreeRDP"];
+		appMenu = [[[NSMenu alloc] initWithTitle:@"MacFreeRDP"] autorelease];
+
+		NSMenuItem *aboutItem = [[[NSMenuItem alloc] initWithTitle:@"About MacFreeRDP"
+		                                                 action:@selector(showAboutPanel:)
+		                                          keyEquivalent:@""] autorelease];
+		[aboutItem setTarget:self];
+		[appMenu addItem:aboutItem];
+		[appMenu addItem:[NSMenuItem separatorItem]];
+
+		NSMenuItem *hideItem = [[[NSMenuItem alloc] initWithTitle:@"Hide MacFreeRDP"
+		                                                action:@selector(hide:)
+		                                         keyEquivalent:@"h"] autorelease];
+		[hideItem setTarget:NSApp];
+		[appMenu addItem:hideItem];
+
+		NSMenuItem *hideOthersItem = [[[NSMenuItem alloc] initWithTitle:@"Hide Others"
+		                                                      action:@selector(hideOtherApplications:)
+		                                               keyEquivalent:@"h"] autorelease];
+		[hideOthersItem setTarget:NSApp];
+		[hideOthersItem setKeyEquivalentModifierMask:(NSEventModifierFlagCommand |
+		                                            NSEventModifierFlagOption)];
+		[appMenu addItem:hideOthersItem];
+
+		NSMenuItem *showAllItem = [[[NSMenuItem alloc] initWithTitle:@"Show All"
+		                                                   action:@selector(unhideAllApplications:)
+		                                            keyEquivalent:@""] autorelease];
+		[showAllItem setTarget:NSApp];
+		[appMenu addItem:showAllItem];
+		[appMenu addItem:[NSMenuItem separatorItem]];
+
+		NSMenuItem *quitItem = [[[NSMenuItem alloc] initWithTitle:@"Quit MacFreeRDP"
+		                                                action:@selector(terminate:)
+		                                         keyEquivalent:@"q"] autorelease];
+		[quitItem setTarget:NSApp];
+		[appMenu addItem:quitItem];
+
+		[appMenuItem setSubmenu:appMenu];
 	}
 
 	NSMenuItem *existingRemote = [mainMenu itemWithTitle:@"Remote"];
@@ -532,6 +569,23 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 	[remoteMenu addItem:sendKeysItem];
 	[remoteItem setSubmenu:remoteMenu];
 	[mainMenu insertItem:remoteItem atIndex:MIN(1, [mainMenu numberOfItems])];
+}
+
+- (void)showAboutPanel:(id)sender
+{
+	(void)sender;
+	NSDictionary *options = [NSDictionary
+	    dictionaryWithObjectsAndKeys:@"MacFreeRDP", @"ApplicationName",
+	                                 [NSString stringWithFormat:@"FreeRDP %@ (%s)",
+	                                                             @FREERDP_VERSION_FULL,
+	                                                             FREERDP_GIT_REVISION],
+	                                 @"Version",
+	                                 ([NSApp applicationIconImage] ?: [NSImage imageNamed:NSImageNameApplicationIcon]),
+	                                 @"ApplicationIcon",
+	                                 @"Remote Desktop Protocol client for macOS.", @"ApplicationDescription",
+	                                 nil];
+	[NSApp orderFrontStandardAboutPanelWithOptions:options];
+	[NSApp activateIgnoringOtherApps:YES];
 }
 
 - (void)installStatusItem
@@ -919,6 +973,8 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 	NSString *message = withMessage ? withMessage : @"Error connecting to server";
 	NSAlert *alert = [[NSAlert alloc] init];
 	[alert setMessageText:message];
+	if ([NSApp applicationIconImage])
+		[alert setIcon:[NSApp applicationIconImage]];
 	[alert beginSheetModalForWindow:[self window]
 	                  modalDelegate:self
 	                 didEndSelector:@selector(alertDidEnd:returnCode:contextInfo:)
@@ -1173,6 +1229,11 @@ static NSURL *mac_find_resource_url(NSString *resourceName, NSString *extension)
 
 static NSImage *mac_load_svg_image(NSString *resourceName, CGFloat pointSize, BOOL templateImage)
 {
+	if ([resourceName isEqualToString:@"freerdp_minimal"] && pointSize >= 128.0)
+		return mac_create_freerdp_vector_icon(pointSize, NO, templateImage);
+	if ([resourceName isEqualToString:@"freerdp_minimal_bw"] && pointSize >= 32.0)
+		return mac_create_freerdp_vector_icon(pointSize, YES, templateImage);
+
 	NSURL *url = mac_find_resource_url(resourceName, @"svg");
 	NSImage *image = nil;
 
@@ -1189,11 +1250,131 @@ static NSImage *mac_load_svg_image(NSString *resourceName, CGFloat pointSize, BO
 	if (!image)
 		return nil;
 
-	[image setTemplate:templateImage];
-	if (pointSize > 0.0)
-		[image setSize:NSMakeSize(pointSize, pointSize)];
+	image = mac_render_image_for_size(image, pointSize, templateImage);
+	if (!image)
+		return nil;
 
 	return image;
+}
+
+static NSImage *mac_create_freerdp_vector_icon(CGFloat pointSize, BOOL monochrome, BOOL templateImage)
+{
+	if (pointSize <= 0.0)
+		pointSize = 128.0;
+
+	NSImage *image = [[[NSImage alloc] initWithSize:NSMakeSize(pointSize, pointSize)] autorelease];
+	[image lockFocus];
+	[[NSGraphicsContext currentContext] setImageInterpolation:NSImageInterpolationHigh];
+
+	NSRect bounds = NSMakeRect(0, 0, pointSize, pointSize);
+	CGFloat outerRadius = pointSize * 0.486;
+	CGFloat innerRadius = pointSize * 0.382;
+	CGFloat pupilRadius = pointSize * 0.181;
+	NSPoint center = NSMakePoint(NSMidX(bounds), NSMidY(bounds));
+	NSPoint pupilCenter = NSMakePoint(center.x + pointSize * 0.135, center.y + pointSize * 0.111);
+	NSBezierPath *outerCircle = [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(center.x - outerRadius,
+		                                                                        center.y - outerRadius,
+		                                                                        outerRadius * 2.0,
+		                                                                        outerRadius * 2.0)];
+	NSBezierPath *innerCircle = [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(center.x - innerRadius,
+		                                                                        center.y - innerRadius,
+		                                                                        innerRadius * 2.0,
+		                                                                        innerRadius * 2.0)];
+	NSBezierPath *pupilCircle = [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(pupilCenter.x - pupilRadius,
+		                                                                        pupilCenter.y - pupilRadius,
+		                                                                        pupilRadius * 2.0,
+		                                                                        pupilRadius * 2.0)];
+
+	NSColor *primary = monochrome ? [NSColor blackColor]
+		                            : [NSColor colorWithCalibratedRed:(7.0 / 255.0)
+		                                                       green:(54.0 / 255.0)
+		                                                        blue:(83.0 / 255.0)
+		                                                       alpha:1.0];
+	NSColor *paper = monochrome ? [NSColor whiteColor] : [NSColor whiteColor];
+	NSColor *highlight = monochrome ? [NSColor whiteColor]
+		                              : [NSColor colorWithCalibratedRed:1.0
+		                                                         green:(250.0 / 255.0)
+		                                                          blue:(234.0 / 255.0)
+		                                                         alpha:1.0];
+
+	[primary setFill];
+	[outerCircle fill];
+	[paper setFill];
+	[innerCircle fill];
+	[primary setFill];
+	[pupilCircle fill];
+
+	NSBezierPath *highlightPath = [NSBezierPath bezierPath];
+	[highlightPath moveToPoint:NSMakePoint(center.x + pointSize * 0.228, center.y + pointSize * 0.269)];
+	[highlightPath curveToPoint:NSMakePoint(center.x + pointSize * 0.189, center.y + pointSize * 0.161)
+	                 controlPoint1:NSMakePoint(center.x + pointSize * 0.252, center.y + pointSize * 0.229)
+	                 controlPoint2:NSMakePoint(center.x + pointSize * 0.240, center.y + pointSize * 0.187)];
+	[highlightPath curveToPoint:NSMakePoint(center.x + pointSize * 0.064, center.y + pointSize * 0.089)
+	                 controlPoint1:NSMakePoint(center.x + pointSize * 0.136, center.y + pointSize * 0.117)
+	                 controlPoint2:NSMakePoint(center.x + pointSize * 0.087, center.y + pointSize * 0.106)];
+	[highlightPath curveToPoint:NSMakePoint(center.x + pointSize * 0.017, center.y + pointSize * 0.208)
+	                 controlPoint1:NSMakePoint(center.x + pointSize * 0.027, center.y + pointSize * 0.121)
+	                 controlPoint2:NSMakePoint(center.x + pointSize * 0.005, center.y + pointSize * 0.168)];
+	[highlightPath curveToPoint:NSMakePoint(center.x + pointSize * 0.141, center.y + pointSize * 0.302)
+	                 controlPoint1:NSMakePoint(center.x + pointSize * 0.046, center.y + pointSize * 0.264)
+	                 controlPoint2:NSMakePoint(center.x + pointSize * 0.114, center.y + pointSize * 0.317)];
+	[highlightPath curveToPoint:NSMakePoint(center.x + pointSize * 0.228, center.y + pointSize * 0.269)
+	                 controlPoint1:NSMakePoint(center.x + pointSize * 0.183, center.y + pointSize * 0.286)
+	                 controlPoint2:NSMakePoint(center.x + pointSize * 0.216, center.y + pointSize * 0.282)];
+	[highlight setFill];
+	[highlightPath fill];
+
+	[image unlockFocus];
+	[image setTemplate:templateImage];
+	return image;
+}
+
+static NSImage *mac_render_image_for_size(NSImage *source, CGFloat pointSize, BOOL templateImage)
+{
+	if (!source)
+		return nil;
+
+	if (pointSize <= 0.0)
+		pointSize = MAX(source.size.width, source.size.height);
+
+	CGFloat backingScale = 2.0;
+	for (NSScreen *screen in [NSScreen screens])
+		backingScale = MAX(backingScale, [screen backingScaleFactor]);
+
+	const NSInteger pixelSize = MAX(1, (NSInteger)lrint(pointSize * backingScale));
+	NSBitmapImageRep *rep = [[[NSBitmapImageRep alloc]
+	    initWithBitmapDataPlanes:NULL
+	                  pixelsWide:pixelSize
+	                  pixelsHigh:pixelSize
+	               bitsPerSample:8
+	             samplesPerPixel:4
+	                    hasAlpha:YES
+	                    isPlanar:NO
+	              colorSpaceName:NSCalibratedRGBColorSpace
+	                 bytesPerRow:0
+	                bitsPerPixel:0] autorelease];
+	if (!rep)
+		return nil;
+
+	NSGraphicsContext *graphicsContext = [NSGraphicsContext graphicsContextWithBitmapImageRep:rep];
+	if (!graphicsContext)
+		return nil;
+
+	[NSGraphicsContext saveGraphicsState];
+	[NSGraphicsContext setCurrentContext:graphicsContext];
+	[graphicsContext setImageInterpolation:NSImageInterpolationHigh];
+	[[NSColor clearColor] set];
+	NSRectFill(NSMakeRect(0, 0, pixelSize, pixelSize));
+	[source drawInRect:NSMakeRect(0, 0, pixelSize, pixelSize)
+	         fromRect:NSZeroRect
+	        operation:NSCompositingOperationSourceOver
+	         fraction:1.0];
+	[NSGraphicsContext restoreGraphicsState];
+
+	NSImage *rendered = [[[NSImage alloc] initWithSize:NSMakeSize(pointSize, pointSize)] autorelease];
+	[rendered addRepresentation:rep];
+	[rendered setTemplate:templateImage];
+	return rendered;
 }
 
 static NSInteger mac_screen_index_for_screen(NSScreen *screen)

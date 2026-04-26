@@ -54,7 +54,7 @@ NSString *mac_keychain_copy_password(NSString *serverName, NSString *username, N
 	if (status != errSecSuccess)
 		return nil;
 
-	NSData *passwordData = [(NSData *)result autorelease];
+	NSData *passwordData = (NSData *)result;
 	NSString *password = [[[NSString alloc] initWithData:passwordData
 	                                             encoding:NSUTF8StringEncoding] autorelease];
 	if (result)
