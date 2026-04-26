@@ -13,6 +13,7 @@
 
 #import <winpr/assert.h>
 #import <freerdp/client/cmdline.h>
+#import <freerdp/client/disp.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -26,6 +27,15 @@ void mac_set_view_size(rdpContext *context, MRDPView *view);
 static void mac_position_window_top_left(NSWindow *window);
 static void mac_maximize_window_minus_menubar(NSWindow *window, MRDPView *view);
 static BOOL mac_is_point_on_left_screen_edge(NSPoint point);
+static NSURL *mac_find_resource_url(NSString *resourceName, NSString *extension);
+static NSImage *mac_load_svg_image(NSString *resourceName, CGFloat pointSize, BOOL templateImage);
+static NSInteger mac_screen_index_for_screen(NSScreen *screen);
+static NSScreen *mac_screen_for_index(NSInteger screenIndex);
+static NSScreen *mac_preferred_screen(NSWindow *window);
+static NSString *mac_display_title(NSScreen *screen, NSInteger screenIndex);
+static DISPLAY_CONTROL_MONITOR_LAYOUT mac_display_layout_for_screen(NSScreen *screen,
+	                                                               BOOL useVisibleFrame,
+	                                                               rdpSettings *settings);
 
 @interface MRDPClientWindow : NSWindow
 @end
@@ -48,6 +58,9 @@ static BOOL mac_is_point_on_left_screen_edge(NSPoint point);
 {
 	id leftEdgeMouseMonitor;
 	NSTimer *leftEdgeFocusTimer;
+	NSStatusItem *statusItem;
+	NSMenu *statusMenu;
+	NSInteger preferredScreenIndex;
 }
 - (void)ensureClientWindow;
 - (void)startLeftEdgeFocusMonitor;
@@ -58,6 +71,16 @@ static BOOL mac_is_point_on_left_screen_edge(NSPoint point);
 - (void)leftEdgeFocusTimerFired:(NSTimer *)timer;
 - (void)focusClientWindow;
 - (void)applyWindowDecorationsFromSettings;
+- (void)configureApplicationIcon;
+- (void)installStatusItem;
+- (void)removeStatusItem;
+- (void)statusItemClicked:(id)sender;
+- (void)rebuildStatusMenu;
+- (void)switchMonitorFromMenuItem:(NSMenuItem *)menuItem;
+- (void)moveSessionToScreen:(NSScreen *)screen screenIndex:(NSInteger)screenIndex;
+- (BOOL)requestRemoteResizeForScreen:(NSScreen *)screen;
+- (NSScreen *)preferredScreen;
+- (NSInteger)currentScreenIndex;
 @end
 
 @implementation AppDelegate
@@ -66,6 +89,8 @@ static BOOL mac_is_point_on_left_screen_edge(NSPoint point);
 {
 	[self stopLeftEdgeFocusMonitor];
 	[self cancelLeftEdgeFocusTimer];
+	[self removeStatusItem];
+	[statusMenu release];
 	[super dealloc];
 }
 
@@ -234,8 +259,11 @@ static BOOL mac_is_point_on_left_screen_edge(NSPoint point);
 	int status;
 	mfContext *mfc;
 	_singleDelegate = self;
+	preferredScreenIndex = mac_screen_index_for_screen([NSScreen mainScreen]);
 	[self CreateContext];
 	[self ensureClientWindow];
+	[self configureApplicationIcon];
+	[self installStatusItem];
 
 	if (!window)
 	{
@@ -263,7 +291,7 @@ static BOOL mac_is_point_on_left_screen_edge(NSPoint point);
 
 	if (status == 0)
 	{
-		NSScreen *screen = [[NSScreen screens] objectAtIndex:0];
+		NSScreen *screen = [self preferredScreen];
 		NSRect screenFrame = [screen frame];
 		rdpSettings *settings = context->settings;
 
@@ -328,6 +356,7 @@ static BOOL mac_is_point_on_left_screen_edge(NSPoint point);
 - (void)applicationWillTerminate:(NSNotification *)notification
 {
 	NSLog(@"Stopping...\n");
+	[self removeStatusItem];
 	freerdp_client_stop(context);
 	[mrdpView releaseResources];
 	_singleDelegate = nil;
@@ -373,6 +402,206 @@ static BOOL mac_is_point_on_left_screen_edge(NSPoint point);
 	}
 
 	[[window contentView] setNeedsDisplay:YES];
+}
+
+- (void)configureApplicationIcon
+{
+	NSImage *dockIcon = mac_load_svg_image(@"freerdp_minimal", 256.0, NO);
+
+	if (dockIcon)
+		[NSApp setApplicationIconImage:dockIcon];
+}
+
+- (void)installStatusItem
+{
+	if (statusItem)
+		return;
+
+	statusItem = [[[NSStatusBar systemStatusBar] statusItemWithLength:NSSquareStatusItemLength]
+	    retain];
+	statusMenu = [[NSMenu alloc] initWithTitle:@"MacFreeRDP"];
+
+	NSStatusBarButton *button = [statusItem button];
+	if (!button)
+		return;
+
+	NSImage *statusIcon = mac_load_svg_image(@"freerdp_minimal_bw",
+	                                         [NSStatusBar systemStatusBar].thickness - 4.0, YES);
+	if (statusIcon)
+		[button setImage:statusIcon];
+
+	[button setTarget:self];
+	[button setAction:@selector(statusItemClicked:)];
+	[button sendActionOn:(NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp)];
+	[button setToolTip:@"MacFreeRDP"];
+}
+
+- (void)removeStatusItem
+{
+	if (!statusItem)
+		return;
+
+	[[NSStatusBar systemStatusBar] removeStatusItem:statusItem];
+	[statusItem release];
+	statusItem = nil;
+}
+
+- (void)statusItemClicked:(id)sender
+{
+	NSEvent *event = [NSApp currentEvent];
+	BOOL showMenu = NO;
+
+	(void)sender;
+
+	if (event)
+	{
+		showMenu = (event.type == NSEventTypeRightMouseUp) ||
+		           ((event.type == NSEventTypeLeftMouseUp) &&
+		            ((event.modifierFlags & NSEventModifierFlagControl) != 0));
+	}
+
+	if (showMenu)
+	{
+		[self rebuildStatusMenu];
+		[statusItem popUpStatusItemMenu:statusMenu];
+		[[statusItem button] setHighlighted:NO];
+		return;
+	}
+
+	[self focusClientWindow];
+}
+
+- (void)rebuildStatusMenu
+{
+	while ([statusMenu numberOfItems] > 0)
+		[statusMenu removeItemAtIndex:0];
+
+	NSArray *screens = [NSScreen screens];
+	NSInteger currentScreen = [self currentScreenIndex];
+
+	for (NSUInteger index = 0; index < [screens count]; index++)
+	{
+		NSScreen *screen = [screens objectAtIndex:index];
+		NSMenuItem *menuItem =
+		    [[[NSMenuItem alloc] initWithTitle:mac_display_title(screen, (NSInteger)index)
+		                                 action:@selector(switchMonitorFromMenuItem:)
+		                          keyEquivalent:@""] autorelease];
+		[menuItem setTarget:self];
+		[menuItem setTag:(NSInteger)index];
+		[menuItem setState:((NSInteger)index == currentScreen) ? NSControlStateValueOn
+		                                                      : NSControlStateValueOff];
+		[statusMenu addItem:menuItem];
+	}
+
+	if ([screens count] > 0)
+		[statusMenu addItem:[NSMenuItem separatorItem]];
+
+	NSMenuItem *quitItem =
+	    [[[NSMenuItem alloc] initWithTitle:@"Quit MacFreeRDP"
+	                                 action:@selector(terminate:)
+	                          keyEquivalent:@""] autorelease];
+	[quitItem setTarget:NSApp];
+	[statusMenu addItem:quitItem];
+}
+
+- (void)switchMonitorFromMenuItem:(NSMenuItem *)menuItem
+{
+	NSInteger screenIndex = [menuItem tag];
+	NSScreen *screen = mac_screen_for_index(screenIndex);
+
+	[self moveSessionToScreen:screen screenIndex:screenIndex];
+}
+
+- (void)moveSessionToScreen:(NSScreen *)screen screenIndex:(NSInteger)screenIndex
+{
+	if (!screen)
+		return;
+
+	preferredScreenIndex = screenIndex;
+
+	if (!window)
+		return;
+
+	rdpSettings *settings = context ? context->settings : NULL;
+	mfContext *mfc = (mfContext *)context;
+	const BOOL fullscreen = settings && freerdp_settings_get_bool(settings, FreeRDP_Fullscreen) &&
+	                        mfc && (mfc->fullscreen_mode != 2);
+	const BOOL pseudoFullscreen = mfc && (mfc->fullscreen_mode == 2);
+	const BOOL useVisibleFrame = pseudoFullscreen;
+	NSRect targetRect = useVisibleFrame ? [screen visibleFrame] : [screen frame];
+
+	if (fullscreen && mrdpView && [mrdpView isInFullScreenMode])
+		[mrdpView exitFullScreenModeWithOptions:nil];
+
+	if (!fullscreen && !pseudoFullscreen)
+	{
+		NSRect frame = [window frame];
+		NSRect visibleFrame = [screen visibleFrame];
+
+		frame.origin.x = NSMinX(visibleFrame);
+		frame.origin.y = NSMaxY(visibleFrame) - NSHeight(frame);
+		[window setFrame:frame display:YES];
+		[self focusClientWindow];
+		return;
+	}
+
+	[window setFrame:targetRect display:YES];
+
+	if (settings)
+	{
+		const BOOL resizeRequested = [self requestRemoteResizeForScreen:screen];
+
+		if (!resizeRequested && pseudoFullscreen)
+			mac_maximize_window_minus_menubar(window, mrdpView);
+	}
+
+	if (fullscreen && mrdpView)
+		[mrdpView enterFullScreenMode:screen withOptions:nil];
+
+	[self focusClientWindow];
+}
+
+- (BOOL)requestRemoteResizeForScreen:(NSScreen *)screen
+{
+	if (!context || !context->settings || !screen)
+		return NO;
+
+	mfContext *mfc = (mfContext *)context;
+	rdpSettings *settings = context->settings;
+	const BOOL fullscreen = freerdp_settings_get_bool(settings, FreeRDP_Fullscreen) &&
+	                        (mfc->fullscreen_mode != 2);
+	const BOOL pseudoFullscreen = (mfc->fullscreen_mode == 2);
+
+	if (!fullscreen && !pseudoFullscreen)
+		return NO;
+
+	if (!mfc->disp || !mfc->disp->SendMonitorLayout)
+		return NO;
+
+	DISPLAY_CONTROL_MONITOR_LAYOUT layout =
+	    mac_display_layout_for_screen(screen, pseudoFullscreen, settings);
+
+	if (!freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, layout.Width))
+		return NO;
+	if (!freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, layout.Height))
+		return NO;
+
+	return (mfc->disp->SendMonitorLayout(mfc->disp, 1, &layout) == CHANNEL_RC_OK) ? YES : NO;
+}
+
+- (NSScreen *)preferredScreen
+{
+	return mac_screen_for_index(preferredScreenIndex);
+}
+
+- (NSInteger)currentScreenIndex
+{
+	NSInteger currentScreen = mac_screen_index_for_screen([window screen]);
+
+	if (currentScreen != NSNotFound)
+		return currentScreen;
+
+	return preferredScreenIndex;
 }
 
 - (int)ParseCommandLineArguments
@@ -603,6 +832,7 @@ void mac_set_view_size(rdpContext *context, MRDPView *view)
 {
 	mfContext *mfc = (mfContext *)context;
 	NSWindow *window = [view window];
+	NSScreen *screen = mac_preferred_screen(window);
 	// set client area to specified dimensions
 	NSRect innerRect;
 	innerRect.origin.x = 0;
@@ -631,8 +861,11 @@ void mac_set_view_size(rdpContext *context, MRDPView *view)
 	// set window to front
 	[NSApp activateIgnoringOtherApps:YES];
 
-	if (freerdp_settings_get_bool(context->settings, FreeRDP_Fullscreen) && mfc->fullscreen_mode != 2)
-		[window toggleFullScreen:nil];
+	if (freerdp_settings_get_bool(context->settings, FreeRDP_Fullscreen) && mfc->fullscreen_mode != 2 &&
+	    view && screen && ![view isInFullScreenMode])
+	{
+		[view enterFullScreenMode:screen withOptions:nil];
+	}
 }
 
 static void mac_position_window_top_left(NSWindow *window)
@@ -640,9 +873,7 @@ static void mac_position_window_top_left(NSWindow *window)
 	if (!window)
 		return;
 
-	NSScreen *screen = [window screen];
-	if (!screen)
-		screen = [NSScreen mainScreen];
+	NSScreen *screen = mac_preferred_screen(window);
 	if (!screen)
 		return;
 
@@ -659,13 +890,10 @@ static void mac_maximize_window_minus_menubar(NSWindow *window, MRDPView *view)
 	if (!window || !view)
 		return;
 
-	NSScreen *screen = [window screen];
-	if (!screen)
-		screen = [NSScreen mainScreen];
+	NSScreen *screen = mac_preferred_screen(window);
 	if (!screen)
 		return;
 
-	NSRect screenFrame = [screen frame];
 	NSRect visibleFrame = [screen visibleFrame];
 
 	NSRect frame = NSMakeRect(
@@ -690,4 +918,140 @@ static BOOL mac_is_point_on_left_screen_edge(NSPoint point)
 	}
 
 	return NO;
+}
+
+static NSURL *mac_find_resource_url(NSString *resourceName, NSString *extension)
+{
+	NSBundle *bundle = [NSBundle mainBundle];
+	NSURL *url = [bundle URLForResource:resourceName withExtension:extension];
+
+	if (url)
+		return url;
+
+	NSString *executablePath = [bundle executablePath];
+	if (!executablePath)
+		executablePath = [[[NSProcessInfo processInfo] arguments] firstObject];
+	if (!executablePath)
+		return nil;
+
+	NSString *candidate = [[executablePath stringByDeletingLastPathComponent]
+	    stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.%@", resourceName,
+	                                                           extension]];
+	if (![[NSFileManager defaultManager] fileExistsAtPath:candidate])
+		return nil;
+
+	return [NSURL fileURLWithPath:candidate];
+}
+
+static NSImage *mac_load_svg_image(NSString *resourceName, CGFloat pointSize, BOOL templateImage)
+{
+	NSURL *url = mac_find_resource_url(resourceName, @"svg");
+	NSImage *image = nil;
+
+	if (!url)
+		return nil;
+
+	image = [[[NSImage alloc] initWithContentsOfURL:url] autorelease];
+	if (!image)
+	{
+		image = [[[NSWorkspace sharedWorkspace] iconForFile:[url path]] copy];
+		[image autorelease];
+	}
+
+	if (!image)
+		return nil;
+
+	[image setTemplate:templateImage];
+	if (pointSize > 0.0)
+		[image setSize:NSMakeSize(pointSize, pointSize)];
+
+	return image;
+}
+
+static NSInteger mac_screen_index_for_screen(NSScreen *screen)
+{
+	NSArray *screens = [NSScreen screens];
+
+	if (!screen)
+		return NSNotFound;
+
+	for (NSUInteger index = 0; index < [screens count]; index++)
+	{
+		if ([screens objectAtIndex:index] == screen)
+			return (NSInteger)index;
+	}
+
+	return NSNotFound;
+}
+
+static NSScreen *mac_screen_for_index(NSInteger screenIndex)
+{
+	NSArray *screens = [NSScreen screens];
+
+	if ((screenIndex >= 0) && ((NSUInteger)screenIndex < [screens count]))
+		return [screens objectAtIndex:(NSUInteger)screenIndex];
+
+	if ([NSScreen mainScreen])
+		return [NSScreen mainScreen];
+
+	return ([screens count] > 0) ? [screens objectAtIndex:0] : nil;
+}
+
+static NSScreen *mac_preferred_screen(NSWindow *window)
+{
+	if (_singleDelegate)
+	{
+		NSScreen *preferred = [_singleDelegate preferredScreen];
+		if (preferred)
+			return preferred;
+	}
+
+	if (window && [window screen])
+		return [window screen];
+
+	return mac_screen_for_index(NSNotFound);
+}
+
+static NSString *mac_display_title(NSScreen *screen, NSInteger screenIndex)
+{
+	NSRect frame = [screen frame];
+	NSMutableString *title =
+	    [NSMutableString stringWithFormat:@"Display %ld (%.0fx%.0f)", (long)screenIndex + 1,
+	                                       frame.size.width, frame.size.height];
+
+	if (screenIndex == mac_screen_index_for_screen([NSScreen mainScreen]))
+		[title appendString:@" Primary"];
+
+	return title;
+}
+
+static DISPLAY_CONTROL_MONITOR_LAYOUT mac_display_layout_for_screen(NSScreen *screen,
+	                                                               BOOL useVisibleFrame,
+	                                                               rdpSettings *settings)
+{
+	DISPLAY_CONTROL_MONITOR_LAYOUT layout = { 0 };
+	NSRect frame = useVisibleFrame ? [screen visibleFrame] : [screen frame];
+	NSNumber *screenNumber = [[screen deviceDescription] objectForKey:@"NSScreenNumber"];
+	const CGDirectDisplayID displayId = screenNumber ? [screenNumber unsignedIntValue] : 0;
+	CGSize physicalSize = displayId ? CGDisplayScreenSize(displayId) : CGSizeZero;
+
+	layout.Flags = DISPLAY_CONTROL_MONITOR_PRIMARY;
+	layout.Left = 0;
+	layout.Top = 0;
+	layout.Width = (UINT32)frame.size.width;
+	layout.Height = (UINT32)frame.size.height;
+	layout.Orientation =
+	    (frame.size.height > frame.size.width) ? ORIENTATION_PORTRAIT : ORIENTATION_LANDSCAPE;
+	layout.PhysicalWidth = (UINT32)physicalSize.width;
+	layout.PhysicalHeight = (UINT32)physicalSize.height;
+	layout.DesktopScaleFactor =
+	    freerdp_settings_get_uint32(settings, FreeRDP_DesktopScaleFactor);
+	layout.DeviceScaleFactor = freerdp_settings_get_uint32(settings, FreeRDP_DeviceScaleFactor);
+
+	if (layout.DesktopScaleFactor == 0)
+		layout.DesktopScaleFactor = 100;
+	if (layout.DeviceScaleFactor == 0)
+		layout.DeviceScaleFactor = 100;
+
+	return layout;
 }

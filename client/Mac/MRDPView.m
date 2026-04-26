@@ -1245,6 +1245,10 @@ static void mac_OnChannelConnectedEventHandler(void *context, const ChannelConne
 	{
 		mac_cliprdr_init(mfc, (CliprdrClientContext *)e->pInterface);
 	}
+	else if (strcmp(e->name, DISP_DVC_CHANNEL_NAME) == 0)
+	{
+		mfc->disp = (DispClientContext *)e->pInterface;
+	}
 	else if (strcmp(e->name, ENCOMSP_SVC_CHANNEL_NAME) == 0)
 	{
 	}
@@ -1267,6 +1271,10 @@ static void mac_OnChannelDisconnectedEventHandler(void *context,
 	if (strcmp(e->name, CLIPRDR_SVC_CHANNEL_NAME) == 0)
 	{
 		mac_cliprdr_uninit(mfc, (CliprdrClientContext *)e->pInterface);
+	}
+	else if (strcmp(e->name, DISP_DVC_CHANNEL_NAME) == 0)
+	{
+		mfc->disp = NULL;
 	}
 	else if (strcmp(e->name, ENCOMSP_SVC_CHANNEL_NAME) == 0)
 	{

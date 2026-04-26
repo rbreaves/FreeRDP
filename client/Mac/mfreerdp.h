@@ -13,6 +13,7 @@
 #include <freerdp/channels/channels.h>
 
 #include <freerdp/client/channels.h>
+#include <freerdp/client/disp.h>
 #include <freerdp/client/rdpei.h>
 #include <freerdp/client/rdpgfx.h>
 #include <freerdp/client/cliprdr.h>
@@ -61,6 +62,7 @@ typedef struct
 	HANDLE clipboardRequestEvent;
 	CLIPRDR_FORMAT* serverFormats;
 	CliprdrClientContext* cliprdr;
+	DispClientContext* disp;
 	UINT32 clipboardCapabilities;
 
 	rdpFile* connectionRdpFile;

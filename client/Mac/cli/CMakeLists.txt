@@ -40,7 +40,9 @@ list(APPEND SOURCES ${OBJECTIVE_SOURCES})
 
 set(HEADERS AppDelegate.h)
 
-set(RESOURCES "en.lproj/InfoPlist.strings" ${MACOSX_BUNDLE_ICON_FILE})
+set(RESOURCES "en.lproj/InfoPlist.strings" ${MACOSX_BUNDLE_ICON_FILE}
+              "../../../resources/freerdp_minimal.svg"
+              "../../../resources/freerdp_minimal_bw.svg")
 # Include XIB file in Xcode resources.
 if("${CMAKE_GENERATOR}" MATCHES "Xcode")
   message(STATUS "Adding Xcode XIB resources for ${MODULE_NAME}")
@@ -58,6 +60,16 @@ if(WITH_BINARY_VERSIONING)
 endif()
 set_target_properties(${PROJECT_NAME} PROPERTIES RESOURCE "${RESOURCES}")
 set_target_properties(${PROJECT_NAME} PROPERTIES MACOSX_BUNDLE_INFO_PLIST ${CMAKE_CURRENT_BINARY_DIR}/Info.plist)
+
+add_custom_command(
+  TARGET ${PROJECT_NAME}
+  POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          ${CMAKE_CURRENT_SOURCE_DIR}/../../../resources/freerdp_minimal.svg
+          ${CMAKE_CURRENT_SOURCE_DIR}/../../../resources/freerdp_minimal_bw.svg
+          ${CMAKE_CURRENT_BINARY_DIR}
+  COMMENT "Copying MacFreeRDP SVG resources beside standalone binary"
+)
 
 target_link_libraries(
   ${PROJECT_NAME} PRIVATE ${COCOA_LIBRARY} ${FOUNDATION_LIBRARY} ${APPKIT_LIBRARY} MacFreeRDP-library
