@@ -71,6 +71,12 @@
 - (void)pause;
 - (void)resume;
 - (void)releaseResources;
+- (BOOL)canSendRemoteInput;
+- (void)sendRemoteUnicodeString:(NSString *)string;
+- (void)sendStoredPasswordForServer:(NSString *)serverName username:(NSString *)username domain:(NSString *)domain;
+- (void)sendRemoteKeyScancode:(UINT32)rdpScancode;
+- (void)sendRemoteCtrlAltDel;
+- (void)sendRemoteBreakKey;
 
 @property(assign) int is_connected;
 

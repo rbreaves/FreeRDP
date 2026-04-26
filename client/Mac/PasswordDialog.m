@@ -70,10 +70,12 @@ static NSScreen *mac_password_dialog_preferred_screen(void)
 @synthesize passwordText;
 @synthesize domainText;
 @synthesize messageLabel;
+@synthesize rememberPasswordButton;
 @synthesize serverHostname;
 @synthesize username;
 @synthesize password;
 @synthesize domain;
+@synthesize rememberPassword;
 @synthesize modalCode;
 
 - (id)init
@@ -90,7 +92,7 @@ static NSScreen *mac_password_dialog_preferred_screen(void)
 
 - (void)createUI
 {
-	NSRect windowFrame = NSMakeRect(0, 0, 450, 280);
+	NSRect windowFrame = NSMakeRect(0, 0, 450, 316);
 	NSWindow *window = [[NSWindow alloc]
 	    initWithContentRect:windowFrame
 	               styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
@@ -185,7 +187,17 @@ static NSScreen *mac_password_dialog_preferred_screen(void)
 	[self.passwordText setStringValue:@""];
 	[contentView addSubview:self.passwordText];
 
-	currentY -= (fieldHeight + spacing * 2);
+	currentY -= (fieldHeight + spacing);
+
+	self.rememberPasswordButton = [[[NSButton alloc]
+	    initWithFrame:NSMakeRect(padding, currentY - 4, windowFrame.size.width - padding * 2,
+	                             buttonHeight)] autorelease];
+	[self.rememberPasswordButton setButtonType:NSSwitchButton];
+	[self.rememberPasswordButton setTitle:@"Remember password in Keychain"];
+	[self.rememberPasswordButton setState:NSControlStateValueOff];
+	[contentView addSubview:self.rememberPasswordButton];
+
+	currentY -= (buttonHeight + spacing * 2);
 
 	// Cancel button
 	NSButton *cancelButton = [[[NSButton alloc]
@@ -248,6 +260,10 @@ static NSScreen *mac_password_dialog_preferred_screen(void)
 		[self.usernameText setStringValue:self.username];
 		[self.window makeFirstResponder:self.passwordText];
 	}
+
+	[self.passwordText setStringValue:self.password ?: @""];
+	[self.rememberPasswordButton setState:self.rememberPassword ? NSControlStateValueOn
+	                                                       : NSControlStateValueOff];
 }
 
 - (void)onOK:(NSObject *)sender
@@ -255,6 +271,7 @@ static NSScreen *mac_password_dialog_preferred_screen(void)
 	self.username = self.usernameText.stringValue;
 	self.password = self.passwordText.stringValue;
 	self.domain = self.domainText.stringValue;
+	self.rememberPassword = (self.rememberPasswordButton.state == NSControlStateValueOn);
 	[NSApp stopModalWithCode:TRUE];
 }
 
@@ -282,6 +299,7 @@ static NSScreen *mac_password_dialog_preferred_screen(void)
 	[passwordText release];
 	[domainText release];
 	[messageLabel release];
+	[rememberPasswordButton release];
 	[serverHostname release];
 	[username release];
 	[password release];

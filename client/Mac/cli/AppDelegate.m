@@ -75,15 +75,21 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 - (void)leftEdgeFocusTimerFired:(NSTimer *)timer;
 - (void)focusClientWindow;
 - (void)applyWindowDecorationsFromSettings;
+- (void)configureMainMenu;
 - (void)configureApplicationIcon;
 - (void)installStatusItem;
 - (void)removeStatusItem;
 - (void)statusItemClicked:(id)sender;
 - (void)rebuildStatusMenu;
 - (void)focusSessionFromMenuItem:(id)sender;
+- (void)sendPasswordFromMenuItem:(id)sender;
+- (void)sendCtrlAltDelFromMenuItem:(id)sender;
+- (void)sendRemoteKeyFromMenuItem:(NSMenuItem *)menuItem;
+- (void)sendRemoteBreakFromMenuItem:(id)sender;
 - (void)switchMonitorFromMenuItem:(NSMenuItem *)menuItem;
 - (void)moveSessionToScreen:(NSScreen *)screen screenIndex:(NSInteger)screenIndex;
 - (BOOL)requestRemoteResizeForScreen:(NSScreen *)screen;
+- (NSString *)credentialTarget;
 - (NSScreen *)preferredScreen;
 - (NSInteger)currentScreenIndex;
 - (void)loadPreferredScreenFromDefaults;
@@ -269,6 +275,7 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 	[self loadPreferredScreenFromDefaults];
 	[self CreateContext];
 	[self ensureClientWindow];
+	[self configureMainMenu];
 	[self configureApplicationIcon];
 	[self installStatusItem];
 
@@ -435,6 +442,98 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 		[NSApp setApplicationIconImage:dockIcon];
 }
 
+- (void)configureMainMenu
+{
+	NSMenu *mainMenu = [NSApp mainMenu];
+	if (!mainMenu)
+		return;
+
+	NSMenuItem *appMenuItem = ([mainMenu numberOfItems] > 0) ? [mainMenu itemAtIndex:0] : nil;
+	NSMenu *appMenu = [appMenuItem submenu];
+
+	if (appMenuItem)
+		[appMenuItem setTitle:@"MacFreeRDP"];
+	if (appMenu)
+		[appMenu setTitle:@"MacFreeRDP"];
+	if (appMenu && ([appMenu numberOfItems] > 0))
+	{
+		NSMenuItem *quitItem = [appMenu itemAtIndex:[appMenu numberOfItems] - 1];
+		[quitItem setTitle:@"Quit MacFreeRDP"];
+	}
+
+	NSMenuItem *existingRemote = [mainMenu itemWithTitle:@"Remote"];
+	if (existingRemote)
+		[mainMenu removeItem:existingRemote];
+
+	NSMenuItem *remoteItem = [[[NSMenuItem alloc] initWithTitle:@"Remote"
+	                                                   action:nil
+	                                            keyEquivalent:@""] autorelease];
+	NSMenu *remoteMenu = [[[NSMenu alloc] initWithTitle:@"Remote"] autorelease];
+
+	NSMenuItem *sendPasswordItem = [[[NSMenuItem alloc] initWithTitle:@"Send Password"
+	                                                        action:@selector(sendPasswordFromMenuItem:)
+	                                                 keyEquivalent:@""] autorelease];
+	[sendPasswordItem setTarget:self];
+	[remoteMenu addItem:sendPasswordItem];
+
+	NSMenuItem *cadItem = [[[NSMenuItem alloc] initWithTitle:@"Ctrl+Alt+Del"
+	                                                  action:@selector(sendCtrlAltDelFromMenuItem:)
+	                                           keyEquivalent:@""] autorelease];
+	[cadItem setTarget:self];
+	[remoteMenu addItem:cadItem];
+
+	NSMenuItem *sendKeysItem = [[[NSMenuItem alloc] initWithTitle:@"Send Keys"
+	                                                    action:nil
+	                                             keyEquivalent:@""] autorelease];
+	NSMenu *sendKeysMenu = [[[NSMenu alloc] initWithTitle:@"Send Keys"] autorelease];
+	NSArray *keyEntries = [NSArray arrayWithObjects:
+	    [NSDictionary dictionaryWithObjectsAndKeys:@"Home", @"title", @(RDP_SCANCODE_HOME), @"tag", nil],
+	    [NSDictionary dictionaryWithObjectsAndKeys:@"End", @"title", @(RDP_SCANCODE_END), @"tag", nil],
+	    [NSDictionary dictionaryWithObjectsAndKeys:@"Forward Delete", @"title", @(RDP_SCANCODE_DELETE), @"tag", nil],
+	    [NSNull null],
+	    [NSDictionary dictionaryWithObjectsAndKeys:@"Num Lock", @"title", @(RDP_SCANCODE_NUMLOCK), @"tag", nil],
+	    [NSDictionary dictionaryWithObjectsAndKeys:@"Scroll Lock", @"title", @(RDP_SCANCODE_SCROLLLOCK), @"tag", nil],
+	    [NSDictionary dictionaryWithObjectsAndKeys:@"Print Scrn", @"title", @(RDP_SCANCODE_PRINTSCREEN), @"tag", nil],
+	    [NSDictionary dictionaryWithObjectsAndKeys:@"Pause", @"title", @(RDP_SCANCODE_PAUSE), @"tag", nil],
+	    [NSDictionary dictionaryWithObjectsAndKeys:@"Break", @"title", @(-1), @"tag", nil],
+	    [NSDictionary dictionaryWithObjectsAndKeys:@"Insert", @"title", @(RDP_SCANCODE_INSERT), @"tag", nil],
+	    [NSNull null],
+	    [NSDictionary dictionaryWithObjectsAndKeys:@"F10", @"title", @(RDP_SCANCODE_F10), @"tag", nil],
+	    [NSDictionary dictionaryWithObjectsAndKeys:@"F11", @"title", @(RDP_SCANCODE_F11), @"tag", nil],
+	    [NSDictionary dictionaryWithObjectsAndKeys:@"F12", @"title", @(RDP_SCANCODE_F12), @"tag", nil],
+	    [NSDictionary dictionaryWithObjectsAndKeys:@"F13", @"title", @(RDP_SCANCODE_F13), @"tag", nil],
+	    [NSDictionary dictionaryWithObjectsAndKeys:@"F14", @"title", @(RDP_SCANCODE_F14), @"tag", nil],
+	    [NSDictionary dictionaryWithObjectsAndKeys:@"F15", @"title", @(RDP_SCANCODE_F15), @"tag", nil],
+	    [NSDictionary dictionaryWithObjectsAndKeys:@"F16", @"title", @(RDP_SCANCODE_F16), @"tag", nil],
+	    nil];
+
+	for (id entry in keyEntries)
+	{
+		if ([entry isKindOfClass:[NSNull class]])
+		{
+			[sendKeysMenu addItem:[NSMenuItem separatorItem]];
+			continue;
+		}
+
+		NSDictionary *definition = (NSDictionary *)entry;
+		NSString *title = [definition objectForKey:@"title"];
+		NSInteger tag = [[definition objectForKey:@"tag"] integerValue];
+		SEL action = (tag == -1) ? @selector(sendRemoteBreakFromMenuItem:)
+		                        : @selector(sendRemoteKeyFromMenuItem:);
+		NSMenuItem *keyItem = [[[NSMenuItem alloc] initWithTitle:title
+		                                                   action:action
+		                                            keyEquivalent:@""] autorelease];
+		[keyItem setTarget:self];
+		[keyItem setTag:tag];
+		[sendKeysMenu addItem:keyItem];
+	}
+
+	[sendKeysItem setSubmenu:sendKeysMenu];
+	[remoteMenu addItem:sendKeysItem];
+	[remoteItem setSubmenu:remoteMenu];
+	[mainMenu insertItem:remoteItem atIndex:MIN(1, [mainMenu numberOfItems])];
+}
+
 - (void)installStatusItem
 {
 	if (statusItem)
@@ -525,6 +624,54 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 	[self focusClientWindow];
 }
 
+- (void)sendPasswordFromMenuItem:(id)sender
+{
+	(void)sender;
+
+	if (!mrdpView || ![mrdpView canSendRemoteInput])
+	{
+		NSBeep();
+		return;
+	}
+
+	NSString *target = [self credentialTarget];
+	NSString *username = nil;
+	NSString *domain = nil;
+
+	if (context && context->settings)
+	{
+		const char *user = freerdp_settings_get_string(context->settings, FreeRDP_Username);
+		const char *dom = freerdp_settings_get_string(context->settings, FreeRDP_Domain);
+		if (user)
+			username = [NSString stringWithCString:user encoding:NSUTF8StringEncoding];
+		if (dom)
+			domain = [NSString stringWithCString:dom encoding:NSUTF8StringEncoding];
+	}
+
+	[self focusClientWindow];
+	[mrdpView sendStoredPasswordForServer:target username:username domain:domain];
+}
+
+- (void)sendCtrlAltDelFromMenuItem:(id)sender
+{
+	(void)sender;
+	[self focusClientWindow];
+	[mrdpView sendRemoteCtrlAltDel];
+}
+
+- (void)sendRemoteKeyFromMenuItem:(NSMenuItem *)menuItem
+{
+	[self focusClientWindow];
+	[mrdpView sendRemoteKeyScancode:(UINT32)[menuItem tag]];
+}
+
+- (void)sendRemoteBreakFromMenuItem:(id)sender
+{
+	(void)sender;
+	[self focusClientWindow];
+	[mrdpView sendRemoteBreakKey];
+}
+
 - (void)switchMonitorFromMenuItem:(NSMenuItem *)menuItem
 {
 	NSInteger screenIndex = [menuItem tag];
@@ -609,6 +756,21 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 		return NO;
 
 	return (mfc->disp->SendMonitorLayout(mfc->disp, 1, &layout) == CHANNEL_RC_OK) ? YES : NO;
+}
+
+- (NSString *)credentialTarget
+{
+	if (!context || !context->settings)
+		return nil;
+
+	const char *name = freerdp_settings_get_string(context->settings, FreeRDP_ServerHostname);
+	const UINT32 port = freerdp_settings_get_uint32(context->settings, FreeRDP_ServerPort);
+	if (!name)
+		return nil;
+
+	return [NSString stringWithFormat:@"%@:%u",
+	                                  [NSString stringWithCString:name encoding:NSUTF8StringEncoding],
+	                                  port];
 }
 
 - (NSScreen *)preferredScreen

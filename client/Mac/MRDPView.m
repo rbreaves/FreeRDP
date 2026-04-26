@@ -26,6 +26,7 @@
 #import "Clipboard.h"
 #import "PasswordDialog.h"
 #import "CertificateDialog.h"
+#import "MacKeychain.h"
 
 #include <winpr/crt.h>
 #include <winpr/assert.h>
@@ -48,6 +49,8 @@
 #import "freerdp/client/file.h"
 #import "freerdp/client/cmdline.h"
 #import "freerdp/log.h"
+#import "freerdp/input.h"
+#import "freerdp/scancode.h"
 
 #import <CoreGraphics/CoreGraphics.h>
 
@@ -70,7 +73,10 @@ static DWORD WINAPI mac_client_thread(void *param);
 static void windows_to_apple_cords(MRDPView *view, NSRect *r);
 static CGContextRef mac_create_bitmap_context(rdpContext *context);
 static BOOL mac_is_chroma_key_pixel(const mfContext *mfc, uint32_t pixel);
+static BOOL mac_send_rdp_scancode(rdpInput *input, UINT32 rdpScancode);
 static NSScreen *mac_startup_preferred_screen(void);
+static NSString *mac_dialog_string_from_utf8(const char *value);
+static NSString *mac_dialog_setting_string(const rdpSettings *settings, size_t key);
 
 static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenIdentifier";
 
@@ -167,6 +173,26 @@ static NSScreen *mac_startup_preferred_screen(void)
 	}
 
 	return [NSScreen mainScreen] ?: [[NSScreen screens] firstObject];
+}
+
+static NSString *mac_dialog_string_from_utf8(const char *value)
+{
+	if (!value)
+		return nil;
+
+	NSString *string = [NSString stringWithCString:value encoding:NSUTF8StringEncoding];
+	if (!string || ([string length] == 0))
+		return nil;
+
+	return string;
+}
+
+static NSString *mac_dialog_setting_string(const rdpSettings *settings, size_t key)
+{
+	if (!settings)
+		return nil;
+
+	return mac_dialog_string_from_utf8(freerdp_settings_get_string(settings, key));
 }
 
 DWORD WINAPI mac_client_thread(void *param)
@@ -1016,6 +1042,90 @@ static BOOL updateFlagStates(rdpInput *input, UINT32 modFlags, UINT32 aKbdModFla
 	return TRUE;
 }
 
+static BOOL mac_send_rdp_scancode(rdpInput *input, UINT32 rdpScancode)
+{
+	WINPR_ASSERT(input);
+	return freerdp_input_send_keyboard_event_ex(input, TRUE, FALSE, rdpScancode) &&
+	       freerdp_input_send_keyboard_event_ex(input, FALSE, FALSE, rdpScancode);
+}
+
+- (BOOL)canSendRemoteInput
+{
+	return is_connected && instance && instance->context && instance->context->input;
+}
+
+- (void)sendRemoteUnicodeString:(NSString *)string
+{
+	if (![self canSendRemoteInput] || !string)
+		return;
+
+	rdpInput *input = instance->context->input;
+	NSUInteger length = [string length];
+
+	for (NSUInteger index = 0; index < length; index++)
+	{
+		const unichar character = [string characterAtIndex:index];
+		(void)freerdp_input_send_unicode_keyboard_event(input, 0, character);
+		(void)freerdp_input_send_unicode_keyboard_event(input, KBD_FLAGS_RELEASE, character);
+	}
+}
+
+- (void)sendStoredPasswordForServer:(NSString *)serverName
+	               username:(NSString *)username
+	                 domain:(NSString *)domain
+{
+	NSString *password = mac_keychain_copy_password(serverName, username, domain);
+
+	if (!password || ([password length] == 0))
+	{
+		NSBeep();
+		return;
+	}
+
+	[self sendRemoteUnicodeString:password];
+}
+
+- (void)sendRemoteKeyScancode:(UINT32)rdpScancode
+{
+	if (![self canSendRemoteInput])
+		return;
+
+	rdpInput *input = instance->context->input;
+
+	if (rdpScancode == RDP_SCANCODE_PAUSE)
+	{
+		(void)freerdp_input_send_keyboard_pause_event(input);
+		return;
+	}
+
+	(void)mac_send_rdp_scancode(input, rdpScancode);
+}
+
+- (void)sendRemoteCtrlAltDel
+{
+	if (![self canSendRemoteInput])
+		return;
+
+	rdpInput *input = instance->context->input;
+	(void)freerdp_input_send_keyboard_event_ex(input, TRUE, FALSE, RDP_SCANCODE_LCONTROL);
+	(void)freerdp_input_send_keyboard_event_ex(input, TRUE, FALSE, RDP_SCANCODE_LMENU);
+	(void)freerdp_input_send_keyboard_event_ex(input, TRUE, FALSE, RDP_SCANCODE_DELETE);
+	(void)freerdp_input_send_keyboard_event_ex(input, FALSE, FALSE, RDP_SCANCODE_DELETE);
+	(void)freerdp_input_send_keyboard_event_ex(input, FALSE, FALSE, RDP_SCANCODE_LMENU);
+	(void)freerdp_input_send_keyboard_event_ex(input, FALSE, FALSE, RDP_SCANCODE_LCONTROL);
+}
+
+- (void)sendRemoteBreakKey
+{
+	if (![self canSendRemoteInput])
+		return;
+
+	rdpInput *input = instance->context->input;
+	(void)freerdp_input_send_keyboard_event_ex(input, TRUE, FALSE, RDP_SCANCODE_LCONTROL);
+	(void)freerdp_input_send_keyboard_pause_event(input);
+	(void)freerdp_input_send_keyboard_event_ex(input, FALSE, FALSE, RDP_SCANCODE_LCONTROL);
+}
+
 static BOOL releaseFlagStates(rdpInput *input, UINT32 aKbdModFlags)
 {
 	return updateFlagStates(input, 0, aKbdModFlags);
@@ -1408,6 +1518,7 @@ void mac_post_disconnect(freerdp *instance)
 static BOOL mac_show_auth_dialog(MRDPView *view, NSString *title, char **username, char **password,
                                  char **domain)
 {
+	const rdpSettings *settings = view->context ? view->context->settings : NULL;
 	WINPR_ASSERT(view);
 	WINPR_ASSERT(title);
 	WINPR_ASSERT(username);
@@ -1418,14 +1529,26 @@ static BOOL mac_show_auth_dialog(MRDPView *view, NSString *title, char **usernam
 
 	dialog.serverHostname = title;
 
-	if (*username)
-		dialog.username = [NSString stringWithCString:*username encoding:NSUTF8StringEncoding];
+	dialog.username = mac_dialog_string_from_utf8(*username);
+	if (!dialog.username)
+		dialog.username = mac_dialog_setting_string(settings, FreeRDP_Username);
 
-	if (*password)
-		dialog.password = [NSString stringWithCString:*password encoding:NSUTF8StringEncoding];
+	dialog.password = mac_dialog_string_from_utf8(*password);
 
-	if (*domain)
-		dialog.domain = [NSString stringWithCString:*domain encoding:NSUTF8StringEncoding];
+	dialog.domain = mac_dialog_string_from_utf8(*domain);
+	if (!dialog.domain)
+		dialog.domain = mac_dialog_setting_string(settings, FreeRDP_Domain);
+
+	NSString *storedPassword = nil;
+	if (dialog.username && ([dialog.username length] > 0))
+		storedPassword = mac_keychain_copy_password(title, dialog.username, dialog.domain);
+
+	if (storedPassword)
+	{
+		dialog.rememberPassword = YES;
+		if (!dialog.password || ([dialog.password length] == 0))
+			dialog.password = storedPassword;
+	}
 
 	free(*username);
 	free(*password);
@@ -1443,6 +1566,11 @@ static BOOL mac_show_auth_dialog(MRDPView *view, NSString *title, char **usernam
 
 	if (ok)
 	{
+		if (dialog.rememberPassword)
+			(void)mac_keychain_store_password(title, dialog.username, dialog.domain, dialog.password);
+		else
+			(void)mac_keychain_delete_password(title, dialog.username, dialog.domain);
+
 		const char *submittedUsername = [dialog.username cStringUsingEncoding:NSUTF8StringEncoding];
 		const size_t submittedUsernameLen =
 		    [dialog.username lengthOfBytesUsingEncoding:NSUTF8StringEncoding];

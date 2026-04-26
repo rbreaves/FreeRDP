@@ -26,16 +26,19 @@
 	NSTextField *passwordText;
 	NSTextField *domainText;
 	NSTextField *messageLabel;
+	NSButton *rememberPasswordButton;
 	NSString *serverHostname;
 	NSString *username;
 	NSString *password;
 	NSString *domain;
+	BOOL rememberPassword;
 	BOOL modalCode;
 }
 @property(retain) NSTextField *usernameText;
 @property(retain) NSTextField *passwordText;
 @property(retain) NSTextField *domainText;
 @property(retain) NSTextField *messageLabel;
+@property(retain) NSButton *rememberPasswordButton;
 
 - (void)onOK:(NSObject *)sender;
 - (void)onCancel:(NSObject *)sender;
@@ -44,6 +47,7 @@
 @property(retain) NSString *username;
 @property(retain) NSString *password;
 @property(retain) NSString *domain;
+@property(assign) BOOL rememberPassword;
 @property(readonly) BOOL modalCode;
 
 - (BOOL)runModal:(NSWindow *)mainWindow;
