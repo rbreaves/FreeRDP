@@ -1222,6 +1222,32 @@ static BOOL mac_send_rdp_scancode(rdpInput *input, UINT32 rdpScancode)
 	               username:(NSString *)username
 	                 domain:(NSString *)domain
 {
+	NSString *keychainPromptKey = [NSString stringWithFormat:@"FreeRDP_KeychainPrompt_%@", serverName];
+	NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+
+	if (![defaults boolForKey:keychainPromptKey])
+	{
+		NSAlert *alert = [NSAlert new];
+		alert.messageText = @"Allow Keychain Access";
+		alert.informativeText = [NSString stringWithFormat:@"FreeRDP would like to access the keychain to retrieve the password for %@.\n\nThis will only be asked once.", serverName];
+		[alert addButtonWithTitle:@"Allow"];
+		[alert addButtonWithTitle:@"Deny"];
+		alert.alertStyle = NSAlertStyleInformational;
+
+		NSModalResponse response = [alert runModal];
+		[alert release];
+
+		if (response == NSAlertFirstButtonReturn)
+		{
+			[defaults setBool:YES forKey:keychainPromptKey];
+		}
+		else
+		{
+			NSBeep();
+			return;
+		}
+	}
+
 	NSString *password = mac_resolve_stored_password(serverName, username, domain);
 
 	if ((!password || ([password length] == 0)) && instance && instance->context &&
