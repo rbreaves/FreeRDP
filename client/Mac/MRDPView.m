@@ -73,6 +73,12 @@ static DWORD WINAPI mac_client_thread(void *param);
 static void windows_to_apple_cords(MRDPView *view, NSRect *r);
 static CGContextRef mac_create_bitmap_context(rdpContext *context);
 static BOOL mac_is_chroma_key_pixel(const mfContext *mfc, uint32_t pixel);
+static BOOL mac_is_resize_cursor(NSCursor *cursor);
+static BOOL mac_view_point_to_buffer_point(MRDPView *view, const mfContext *mfc,
+	                                       rdpContext *context, NSPoint viewPoint,
+	                                       int *outX, int *outY);
+static BOOL mac_has_chroma_key_margin(const mfContext *mfc, const rdpGdi *gdi, int x, int y,
+	                                  int radius);
 static BOOL mac_send_rdp_scancode(rdpInput *input, UINT32 rdpScancode);
 static NSScreen *mac_startup_preferred_screen(void);
 static NSString *mac_dialog_string_from_utf8(const char *value);
@@ -627,31 +633,21 @@ DWORD WINAPI mac_client_thread(void *param)
 	if (!mfc->chromaKeyEnabled)
 		return NO;
 
+	int bx = 0;
+	int by = 0;
+	if (!mac_view_point_to_buffer_point(self, mfc, context, viewPoint, &bx, &by))
+		return NO;
+
 	rdpGdi *gdi = context->gdi;
-	if (!gdi || !gdi->primary_buffer)
-		return NO;
-
-	NSRect bounds = [self bounds];
-	if (!NSPointInRect(viewPoint, bounds))
-		return NO;
-
-	CGFloat width = NSWidth(bounds);
-	CGFloat height = NSHeight(bounds);
-	if (width <= 0 || height <= 0)
-		return NO;
-
-	CGFloat xScale = (CGFloat)gdi->width / width;
-	CGFloat yScale = (CGFloat)gdi->height / height;
-	int bx = (int)floor(viewPoint.x * xScale);
-	int by = (int)floor((height - viewPoint.y) * yScale);
-
-	if (bx < 0 || bx >= (int)gdi->width || by < 0 || by >= (int)gdi->height)
-		return NO;
-
 	uint32_t *buffer = (uint32_t *)gdi->primary_buffer;
 	uint32_t pixel = buffer[(size_t)by * (size_t)gdi->width + (size_t)bx];
+	if (!mac_is_chroma_key_pixel(mfc, pixel))
+		return NO;
 
-	return mac_is_chroma_key_pixel(mfc, pixel);
+	if (mac_is_resize_cursor([NSCursor currentSystemCursor]))
+		return NO;
+
+	return mac_has_chroma_key_margin(mfc, gdi, bx, by, 8);
 }
 
 - (BOOL)shouldPassMouseEventThrough:(NSEvent *)event
@@ -1365,6 +1361,84 @@ static BOOL mac_is_chroma_key_pixel(const mfContext *mfc, uint32_t pixel)
 	float maxDiff = fmaxf(fmaxf(diffR, diffG), diffB);
 
 	return (maxDiff <= tolerance) ? TRUE : FALSE;
+}
+
+static BOOL mac_is_resize_cursor(NSCursor *cursor)
+{
+	if (!cursor)
+		return FALSE;
+
+	if ((cursor == [NSCursor resizeLeftRightCursor]) ||
+	    (cursor == [NSCursor resizeUpDownCursor]))
+	{
+		return TRUE;
+	}
+
+	return [cursor isEqual:[NSCursor resizeLeftRightCursor]] ||
+	       [cursor isEqual:[NSCursor resizeUpDownCursor]];
+}
+
+static BOOL mac_view_point_to_buffer_point(MRDPView *view, const mfContext *mfc,
+	                                       rdpContext *context, NSPoint viewPoint,
+	                                       int *outX, int *outY)
+{
+	rdpGdi *gdi = context ? context->gdi : NULL;
+	if (!view || !mfc || !mfc->chromaKeyEnabled || !gdi || !gdi->primary_buffer)
+		return FALSE;
+
+	NSRect bounds = [view bounds];
+	if (!NSPointInRect(viewPoint, bounds))
+		return FALSE;
+
+	CGFloat width = NSWidth(bounds);
+	CGFloat height = NSHeight(bounds);
+	if (width <= 0 || height <= 0)
+		return FALSE;
+
+	CGFloat xScale = (CGFloat)gdi->width / width;
+	CGFloat yScale = (CGFloat)gdi->height / height;
+	int bx = (int)floor(viewPoint.x * xScale);
+	int by = (int)floor((height - viewPoint.y) * yScale);
+
+	if (bx < 0 || bx >= (int)gdi->width || by < 0 || by >= (int)gdi->height)
+		return FALSE;
+
+	if (outX)
+		*outX = bx;
+	if (outY)
+		*outY = by;
+
+	return TRUE;
+}
+
+static BOOL mac_has_chroma_key_margin(const mfContext *mfc, const rdpGdi *gdi, int x, int y,
+	                                  int radius)
+{
+	uint32_t *buffer = gdi ? (uint32_t *)gdi->primary_buffer : NULL;
+
+	if (!mfc || !gdi || !buffer || radius < 1)
+		return FALSE;
+
+	for (int dy = -radius; dy <= radius; dy++)
+	{
+		for (int dx = -radius; dx <= radius; dx++)
+		{
+			if ((dx == 0) && (dy == 0))
+				continue;
+
+			const int nx = x + dx;
+			const int ny = y + dy;
+
+			if (nx < 0 || nx >= (int)gdi->width || ny < 0 || ny >= (int)gdi->height)
+				return FALSE;
+
+			const uint32_t pixel = buffer[(size_t)ny * (size_t)gdi->width + (size_t)nx];
+			if (!mac_is_chroma_key_pixel(mfc, pixel))
+				return FALSE;
+		}
+	}
+
+	return TRUE;
 }
 
 - (void)releaseResources
