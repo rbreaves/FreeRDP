@@ -39,6 +39,7 @@
 #include "sdl_input.hpp"
 
 #include "dialogs/sdl_connection_dialog_wrapper.hpp"
+#include "sdl_chroma.hpp"
 
 class SdlContext
 {
@@ -112,6 +113,7 @@ class SdlContext
 
 	[[nodiscard]] bool drawToWindows(const std::vector<SDL_Rect>& rects = {});
 	[[nodiscard]] bool drawToWindow(SdlWindow& window, const std::vector<SDL_Rect>& rects = {});
+	[[nodiscard]] bool updateChromaKeyMouseRects();
 	[[nodiscard]] bool minimizeAllWindows();
 	[[nodiscard]] int exitCode() const;
 	[[nodiscard]] SDL_PixelFormat pixelFormat() const;
@@ -236,4 +238,8 @@ class SdlContext
 	WinPREvent _windowsCreatedEvent;
 	std::thread _thread;
 	std::vector<COMMAND_LINE_ARGUMENT_A> _args;
+
+	uint32_t _chromaKeyColor = 0x00FF00;
+	float _chromaKeyTolerance = 10.0f;
+	bool _chromaKeyEnabled = false;
 };

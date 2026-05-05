@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 
 #include "sdl_context.hpp"
 #include "sdl_config.hpp"
@@ -36,7 +37,10 @@
 #include <aad/sdl_webview.hpp>
 #endif
 
+#define TAG CLIENT_TAG("sdl")
+
 static constexpr auto sdl_allow_screensaver = "sdl-allow-screensaver";
+static constexpr auto sdl_chroma_key = "chroma-key";
 
 static void sdl_PointerFreeCopyAll(rdpPointer* pointer)
 {
@@ -76,6 +80,8 @@ SdlContext::SdlContext(rdpContext* context)
 
 	_args.push_back({ sdl_allow_screensaver, COMMAND_LINE_VALUE_BOOL, nullptr, BoolValueFalse,
 	                  nullptr, -1, nullptr, "Allow local screensaver to activate" });
+	_args.push_back({ sdl_chroma_key, COMMAND_LINE_VALUE_OPTIONAL, nullptr, nullptr, nullptr, -1,
+	                  nullptr, "Enable chroma key with color in hex (e.g., 00FF00 or FF00FF)" });
 
 	/* Push a null element used as abort when iterating the array */
 	_args.push_back({ nullptr, 0, nullptr, nullptr, nullptr, -1, nullptr, nullptr });
@@ -936,6 +942,45 @@ bool SdlContext::drawToWindow(SdlWindow& window, const std::vector<SDL_Rect>& re
 	return true;
 }
 
+bool SdlContext::updateChromaKeyMouseRects()
+{
+	if (!_chromaKeyEnabled || !isConnected())
+		return true;
+
+	auto gdi = context()->gdi;
+	if (!gdi || !gdi->primary_buffer)
+		return true;
+
+	for (auto& [id, window] : _windows)
+	{
+		auto opaqueRegions = SdlChroma::calculateOpaqueRegions(
+		    _chromaKeyColor, _chromaKeyTolerance, gdi, 1);
+
+		if (opaqueRegions.empty())
+		{
+			SDL_SetWindowMouseRect(window.window(), nullptr);
+		}
+		else if (opaqueRegions.size() == 1)
+		{
+			SDL_SetWindowMouseRect(window.window(), &opaqueRegions[0]);
+		}
+		else
+		{
+			SDL_SetWindowMouseRect(window.window(), nullptr);
+
+			for (const auto& rect : opaqueRegions)
+			{
+				SDL_Point topLeft{rect.x, rect.y};
+				SDL_Point bottomRight{rect.x + rect.w - 1, rect.y + rect.h - 1};
+				WLog_DBG(TAG, "Opaque region: (%d, %d) to (%d, %d)", topLeft.x, topLeft.y,
+				         bottomRight.x, bottomRight.y);
+			}
+		}
+	}
+
+	return true;
+}
+
 bool SdlContext::minimizeAllWindows()
 {
 	for (auto& w : _windows)
@@ -1454,6 +1499,25 @@ int SdlContext::argumentHandler(const COMMAND_LINE_ARGUMENT_A* arg, void* custom
 				}
 			}
 		}
+		else if (strcmp(arg->Name, sdl_chroma_key) == 0)
+		{
+			sdl->_chromaKeyEnabled = TRUE;
+			if (arg->Value != nullptr)
+			{
+				uint32_t color = 0;
+				if (sscanf(arg->Value, "%x", &color) == 1)
+				{
+					sdl->_chromaKeyColor = color;
+				}
+				else
+				{
+					SDL_LogError(SDL_LOG_CATEGORY_APPLICATION,
+					             "Invalid chroma-key color: %s (expected hex like 00FF00)",
+					             arg->Value);
+					return -2;
+				}
+			}
+		}
 	}
 	return 0;
 }
@@ -1488,6 +1552,9 @@ bool SdlContext::drawToWindows(const std::vector<SDL_Rect>& rects)
 		if (!drawToWindow(window.second, rects))
 			return FALSE;
 	}
+
+	if (!updateChromaKeyMouseRects())
+		return FALSE;
 
 	return TRUE;
 }
