@@ -168,7 +168,7 @@ static void sdl_term_handler([[maybe_unused]] int signum, [[maybe_unused]] const
 		while (!sdl->shallAbort())
 		{
 			SDL_Event windowEvent = {};
-			while (!sdl->shallAbort() && SDL_WaitEventTimeout(nullptr, 1000))
+			while (!sdl->shallAbort() && SDL_WaitEventTimeout(nullptr, 10))
 			{
 				/* Only poll standard SDL events and SDL_EVENT_USERS meant to create
 				 * dialogs. do not process the dialog return value events here.
