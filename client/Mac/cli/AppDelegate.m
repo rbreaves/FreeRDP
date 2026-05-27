@@ -19,6 +19,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static AppDelegate *_singleDelegate = nil;
 void AppDelegate_ConnectionResultEventHandler(void *context, const ConnectionResultEventArgs *e);
@@ -49,6 +50,11 @@ static BOOL mac_ax_get_window_frame(AXUIElementRef windowElement, CGRect *frame)
 static void mac_ax_set_window_frame(AXUIElementRef windowElement, CGRect frame);
 
 static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenIdentifier";
+static NSString *const MRDPChromaKeyEnabledKey = @"MRDPChromaKeyEnabled";
+static NSString *const MRDPChromaKeyColorKey = @"MRDPChromaKeyColor";
+static NSString *const MRDPStatusSessionDidUpdateNotification = @"org.freerdp.mac.statusSessionDidUpdate";
+static NSString *const MRDPStatusSessionWillTerminateNotification = @"org.freerdp.mac.statusSessionWillTerminate";
+static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusCommand";
 
 @interface MRDPClientWindow : NSWindow
 @end
@@ -73,6 +79,8 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 	NSTimer *leftEdgeFocusTimer;
 	NSStatusItem *statusItem;
 	NSMenu *statusMenu;
+	NSMutableDictionary *statusSessions;
+	NSTimer *statusCoordinationTimer;
 	NSTimer *spacerEnforcementTimer;
 	NSInteger preferredScreenIndex;
 }
@@ -87,13 +95,34 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 - (void)applyWindowDecorationsFromSettings;
 - (void)configureMainMenu;
 - (void)configureApplicationIcon;
+- (void)configureStatusCoordination;
+- (void)stopStatusCoordination;
+- (void)statusCoordinationTimerFired:(NSTimer *)timer;
+- (void)reevaluateStatusItemOwnership;
+- (void)broadcastStatusSessionUpdate;
+- (void)broadcastStatusSessionWillTerminate;
+- (void)handleStatusSessionDidUpdate:(NSNotification *)notification;
+- (void)handleStatusSessionWillTerminate:(NSNotification *)notification;
+- (void)handleStatusCommand:(NSNotification *)notification;
+- (NSDictionary *)statusSessionInfo;
+- (NSNumber *)localStatusSessionPID;
+- (BOOL)isStatusItemOwner;
+- (BOOL)isLocalStatusSession:(NSDictionary *)session;
+- (void)postStatusCommand:(NSString *)command forSession:(NSDictionary *)session value:(NSNumber *)value;
 - (void)installStatusItem;
 - (void)removeStatusItem;
 - (void)statusItemClicked:(id)sender;
 - (void)rebuildStatusMenu;
+- (void)appendSessionMenuItemsToMenu:(NSMenu *)menu
+                          forSession:(NSDictionary *)session
+                         includeQuit:(BOOL)includeQuit;
+- (void)remoteStatusCommandFromMenuItem:(NSMenuItem *)menuItem;
 - (void)focusSessionFromMenuItem:(id)sender;
 - (void)refreshBitmapFromMenuItem:(id)sender;
+- (void)quitSessionFromMenuItem:(id)sender;
+- (void)quitAllFromMenuItem:(id)sender;
 - (void)setSpacerPositionFromMenuItem:(NSMenuItem *)menuItem;
+- (void)showGeneralSettingsFromMenuItem:(id)sender;
 - (void)showSpacerSettingsFromMenuItem:(id)sender;
 - (void)updateSpacerWindow;
 - (void)showSpacerWindow;
@@ -115,6 +144,9 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 - (NSInteger)currentScreenIndex;
 - (void)loadPreferredScreenFromDefaults;
 - (void)savePreferredScreenToDefaults;
+- (void)loadChromaKeySettingsFromDefaults;
+- (NSString *)sessionMenuTitle;
+- (NSArray *)runningMacFreeRDPApplications;
 @end
 
 @implementation AppDelegate
@@ -123,9 +155,11 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 {
 	[self stopLeftEdgeFocusMonitor];
 	[self cancelLeftEdgeFocusTimer];
+	[self stopStatusCoordination];
 	[self removeStatusItem];
 	[self hideSpacerWindow];
 	[self stopSpacerEnforcement];
+	[statusSessions release];
 	[statusMenu release];
 	[super dealloc];
 }
@@ -297,11 +331,12 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 	_singleDelegate = self;
 	[self loadPreferredScreenFromDefaults];
 	[self CreateContext];
+	[self loadChromaKeySettingsFromDefaults];
 	[self loadSpacerSettingsFromDefaults];
 	[self ensureClientWindow];
 	[self configureMainMenu];
 	[self configureApplicationIcon];
-	[self installStatusItem];
+	[self configureStatusCoordination];
 
 	if (!window)
 	{
@@ -367,6 +402,7 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 		}
 
 		[window setTitle:winTitle];
+		[self broadcastStatusSessionUpdate];
 	}
 	else
 	{
@@ -394,6 +430,8 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 {
 	NSLog(@"Stopping...\n");
 	[self savePreferredScreenToDefaults];
+	[self broadcastStatusSessionWillTerminate];
+	[self stopStatusCoordination];
 	[self stopSpacerEnforcement];
 	[self removeStatusItem];
 	freerdp_client_stop(context);
@@ -427,6 +465,7 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 {
 	(void)notification;
 	[self savePreferredScreenToDefaults];
+	[self broadcastStatusSessionUpdate];
 }
 
 - (void)focusClientWindow
@@ -609,6 +648,229 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 	[NSApp activateIgnoringOtherApps:YES];
 }
 
+- (void)configureStatusCoordination
+{
+	if (!statusSessions)
+		statusSessions = [[NSMutableDictionary alloc] init];
+
+	[statusSessions setObject:[self statusSessionInfo] forKey:[self localStatusSessionPID]];
+
+	NSDistributedNotificationCenter *center = [NSDistributedNotificationCenter defaultCenter];
+	[center addObserver:self
+	           selector:@selector(handleStatusSessionDidUpdate:)
+	               name:MRDPStatusSessionDidUpdateNotification
+	             object:nil];
+	[center addObserver:self
+	           selector:@selector(handleStatusSessionWillTerminate:)
+	               name:MRDPStatusSessionWillTerminateNotification
+	             object:nil];
+	[center addObserver:self
+	           selector:@selector(handleStatusCommand:)
+	               name:MRDPStatusCommandNotification
+	             object:nil];
+
+	statusCoordinationTimer = [NSTimer scheduledTimerWithTimeInterval:1.0
+	                                                           target:self
+	                                                         selector:@selector(statusCoordinationTimerFired:)
+	                                                         userInfo:nil
+	                                                          repeats:YES];
+
+	[self reevaluateStatusItemOwnership];
+	[self broadcastStatusSessionUpdate];
+}
+
+- (void)stopStatusCoordination
+{
+	if (statusCoordinationTimer)
+	{
+		[statusCoordinationTimer invalidate];
+		statusCoordinationTimer = nil;
+	}
+
+	[[NSDistributedNotificationCenter defaultCenter] removeObserver:self];
+}
+
+- (void)statusCoordinationTimerFired:(NSTimer *)timer
+{
+	(void)timer;
+	[self reevaluateStatusItemOwnership];
+	[self broadcastStatusSessionUpdate];
+}
+
+- (void)reevaluateStatusItemOwnership
+{
+	NSMutableSet *runningPIDs = [NSMutableSet set];
+	for (NSRunningApplication *application in [self runningMacFreeRDPApplications])
+		[runningPIDs addObject:[NSNumber numberWithInt:[application processIdentifier]]];
+	[runningPIDs addObject:[self localStatusSessionPID]];
+
+	NSArray *sessionPIDs = [[statusSessions allKeys] copy];
+	for (NSNumber *pid in sessionPIDs)
+	{
+		if (![runningPIDs containsObject:pid])
+			[statusSessions removeObjectForKey:pid];
+	}
+	[sessionPIDs release];
+
+	if ([self isStatusItemOwner])
+		[self installStatusItem];
+	else
+		[self removeStatusItem];
+}
+
+- (void)broadcastStatusSessionUpdate
+{
+	NSDictionary *info = [self statusSessionInfo];
+	[statusSessions setObject:info forKey:[self localStatusSessionPID]];
+
+	[[NSDistributedNotificationCenter defaultCenter]
+	    postNotificationName:MRDPStatusSessionDidUpdateNotification
+	                  object:nil
+	                userInfo:info
+	      deliverImmediately:YES];
+}
+
+- (void)broadcastStatusSessionWillTerminate
+{
+	NSDictionary *info = [NSDictionary dictionaryWithObject:[self localStatusSessionPID] forKey:@"pid"];
+	[[NSDistributedNotificationCenter defaultCenter]
+	    postNotificationName:MRDPStatusSessionWillTerminateNotification
+	                  object:nil
+	                userInfo:info
+	      deliverImmediately:YES];
+}
+
+- (void)handleStatusSessionDidUpdate:(NSNotification *)notification
+{
+	NSDictionary *info = [notification userInfo];
+	NSNumber *pid = [info objectForKey:@"pid"];
+	if (!pid)
+		return;
+
+	[statusSessions setObject:info forKey:pid];
+	[self reevaluateStatusItemOwnership];
+}
+
+- (void)handleStatusSessionWillTerminate:(NSNotification *)notification
+{
+	NSNumber *pid = [[notification userInfo] objectForKey:@"pid"];
+	if (pid)
+		[statusSessions removeObjectForKey:pid];
+
+	[self reevaluateStatusItemOwnership];
+}
+
+- (void)handleStatusCommand:(NSNotification *)notification
+{
+	NSDictionary *info = [notification userInfo];
+	NSNumber *pid = [info objectForKey:@"pid"];
+	NSString *command = [info objectForKey:@"command"];
+
+	if (!pid || !command || ![pid isEqualToNumber:[self localStatusSessionPID]])
+		return;
+
+	if ([command isEqualToString:@"focus"])
+		[self focusClientWindow];
+	else if ([command isEqualToString:@"refresh"])
+		[self refreshBitmapFromMenuItem:nil];
+	else if ([command isEqualToString:@"screen"])
+	{
+		NSNumber *screenIndex = [info objectForKey:@"value"];
+		NSScreen *screen = mac_screen_for_index([screenIndex integerValue]);
+		[self moveSessionToScreen:screen screenIndex:[screenIndex integerValue]];
+	}
+	else if ([command isEqualToString:@"spacerPosition"])
+	{
+		NSNumber *position = [info objectForKey:@"value"];
+		mfContext *mfc = (mfContext *)context;
+		mfc->spacerPosition = (UINT32)[position integerValue];
+
+		NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+		[defaults setInteger:(NSInteger)mfc->spacerPosition forKey:@"MRDPSpacerPosition"];
+		[defaults synchronize];
+
+		[self updateSpacerWindow];
+		[self broadcastStatusSessionUpdate];
+	}
+	else if ([command isEqualToString:@"spacerSettings"])
+	{
+		[self showSpacerSettingsFromMenuItem:nil];
+	}
+	else if ([command isEqualToString:@"chroma"])
+	{
+		NSNumber *enabled = [info objectForKey:@"enabled"];
+		NSNumber *color = [info objectForKey:@"color"];
+		mfContext *mfc = (mfContext *)context;
+
+		if (enabled)
+			mfc->chromaKeyEnabled = [enabled boolValue];
+		if (color)
+			mfc->chromaKeyColor = (uint32_t)([color integerValue] & 0xFFFFFF);
+
+		if (mrdpView)
+			[mrdpView refreshBitmap];
+	}
+	else if ([command isEqualToString:@"quit"])
+	{
+		[NSApp terminate:self];
+	}
+}
+
+- (NSDictionary *)statusSessionInfo
+{
+	mfContext *mfc = (mfContext *)context;
+
+	return [NSDictionary dictionaryWithObjectsAndKeys:
+	                         [self localStatusSessionPID], @"pid",
+	                         [self sessionMenuTitle], @"title",
+	                         @([self currentScreenIndex]), @"currentScreen",
+	                         @(mfc ? mfc->spacerPosition : 0), @"spacerPosition",
+	                         @(mfc ? mfc->spacerEnabled : NO), @"spacerEnabled",
+	                         nil];
+}
+
+- (NSNumber *)localStatusSessionPID
+{
+	return [NSNumber numberWithInt:getpid()];
+}
+
+- (BOOL)isStatusItemOwner
+{
+	pid_t localPID = getpid();
+	pid_t ownerPID = localPID;
+
+	for (NSRunningApplication *application in [self runningMacFreeRDPApplications])
+	{
+		pid_t pid = [application processIdentifier];
+		if (pid > 0 && pid < ownerPID)
+			ownerPID = pid;
+	}
+
+	return ownerPID == localPID;
+}
+
+- (BOOL)isLocalStatusSession:(NSDictionary *)session
+{
+	return [[session objectForKey:@"pid"] isEqualToNumber:[self localStatusSessionPID]];
+}
+
+- (void)postStatusCommand:(NSString *)command forSession:(NSDictionary *)session value:(NSNumber *)value
+{
+	NSNumber *pid = [session objectForKey:@"pid"];
+	if (!pid || !command)
+		return;
+
+	NSMutableDictionary *info =
+	    [NSMutableDictionary dictionaryWithObjectsAndKeys:pid, @"pid", command, @"command", nil];
+	if (value)
+		[info setObject:value forKey:@"value"];
+
+	[[NSDistributedNotificationCenter defaultCenter] postNotificationName:MRDPStatusCommandNotification
+	                                                               object:nil
+	                                                             userInfo:info
+	                                                   deliverImmediately:YES];
+}
+
 - (void)installStatusItem
 {
 	if (statusItem)
@@ -641,6 +903,8 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 	[[NSStatusBar systemStatusBar] removeStatusItem:statusItem];
 	[statusItem release];
 	statusItem = nil;
+	[statusMenu release];
+	statusMenu = nil;
 }
 
 - (void)statusItemClicked:(id)sender
@@ -656,34 +920,97 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 	while ([statusMenu numberOfItems] > 0)
 		[statusMenu removeItemAtIndex:0];
 
+	NSArray *sessions = [[statusSessions allValues]
+	    sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *left, NSDictionary *right) {
+		    NSNumber *leftPID = [left objectForKey:@"pid"];
+		    NSNumber *rightPID = [right objectForKey:@"pid"];
+		    return [leftPID compare:rightPID];
+	    }];
+
+	if ([sessions count] > 1)
+	{
+		for (NSDictionary *session in sessions)
+		{
+			NSString *sessionTitle = [session objectForKey:@"title"] ?: @"Current Session";
+			NSMenuItem *sessionItem = [[[NSMenuItem alloc] initWithTitle:sessionTitle
+			                                                      action:nil
+			                                               keyEquivalent:@""] autorelease];
+			NSMenu *sessionMenu = [[[NSMenu alloc] initWithTitle:sessionTitle] autorelease];
+			[self appendSessionMenuItemsToMenu:sessionMenu forSession:session includeQuit:YES];
+			[sessionItem setSubmenu:sessionMenu];
+			[statusMenu addItem:sessionItem];
+		}
+	}
+	else
+	{
+		NSDictionary *session = ([sessions count] > 0) ? [sessions objectAtIndex:0] : [self statusSessionInfo];
+		[self appendSessionMenuItemsToMenu:statusMenu forSession:session includeQuit:NO];
+	}
+
+	[statusMenu addItem:[NSMenuItem separatorItem]];
+
+	NSMenuItem *generalSettingsItem =
+	    [[[NSMenuItem alloc] initWithTitle:@"General Settings"
+	                                 action:@selector(showGeneralSettingsFromMenuItem:)
+	                          keyEquivalent:@""] autorelease];
+	[generalSettingsItem setTarget:self];
+	[statusMenu addItem:generalSettingsItem];
+
+	NSMenuItem *quitItem =
+	    [[[NSMenuItem alloc] initWithTitle:([sessions count] > 1 ? @"Quit All" : @"Quit MacFreeRDP")
+	                                 action:@selector(quitAllFromMenuItem:)
+	                          keyEquivalent:@""] autorelease];
+	[quitItem setTarget:self];
+	[statusMenu addItem:quitItem];
+}
+
+- (void)appendSessionMenuItemsToMenu:(NSMenu *)menu
+                          forSession:(NSDictionary *)session
+                         includeQuit:(BOOL)includeQuit
+{
 	NSArray *screens = [NSScreen screens];
-	NSInteger currentScreen = [self currentScreenIndex];
+	BOOL localSession = [self isLocalStatusSession:session];
+	NSInteger currentScreen = localSession ? [self currentScreenIndex]
+	                                      : [[session objectForKey:@"currentScreen"] integerValue];
 
 	for (NSUInteger index = 0; index < [screens count]; index++)
 	{
 		NSScreen *screen = [screens objectAtIndex:index];
 		NSMenuItem *menuItem =
 		    [[[NSMenuItem alloc] initWithTitle:mac_display_title(screen, (NSInteger)index)
-		                                 action:@selector(switchMonitorFromMenuItem:)
+		                                 action:(localSession ? @selector(switchMonitorFromMenuItem:)
+		                                                       : @selector(remoteStatusCommandFromMenuItem:))
 		                          keyEquivalent:@""] autorelease];
 		[menuItem setTarget:self];
 		[menuItem setTag:(NSInteger)index];
+		if (!localSession)
+			[menuItem setRepresentedObject:[NSDictionary dictionaryWithObjectsAndKeys:
+			                                             session, @"session", @"screen", @"command",
+			                                             @((NSInteger)index), @"value", nil]];
 		[menuItem setState:((NSInteger)index == currentScreen) ? NSControlStateValueOn
 		                                                      : NSControlStateValueOff];
-		[statusMenu addItem:menuItem];
+		[menu addItem:menuItem];
 	}
 
 	if ([screens count] > 0)
-		[statusMenu addItem:[NSMenuItem separatorItem]];
+		[menu addItem:[NSMenuItem separatorItem]];
 
 	NSMenuItem *refreshItem =
 	    [[[NSMenuItem alloc] initWithTitle:@"Refresh Bitmap"
-	                                 action:@selector(refreshBitmapFromMenuItem:)
+	                                 action:(localSession ? @selector(refreshBitmapFromMenuItem:)
+	                                                       : @selector(remoteStatusCommandFromMenuItem:))
 	                          keyEquivalent:@""] autorelease];
 	[refreshItem setTarget:self];
-	[statusMenu addItem:refreshItem];
+	if (!localSession)
+		[refreshItem setRepresentedObject:[NSDictionary dictionaryWithObjectsAndKeys:
+		                                                session, @"session", @"refresh", @"command", nil]];
+	[menu addItem:refreshItem];
 
 	mfContext *mfc = (mfContext *)context;
+	NSInteger spacerPosition = localSession ? (mfc ? (NSInteger)mfc->spacerPosition : 0)
+	                                       : [[session objectForKey:@"spacerPosition"] integerValue];
+	BOOL spacerEnabled = localSession ? (mfc && mfc->spacerEnabled)
+	                                 : [[session objectForKey:@"spacerEnabled"] boolValue];
 	NSMenuItem *spacerPositionItem = [[[NSMenuItem alloc] initWithTitle:@"Spacer Position"
 	                                                               action:nil
 	                                                        keyEquivalent:@""] autorelease];
@@ -701,11 +1028,16 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 		NSString *title = [definition objectForKey:@"title"];
 		NSInteger tag = [[definition objectForKey:@"tag"] integerValue];
 		NSMenuItem *posItem = [[[NSMenuItem alloc] initWithTitle:title
-		                                                    action:@selector(setSpacerPositionFromMenuItem:)
+		                                                    action:(localSession ? @selector(setSpacerPositionFromMenuItem:)
+		                                                                          : @selector(remoteStatusCommandFromMenuItem:))
 		                                             keyEquivalent:@""] autorelease];
 		[posItem setTarget:self];
 		[posItem setTag:tag];
-		[posItem setState:(mfc && tag == (NSInteger)mfc->spacerPosition && mfc->spacerEnabled)
+		if (!localSession)
+			[posItem setRepresentedObject:[NSDictionary dictionaryWithObjectsAndKeys:
+			                                           session, @"session", @"spacerPosition", @"command",
+			                                           @(tag), @"value", nil]];
+		[posItem setState:(tag == spacerPosition && spacerEnabled)
 		                      ? NSControlStateValueOn
 		                      : NSControlStateValueOff];
 		[spacerPositionMenu addItem:posItem];
@@ -713,30 +1045,57 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 
 	[spacerPositionMenu addItem:[NSMenuItem separatorItem]];
 
-	NSMenuItem *spacerSettingsItem = [[[NSMenuItem alloc] initWithTitle:@"Settings"
-	                                                               action:@selector(showSpacerSettingsFromMenuItem:)
-	                                                        keyEquivalent:@""] autorelease];
+	NSMenuItem *spacerSettingsItem =
+	    [[[NSMenuItem alloc] initWithTitle:@"Settings"
+	                                 action:(localSession ? @selector(showSpacerSettingsFromMenuItem:)
+	                                                       : @selector(remoteStatusCommandFromMenuItem:))
+	                          keyEquivalent:@""] autorelease];
 	[spacerSettingsItem setTarget:self];
+	if (!localSession)
+		[spacerSettingsItem setRepresentedObject:[NSDictionary dictionaryWithObjectsAndKeys:
+		                                                       session, @"session", @"spacerSettings",
+		                                                       @"command", nil]];
 	[spacerPositionMenu addItem:spacerSettingsItem];
 
 	[spacerPositionItem setSubmenu:spacerPositionMenu];
-	[statusMenu addItem:spacerPositionItem];
+	[menu addItem:spacerPositionItem];
 
 	NSMenuItem *focusItem =
 	    [[[NSMenuItem alloc] initWithTitle:@"Focus Session"
-	                                 action:@selector(focusSessionFromMenuItem:)
+	                                 action:(localSession ? @selector(focusSessionFromMenuItem:)
+	                                                       : @selector(remoteStatusCommandFromMenuItem:))
 	                          keyEquivalent:@""] autorelease];
 	[focusItem setTarget:self];
-	[statusMenu addItem:focusItem];
+	if (!localSession)
+		[focusItem setRepresentedObject:[NSDictionary dictionaryWithObjectsAndKeys:
+		                                              session, @"session", @"focus", @"command", nil]];
+	[menu addItem:focusItem];
 
-	[statusMenu addItem:[NSMenuItem separatorItem]];
+	if (includeQuit)
+	{
+		[menu addItem:[NSMenuItem separatorItem]];
 
-	NSMenuItem *quitItem =
-	    [[[NSMenuItem alloc] initWithTitle:@"Quit MacFreeRDP"
-	                                 action:@selector(terminate:)
-	                          keyEquivalent:@""] autorelease];
-	[quitItem setTarget:NSApp];
-	[statusMenu addItem:quitItem];
+		NSMenuItem *quitItem =
+		    [[[NSMenuItem alloc] initWithTitle:@"Quit Session"
+		                                 action:(localSession ? @selector(quitSessionFromMenuItem:)
+		                                                       : @selector(remoteStatusCommandFromMenuItem:))
+		                          keyEquivalent:@""] autorelease];
+		[quitItem setTarget:self];
+		if (!localSession)
+			[quitItem setRepresentedObject:[NSDictionary dictionaryWithObjectsAndKeys:
+			                                             session, @"session", @"quit", @"command", nil]];
+		[menu addItem:quitItem];
+	}
+}
+
+- (void)remoteStatusCommandFromMenuItem:(NSMenuItem *)menuItem
+{
+	NSDictionary *info = [menuItem representedObject];
+	NSDictionary *session = [info objectForKey:@"session"];
+	NSString *command = [info objectForKey:@"command"];
+	NSNumber *value = [info objectForKey:@"value"];
+
+	[self postStatusCommand:command forSession:session value:value];
 }
 
 - (void)focusSessionFromMenuItem:(id)sender
@@ -752,6 +1111,131 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 		[mrdpView refreshBitmap];
 }
 
+- (void)quitSessionFromMenuItem:(id)sender
+{
+	(void)sender;
+	[NSApp terminate:self];
+}
+
+- (void)quitAllFromMenuItem:(id)sender
+{
+	(void)sender;
+	NSNumber *localPID = [self localStatusSessionPID];
+
+	for (NSDictionary *session in [statusSessions allValues])
+	{
+		if ([[session objectForKey:@"pid"] isEqualToNumber:localPID])
+			continue;
+
+		[self postStatusCommand:@"quit" forSession:session value:nil];
+	}
+
+	[NSApp terminate:self];
+}
+
+- (void)showGeneralSettingsFromMenuItem:(id)sender
+{
+	(void)sender;
+	if (!context)
+		return;
+
+	mfContext *mfc = (mfContext *)context;
+	NSAlert *alert = [[NSAlert alloc] init];
+	[alert setMessageText:@"General Settings"];
+	[alert setInformativeText:@"Choose the hex color that should be treated as transparent."];
+	[alert addButtonWithTitle:@"OK"];
+	[alert addButtonWithTitle:@"Cancel"];
+
+	NSView *accessoryView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 320, 86)];
+
+	NSButton *enableCheckbox = [[NSButton alloc] initWithFrame:NSMakeRect(0, 56, 320, 20)];
+	[enableCheckbox setButtonType:NSButtonTypeSwitch];
+	[enableCheckbox setTitle:@"Enable Chroma Key Transparency"];
+	[enableCheckbox setState:mfc->chromaKeyEnabled ? NSControlStateValueOn : NSControlStateValueOff];
+	[accessoryView addSubview:enableCheckbox];
+
+	NSTextField *colorLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 24, 120, 20)];
+	[colorLabel setStringValue:@"Chroma Key:"];
+	[colorLabel setEditable:NO];
+	[colorLabel setBezeled:NO];
+	[colorLabel setDrawsBackground:NO];
+	[accessoryView addSubview:colorLabel];
+
+	NSTextField *colorInput = [[NSTextField alloc] initWithFrame:NSMakeRect(125, 22, 100, 24)];
+	[colorInput setStringValue:[NSString stringWithFormat:@"#%06X", (unsigned int)(mfc->chromaKeyColor & 0xFFFFFF)]];
+	[accessoryView addSubview:colorInput];
+
+	NSTextField *hintLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(125, 0, 195, 18)];
+	[hintLabel setStringValue:@"Format: #RRGGBB"];
+	[hintLabel setFont:[NSFont systemFontOfSize:[NSFont smallSystemFontSize]]];
+	[hintLabel setTextColor:[NSColor secondaryLabelColor]];
+	[hintLabel setEditable:NO];
+	[hintLabel setBezeled:NO];
+	[hintLabel setDrawsBackground:NO];
+	[accessoryView addSubview:hintLabel];
+
+	[alert setAccessoryView:accessoryView];
+
+	NSInteger result = [alert runModal];
+
+	if (result == NSAlertFirstButtonReturn)
+	{
+		NSString *colorText = [[colorInput stringValue]
+		    stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+		if ([colorText hasPrefix:@"#"])
+			colorText = [colorText substringFromIndex:1];
+		if ([colorText hasPrefix:@"0x"] || [colorText hasPrefix:@"0X"])
+			colorText = [colorText substringFromIndex:2];
+
+		unsigned int colorVal = 0;
+		NSScanner *scanner = [NSScanner scannerWithString:colorText];
+		BOOL validColor = ([colorText length] == 6) && [scanner scanHexInt:&colorVal] &&
+		                  [scanner isAtEnd];
+
+		if (validColor)
+		{
+			mfc->chromaKeyEnabled = [enableCheckbox state] == NSControlStateValueOn;
+			mfc->chromaKeyColor = colorVal & 0xFFFFFF;
+
+			NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+			[defaults setBool:mfc->chromaKeyEnabled forKey:MRDPChromaKeyEnabledKey];
+			[defaults setInteger:(NSInteger)mfc->chromaKeyColor forKey:MRDPChromaKeyColorKey];
+			[defaults synchronize];
+
+			if (mrdpView)
+				[mrdpView refreshBitmap];
+
+			for (NSDictionary *session in [statusSessions allValues])
+			{
+				NSNumber *pid = [session objectForKey:@"pid"];
+				if (!pid)
+					continue;
+
+				NSDictionary *info = [NSDictionary
+				    dictionaryWithObjectsAndKeys:pid, @"pid", @"chroma", @"command",
+				                                 @(mfc->chromaKeyEnabled), @"enabled",
+				                                 @((NSInteger)mfc->chromaKeyColor), @"color", nil];
+				[[NSDistributedNotificationCenter defaultCenter]
+				    postNotificationName:MRDPStatusCommandNotification
+				                  object:nil
+				                userInfo:info
+				      deliverImmediately:YES];
+			}
+		}
+		else
+		{
+			NSBeep();
+		}
+	}
+
+	[enableCheckbox release];
+	[colorLabel release];
+	[colorInput release];
+	[hintLabel release];
+	[accessoryView release];
+	[alert release];
+}
+
 - (void)setSpacerPositionFromMenuItem:(NSMenuItem *)menuItem
 {
 	if (!context)
@@ -765,6 +1249,7 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 	[defaults synchronize];
 
 	[self updateSpacerWindow];
+	[self broadcastStatusSessionUpdate];
 }
 
 - (void)showSpacerSettingsFromMenuItem:(id)sender
@@ -816,6 +1301,7 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 		[defaults synchronize];
 
 		[self updateSpacerWindow];
+		[self broadcastStatusSessionUpdate];
 	}
 
 	[enableCheckbox release];
@@ -912,6 +1398,7 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 		frame.origin.y = NSMaxY(visibleFrame) - NSHeight(frame);
 		[window setFrame:frame display:YES];
 		[self focusClientWindow];
+		[self broadcastStatusSessionUpdate];
 		return;
 	}
 
@@ -929,6 +1416,7 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 		[mrdpView enterFullScreenMode:screen withOptions:nil];
 
 	[self focusClientWindow];
+	[self broadcastStatusSessionUpdate];
 }
 
 - (BOOL)requestRemoteResizeForScreen:(NSScreen *)screen
@@ -989,6 +1477,39 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 	return preferredScreenIndex;
 }
 
+- (NSString *)sessionMenuTitle
+{
+	NSString *target = [self credentialTarget];
+
+	if ([target length] > 0)
+		return target;
+
+	if ([window title] && [[window title] length] > 0)
+		return [window title];
+
+	return @"Current Session";
+}
+
+- (NSArray *)runningMacFreeRDPApplications
+{
+	NSString *bundleIdentifier = [[NSBundle mainBundle] bundleIdentifier];
+	NSString *executablePath = [[[NSBundle mainBundle] executablePath] lastPathComponent];
+	NSMutableArray *applications = [NSMutableArray array];
+
+	for (NSRunningApplication *application in [[NSWorkspace sharedWorkspace] runningApplications])
+	{
+		BOOL matchesBundle = bundleIdentifier && [[application bundleIdentifier] isEqualToString:bundleIdentifier];
+		BOOL matchesExecutable = executablePath &&
+		                         [[[[application executableURL] path] lastPathComponent]
+		                             isEqualToString:executablePath];
+
+		if (matchesBundle || matchesExecutable)
+			[applications addObject:application];
+	}
+
+	return applications;
+}
+
 - (void)loadPreferredScreenFromDefaults
 {
 	NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
@@ -1001,6 +1522,19 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 	preferredScreenIndex = mac_screen_index_for_screen(screen);
 	if (preferredScreenIndex == NSNotFound)
 		preferredScreenIndex = 0;
+}
+
+- (void)loadChromaKeySettingsFromDefaults
+{
+	if (!context)
+		return;
+
+	NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+	mfContext *mfc = (mfContext *)context;
+
+	mfc->chromaKeyEnabled = [defaults boolForKey:MRDPChromaKeyEnabledKey];
+	if ([defaults objectForKey:MRDPChromaKeyColorKey])
+		mfc->chromaKeyColor = (uint32_t)([defaults integerForKey:MRDPChromaKeyColorKey] & 0xFFFFFF);
 }
 
 - (void)loadSpacerSettingsFromDefaults
@@ -1177,6 +1711,11 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 		return;
 
 	const pid_t ownPid = [[NSProcessInfo processInfo] processIdentifier];
+	NSMutableSet *macFreeRDPPids = [NSMutableSet set];
+	for (NSRunningApplication *application in [self runningMacFreeRDPApplications])
+		[macFreeRDPPids addObject:[NSNumber numberWithInt:[application processIdentifier]]];
+	[macFreeRDPPids addObject:[NSNumber numberWithInt:ownPid]];
+
 	NSMutableSet *processedPids = [NSMutableSet set];
 	NSArray *windows = (NSArray *)windowInfo;
 
@@ -1190,7 +1729,8 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 		if (!pidNumber || !layerNumber || [layerNumber integerValue] != 0 ||
 		    !CGRectMakeWithDictionaryRepresentation((CFDictionaryRef)boundsDictionary, &cgFrame))
 			continue;
-		if ([pidNumber intValue] == ownPid || !CGRectIntersectsRect(cgFrame, spacerRect))
+		if ([macFreeRDPPids containsObject:pidNumber] ||
+		    !CGRectIntersectsRect(cgFrame, spacerRect))
 			continue;
 		if ([processedPids containsObject:pidNumber])
 			continue;
