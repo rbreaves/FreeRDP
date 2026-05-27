@@ -1337,6 +1337,15 @@ static BOOL mac_send_rdp_scancode(rdpInput *input, UINT32 rdpScancode)
 	(void)freerdp_input_send_keyboard_event_ex(input, FALSE, FALSE, RDP_SCANCODE_LCONTROL);
 }
 
+- (void)refreshBitmap
+{
+	if (!instance || !instance->context || !instance->context->gdi)
+		return;
+
+	rdpGdi *gdi = instance->context->gdi;
+	gdi_InvalidateRegion(gdi->primary->hdc, 0, 0, (INT32)gdi->width, (INT32)gdi->height);
+}
+
 static BOOL releaseFlagStates(rdpInput *input, UINT32 aKbdModFlags)
 {
 	return updateFlagStates(input, 0, aKbdModFlags);

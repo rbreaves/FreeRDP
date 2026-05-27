@@ -79,6 +79,7 @@
 - (void)sendRemoteKeyScancode:(UINT32)rdpScancode;
 - (void)sendRemoteCtrlAltDel;
 - (void)sendRemoteBreakKey;
+- (void)refreshBitmap;
 
 @property(assign) int is_connected;
 

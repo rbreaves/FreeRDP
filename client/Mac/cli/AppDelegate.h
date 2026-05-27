@@ -19,6 +19,7 @@
 }
 
 - (void)rdpConnectError:(NSString *)customMessage;
+- (void)refreshBitmapFromMenuItem:(id)sender;
 
 @property(assign) IBOutlet NSWindow *window;
 @property(assign) rdpContext *context;

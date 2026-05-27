@@ -85,6 +85,7 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 - (void)statusItemClicked:(id)sender;
 - (void)rebuildStatusMenu;
 - (void)focusSessionFromMenuItem:(id)sender;
+- (void)refreshBitmapFromMenuItem:(id)sender;
 - (void)sendPasswordFromMenuItem:(id)sender;
 - (void)sendCtrlAltDelFromMenuItem:(id)sender;
 - (void)sendRemoteKeyFromMenuItem:(NSMenuItem *)menuItem;
@@ -655,6 +656,13 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 	if ([screens count] > 0)
 		[statusMenu addItem:[NSMenuItem separatorItem]];
 
+	NSMenuItem *refreshItem =
+	    [[[NSMenuItem alloc] initWithTitle:@"Refresh Bitmap"
+	                                 action:@selector(refreshBitmapFromMenuItem:)
+	                          keyEquivalent:@""] autorelease];
+	[refreshItem setTarget:self];
+	[statusMenu addItem:refreshItem];
+
 	NSMenuItem *focusItem =
 	    [[[NSMenuItem alloc] initWithTitle:@"Focus Session"
 	                                 action:@selector(focusSessionFromMenuItem:)
@@ -676,6 +684,13 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 {
 	(void)sender;
 	[self focusClientWindow];
+}
+
+- (void)refreshBitmapFromMenuItem:(id)sender
+{
+	(void)sender;
+	if (mrdpView)
+		[mrdpView refreshBitmap];
 }
 
 - (void)sendPasswordFromMenuItem:(id)sender
