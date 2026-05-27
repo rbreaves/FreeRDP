@@ -7,6 +7,7 @@
 //
 
 #import "AppDelegate.h"
+#import <ApplicationServices/ApplicationServices.h>
 #import <mfreerdp.h>
 #import <mf_client.h>
 #import <MRDPView.h>
@@ -41,6 +42,11 @@ static NSString *mac_display_title(NSScreen *screen, NSInteger screenIndex);
 static DISPLAY_CONTROL_MONITOR_LAYOUT mac_display_layout_for_screen(NSScreen *screen,
 	                                                               BOOL useVisibleFrame,
 	                                                               rdpSettings *settings);
+static CGRect mac_ax_rect_for_screen_rect(NSScreen *screen, NSRect rect);
+static CGRect mac_spacer_rect_for_screen(NSScreen *screen, UINT32 position, UINT32 size);
+static CGRect mac_available_rect_for_spacer(NSScreen *screen, UINT32 position, UINT32 size);
+static BOOL mac_ax_get_window_frame(AXUIElementRef windowElement, CGRect *frame);
+static void mac_ax_set_window_frame(AXUIElementRef windowElement, CGRect frame);
 
 static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenIdentifier";
 
@@ -67,6 +73,7 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 	NSTimer *leftEdgeFocusTimer;
 	NSStatusItem *statusItem;
 	NSMenu *statusMenu;
+	NSTimer *spacerEnforcementTimer;
 	NSInteger preferredScreenIndex;
 }
 - (void)ensureClientWindow;
@@ -86,6 +93,15 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 - (void)rebuildStatusMenu;
 - (void)focusSessionFromMenuItem:(id)sender;
 - (void)refreshBitmapFromMenuItem:(id)sender;
+- (void)setSpacerPositionFromMenuItem:(NSMenuItem *)menuItem;
+- (void)showSpacerSettingsFromMenuItem:(id)sender;
+- (void)updateSpacerWindow;
+- (void)showSpacerWindow;
+- (void)hideSpacerWindow;
+- (void)startSpacerEnforcement;
+- (void)stopSpacerEnforcement;
+- (void)spacerEnforcementTimerFired:(NSTimer *)timer;
+- (void)enforceSpacerForWindows;
 - (void)sendPasswordFromMenuItem:(id)sender;
 - (void)sendCtrlAltDelFromMenuItem:(id)sender;
 - (void)sendRemoteKeyFromMenuItem:(NSMenuItem *)menuItem;
@@ -108,6 +124,8 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 	[self stopLeftEdgeFocusMonitor];
 	[self cancelLeftEdgeFocusTimer];
 	[self removeStatusItem];
+	[self hideSpacerWindow];
+	[self stopSpacerEnforcement];
 	[statusMenu release];
 	[super dealloc];
 }
@@ -279,6 +297,7 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 	_singleDelegate = self;
 	[self loadPreferredScreenFromDefaults];
 	[self CreateContext];
+	[self loadSpacerSettingsFromDefaults];
 	[self ensureClientWindow];
 	[self configureMainMenu];
 	[self configureApplicationIcon];
@@ -375,6 +394,7 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 {
 	NSLog(@"Stopping...\n");
 	[self savePreferredScreenToDefaults];
+	[self stopSpacerEnforcement];
 	[self removeStatusItem];
 	freerdp_client_stop(context);
 	[mrdpView releaseResources];
@@ -663,6 +683,45 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 	[refreshItem setTarget:self];
 	[statusMenu addItem:refreshItem];
 
+	mfContext *mfc = (mfContext *)context;
+	NSMenuItem *spacerPositionItem = [[[NSMenuItem alloc] initWithTitle:@"Spacer Position"
+	                                                               action:nil
+	                                                        keyEquivalent:@""] autorelease];
+	NSMenu *spacerPositionMenu = [[[NSMenu alloc] initWithTitle:@"Spacer Position"] autorelease];
+	NSArray *positionEntries = [NSArray arrayWithObjects:
+	    [NSDictionary dictionaryWithObjectsAndKeys:@"Top", @"title", @(0), @"tag", nil],
+	    [NSDictionary dictionaryWithObjectsAndKeys:@"Bottom", @"title", @(1), @"tag", nil],
+	    [NSDictionary dictionaryWithObjectsAndKeys:@"Left", @"title", @(2), @"tag", nil],
+	    [NSDictionary dictionaryWithObjectsAndKeys:@"Right", @"title", @(3), @"tag", nil],
+	    nil];
+
+	for (id entry in positionEntries)
+	{
+		NSDictionary *definition = (NSDictionary *)entry;
+		NSString *title = [definition objectForKey:@"title"];
+		NSInteger tag = [[definition objectForKey:@"tag"] integerValue];
+		NSMenuItem *posItem = [[[NSMenuItem alloc] initWithTitle:title
+		                                                    action:@selector(setSpacerPositionFromMenuItem:)
+		                                             keyEquivalent:@""] autorelease];
+		[posItem setTarget:self];
+		[posItem setTag:tag];
+		[posItem setState:(mfc && tag == (NSInteger)mfc->spacerPosition && mfc->spacerEnabled)
+		                      ? NSControlStateValueOn
+		                      : NSControlStateValueOff];
+		[spacerPositionMenu addItem:posItem];
+	}
+
+	[spacerPositionMenu addItem:[NSMenuItem separatorItem]];
+
+	NSMenuItem *spacerSettingsItem = [[[NSMenuItem alloc] initWithTitle:@"Settings"
+	                                                               action:@selector(showSpacerSettingsFromMenuItem:)
+	                                                        keyEquivalent:@""] autorelease];
+	[spacerSettingsItem setTarget:self];
+	[spacerPositionMenu addItem:spacerSettingsItem];
+
+	[spacerPositionItem setSubmenu:spacerPositionMenu];
+	[statusMenu addItem:spacerPositionItem];
+
 	NSMenuItem *focusItem =
 	    [[[NSMenuItem alloc] initWithTitle:@"Focus Session"
 	                                 action:@selector(focusSessionFromMenuItem:)
@@ -691,6 +750,79 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 	(void)sender;
 	if (mrdpView)
 		[mrdpView refreshBitmap];
+}
+
+- (void)setSpacerPositionFromMenuItem:(NSMenuItem *)menuItem
+{
+	if (!context)
+		return;
+
+	mfContext *mfc = (mfContext *)context;
+	mfc->spacerPosition = (UINT32)[menuItem tag];
+
+	NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+	[defaults setInteger:(NSInteger)mfc->spacerPosition forKey:@"MRDPSpacerPosition"];
+	[defaults synchronize];
+
+	[self updateSpacerWindow];
+}
+
+- (void)showSpacerSettingsFromMenuItem:(id)sender
+{
+	(void)sender;
+	if (!context)
+		return;
+
+	mfContext *mfc = (mfContext *)context;
+
+	NSAlert *alert = [[NSAlert alloc] init];
+	[alert setMessageText:@"Spacer Settings"];
+	[alert setInformativeText:@"Configure the spacer area that reserves screen space like the macOS Dock."];
+	[alert addButtonWithTitle:@"OK"];
+	[alert addButtonWithTitle:@"Cancel"];
+
+	NSView *accessoryView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 300, 80)];
+
+	NSButton *enableCheckbox = [[NSButton alloc] initWithFrame:NSMakeRect(0, 50, 300, 20)];
+	[enableCheckbox setButtonType:NSButtonTypeSwitch];
+	[enableCheckbox setTitle:@"Enable Spacer"];
+	[enableCheckbox setState:mfc->spacerEnabled ? NSControlStateValueOn : NSControlStateValueOff];
+	[accessoryView addSubview:enableCheckbox];
+
+	NSTextField *sizeLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 25, 80, 20)];
+	[sizeLabel setStringValue:@"Size (px):"];
+	[sizeLabel setEditable:NO];
+	[sizeLabel setBezeled:NO];
+	[sizeLabel setDrawsBackground:NO];
+	[accessoryView addSubview:sizeLabel];
+
+	NSTextField *sizeInput = [[NSTextField alloc] initWithFrame:NSMakeRect(85, 25, 60, 20)];
+	[sizeInput setStringValue:[NSString stringWithFormat:@"%u", mfc->spacerSize]];
+	[accessoryView addSubview:sizeInput];
+
+	[alert setAccessoryView:accessoryView];
+
+	NSInteger result = [alert runModal];
+
+	if (result == NSAlertFirstButtonReturn)
+	{
+		mfc->spacerEnabled = [enableCheckbox state] == NSControlStateValueOn;
+		NSInteger sizeVal = [sizeInput integerValue];
+		mfc->spacerSize = (sizeVal > 0) ? (UINT32)sizeVal : 50;
+
+		NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+		[defaults setBool:mfc->spacerEnabled forKey:@"MRDPSpacerEnabled"];
+		[defaults setInteger:(NSInteger)mfc->spacerSize forKey:@"MRDPSpacerSize"];
+		[defaults synchronize];
+
+		[self updateSpacerWindow];
+	}
+
+	[enableCheckbox release];
+	[sizeLabel release];
+	[sizeInput release];
+	[accessoryView release];
+	[alert release];
 }
 
 - (void)sendPasswordFromMenuItem:(id)sender
@@ -869,6 +1001,240 @@ static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenI
 	preferredScreenIndex = mac_screen_index_for_screen(screen);
 	if (preferredScreenIndex == NSNotFound)
 		preferredScreenIndex = 0;
+}
+
+- (void)loadSpacerSettingsFromDefaults
+{
+	if (!context)
+		return;
+
+	mfContext *mfc = (mfContext *)context;
+	NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+
+	mfc->spacerEnabled = [defaults boolForKey:@"MRDPSpacerEnabled"];
+	NSInteger spacerPos = [defaults integerForKey:@"MRDPSpacerPosition"];
+	mfc->spacerPosition = (spacerPos >= 0 && spacerPos <= 3) ? (UINT32)spacerPos : 2;
+	NSInteger spacerSizeVal = [defaults integerForKey:@"MRDPSpacerSize"];
+	mfc->spacerSize = (spacerSizeVal > 0) ? (UINT32)spacerSizeVal : 50;
+
+	[self updateSpacerWindow];
+}
+
+- (void)updateSpacerWindow
+{
+	if (!context)
+		return;
+
+	mfContext *mfc = (mfContext *)context;
+
+	if (mfc->spacerEnabled && mfc->spacerSize > 0)
+	{
+		[self showSpacerWindow];
+		[self startSpacerEnforcement];
+		[self enforceSpacerForWindows];
+	}
+	else
+	{
+		[self hideSpacerWindow];
+		[self stopSpacerEnforcement];
+	}
+}
+
+- (void)showSpacerWindow
+{
+	if (!context)
+		return;
+
+	mfContext *mfc = (mfContext *)context;
+	NSScreen *screen = [self preferredScreen];
+	if (!screen)
+		screen = [NSScreen mainScreen];
+	if (!screen)
+		return;
+
+	if (spacerWindow && [spacerWindow isVisible])
+		[self hideSpacerWindow];
+
+	NSRect screenFrame = [screen frame];
+	NSRect spacerFrame;
+
+	switch (mfc->spacerPosition)
+	{
+		case 0: // Top
+			spacerFrame = NSMakeRect(NSMinX(screenFrame), NSMaxY(screenFrame) - mfc->spacerSize,
+			                        NSWidth(screenFrame), mfc->spacerSize);
+			break;
+		case 1: // Bottom
+			spacerFrame = NSMakeRect(NSMinX(screenFrame), NSMinY(screenFrame),
+			                        NSWidth(screenFrame), mfc->spacerSize);
+			break;
+		case 2: // Left
+			spacerFrame = NSMakeRect(NSMinX(screenFrame), NSMinY(screenFrame),
+			                        mfc->spacerSize, NSHeight(screenFrame));
+			break;
+		case 3: // Right
+		default:
+			spacerFrame = NSMakeRect(NSMaxX(screenFrame) - mfc->spacerSize, NSMinY(screenFrame),
+			                        mfc->spacerSize, NSHeight(screenFrame));
+			break;
+	}
+
+	spacerWindow = [[NSWindow alloc] initWithContentRect:spacerFrame
+	                                             styleMask:NSWindowStyleMaskBorderless
+	                                               backing:NSBackingStoreBuffered
+	                                                 defer:NO];
+	[spacerWindow setLevel:NSFloatingWindowLevel];
+	[spacerWindow setOpaque:NO];
+	[spacerWindow setBackgroundColor:[NSColor clearColor]];
+	[spacerWindow setIgnoresMouseEvents:YES];
+	[spacerWindow setCanHide:NO];
+	[spacerWindow setCollectionBehavior:(NSWindowCollectionBehaviorCanJoinAllSpaces |
+	                                     NSWindowCollectionBehaviorStationary |
+	                                     NSWindowCollectionBehaviorFullScreenAuxiliary |
+	                                     NSWindowCollectionBehaviorIgnoresCycle)];
+	[spacerWindow orderFront:self];
+}
+
+- (void)hideSpacerWindow
+{
+	if (spacerWindow)
+	{
+		[spacerWindow orderOut:self];
+		[spacerWindow release];
+		spacerWindow = nil;
+	}
+}
+
+- (void)startSpacerEnforcement
+{
+	if (spacerEnforcementTimer)
+		return;
+
+	if (!AXIsProcessTrusted())
+	{
+		const void *keys[] = { kAXTrustedCheckOptionPrompt };
+		const void *values[] = { kCFBooleanTrue };
+		CFDictionaryRef options = CFDictionaryCreate(kCFAllocatorDefault, keys, values, 1,
+		                                             &kCFTypeDictionaryKeyCallBacks,
+		                                             &kCFTypeDictionaryValueCallBacks);
+		const Boolean trusted = AXIsProcessTrustedWithOptions(options);
+		if (options)
+			CFRelease(options);
+
+		if (!trusted)
+		{
+			NSLog(@"Spacer window enforcement needs Accessibility permission.");
+			return;
+		}
+	}
+
+	spacerEnforcementTimer = [NSTimer scheduledTimerWithTimeInterval:0.35
+	                                                          target:self
+	                                                        selector:@selector(spacerEnforcementTimerFired:)
+	                                                        userInfo:nil
+	                                                         repeats:YES];
+	[spacerEnforcementTimer setTolerance:0.1];
+}
+
+- (void)stopSpacerEnforcement
+{
+	if (!spacerEnforcementTimer)
+		return;
+
+	[spacerEnforcementTimer invalidate];
+	spacerEnforcementTimer = nil;
+}
+
+- (void)spacerEnforcementTimerFired:(NSTimer *)timer
+{
+	if (timer != spacerEnforcementTimer)
+		return;
+
+	[self enforceSpacerForWindows];
+}
+
+- (void)enforceSpacerForWindows
+{
+	if (!context || !AXIsProcessTrusted())
+		return;
+
+	mfContext *mfc = (mfContext *)context;
+	if (!mfc->spacerEnabled || mfc->spacerSize == 0)
+		return;
+
+	NSScreen *screen = [self preferredScreen];
+	if (!screen)
+		screen = [NSScreen mainScreen];
+	if (!screen)
+		return;
+
+	CGRect spacerRect = mac_spacer_rect_for_screen(screen, mfc->spacerPosition, mfc->spacerSize);
+	CGRect availableRect =
+	    mac_available_rect_for_spacer(screen, mfc->spacerPosition, mfc->spacerSize);
+	CFArrayRef windowInfo = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly,
+	                                                  kCGNullWindowID);
+	if (!windowInfo)
+		return;
+
+	const pid_t ownPid = [[NSProcessInfo processInfo] processIdentifier];
+	NSMutableSet *processedPids = [NSMutableSet set];
+	NSArray *windows = (NSArray *)windowInfo;
+
+	for (NSDictionary *info in windows)
+	{
+		NSNumber *pidNumber = [info objectForKey:(NSString *)kCGWindowOwnerPID];
+		NSNumber *layerNumber = [info objectForKey:(NSString *)kCGWindowLayer];
+		NSDictionary *boundsDictionary = [info objectForKey:(NSString *)kCGWindowBounds];
+		CGRect cgFrame = CGRectZero;
+
+		if (!pidNumber || !layerNumber || [layerNumber integerValue] != 0 ||
+		    !CGRectMakeWithDictionaryRepresentation((CFDictionaryRef)boundsDictionary, &cgFrame))
+			continue;
+		if ([pidNumber intValue] == ownPid || !CGRectIntersectsRect(cgFrame, spacerRect))
+			continue;
+		if ([processedPids containsObject:pidNumber])
+			continue;
+
+		[processedPids addObject:pidNumber];
+
+		AXUIElementRef appElement = AXUIElementCreateApplication([pidNumber intValue]);
+		if (!appElement)
+			continue;
+
+		CFArrayRef axWindows = NULL;
+		if (AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute,
+		                                  (CFTypeRef *)&axWindows) == kAXErrorSuccess &&
+		    axWindows)
+		{
+			const CFIndex count = CFArrayGetCount(axWindows);
+			for (CFIndex index = 0; index < count; index++)
+			{
+				AXUIElementRef axWindow =
+				    (AXUIElementRef)CFArrayGetValueAtIndex(axWindows, index);
+				CGRect axFrame = CGRectZero;
+
+				if (!mac_ax_get_window_frame(axWindow, &axFrame) ||
+				    !CGRectIntersectsRect(axFrame, spacerRect))
+					continue;
+
+				CGRect target = axFrame;
+				target.size.width = MIN(target.size.width, availableRect.size.width);
+				target.size.height = MIN(target.size.height, availableRect.size.height);
+				target.origin.x = MIN(MAX(target.origin.x, CGRectGetMinX(availableRect)),
+				                      CGRectGetMaxX(availableRect) - target.size.width);
+				target.origin.y = MIN(MAX(target.origin.y, CGRectGetMinY(availableRect)),
+				                      CGRectGetMaxY(availableRect) - target.size.height);
+
+				mac_ax_set_window_frame(axWindow, target);
+			}
+
+			CFRelease(axWindows);
+		}
+
+		CFRelease(appElement);
+	}
+
+	CFRelease(windowInfo);
 }
 
 - (void)savePreferredScreenToDefaults
@@ -1476,6 +1842,157 @@ static NSString *mac_display_title(NSScreen *screen, NSInteger screenIndex)
 		[title appendString:@" Primary"];
 
 	return title;
+}
+
+static CGRect mac_ax_rect_for_screen_rect(NSScreen *screen, NSRect rect)
+{
+	if (!screen)
+		return CGRectZero;
+
+	NSNumber *screenNumber = [[screen deviceDescription] objectForKey:@"NSScreenNumber"];
+	const CGDirectDisplayID displayId = screenNumber ? [screenNumber unsignedIntValue] : 0;
+	const CGRect displayBounds = displayId ? CGDisplayBounds(displayId) : CGRectZero;
+	const NSRect screenFrame = [screen frame];
+
+	if (CGRectIsEmpty(displayBounds) || NSIsEmptyRect(screenFrame))
+		return CGRectZero;
+
+	return CGRectMake(CGRectGetMinX(displayBounds) + (NSMinX(rect) - NSMinX(screenFrame)),
+	                  CGRectGetMinY(displayBounds) + (NSMaxY(screenFrame) - NSMaxY(rect)),
+	                  NSWidth(rect), NSHeight(rect));
+}
+
+static CGRect mac_spacer_rect_for_screen(NSScreen *screen, UINT32 position, UINT32 size)
+{
+	if (!screen || size == 0)
+		return CGRectZero;
+
+	CGRect screenRect = mac_ax_rect_for_screen_rect(screen, [screen frame]);
+	const CGFloat spacerSize = (CGFloat)size;
+
+	switch (position)
+	{
+		case 0: // Top
+			return CGRectMake(CGRectGetMinX(screenRect), CGRectGetMinY(screenRect),
+			                  CGRectGetWidth(screenRect), spacerSize);
+		case 1: // Bottom
+			return CGRectMake(CGRectGetMinX(screenRect),
+			                  CGRectGetMaxY(screenRect) - spacerSize,
+			                  CGRectGetWidth(screenRect), spacerSize);
+		case 2: // Left
+			return CGRectMake(CGRectGetMinX(screenRect), CGRectGetMinY(screenRect), spacerSize,
+			                  CGRectGetHeight(screenRect));
+		case 3: // Right
+		default:
+			return CGRectMake(CGRectGetMaxX(screenRect) - spacerSize, CGRectGetMinY(screenRect),
+			                  spacerSize, CGRectGetHeight(screenRect));
+	}
+}
+
+static CGRect mac_available_rect_for_spacer(NSScreen *screen, UINT32 position, UINT32 size)
+{
+	if (!screen)
+		return CGRectZero;
+
+	CGRect available = mac_ax_rect_for_screen_rect(screen, [screen visibleFrame]);
+	const CGFloat spacerSize = (CGFloat)size;
+
+	switch (position)
+	{
+		case 0: // Top
+			available.origin.y += spacerSize;
+			available.size.height -= spacerSize;
+			break;
+		case 1: // Bottom
+			available.size.height -= spacerSize;
+			break;
+		case 2: // Left
+			available.origin.x += spacerSize;
+			available.size.width -= spacerSize;
+			break;
+		case 3: // Right
+		default:
+			available.size.width -= spacerSize;
+			break;
+	}
+
+	if (available.size.width < 1.0)
+		available.size.width = 1.0;
+	if (available.size.height < 1.0)
+		available.size.height = 1.0;
+
+	return available;
+}
+
+static BOOL mac_ax_get_window_frame(AXUIElementRef windowElement, CGRect *frame)
+{
+	if (!windowElement || !frame)
+		return NO;
+
+	CFTypeRef positionValue = NULL;
+	CFTypeRef sizeValue = NULL;
+	CGPoint position = CGPointZero;
+	CGSize size = CGSizeZero;
+
+	if (AXUIElementCopyAttributeValue(windowElement, kAXPositionAttribute, &positionValue) !=
+	        kAXErrorSuccess ||
+	    !positionValue)
+		return NO;
+
+	if (AXUIElementCopyAttributeValue(windowElement, kAXSizeAttribute, &sizeValue) !=
+	        kAXErrorSuccess ||
+	    !sizeValue)
+	{
+		CFRelease(positionValue);
+		return NO;
+	}
+
+	const BOOL ok = AXValueGetValue((AXValueRef)positionValue, kAXValueCGPointType, &position) &&
+	                AXValueGetValue((AXValueRef)sizeValue, kAXValueCGSizeType, &size);
+
+	CFRelease(positionValue);
+	CFRelease(sizeValue);
+
+	if (!ok || size.width <= 0.0 || size.height <= 0.0)
+		return NO;
+
+	*frame = CGRectMake(position.x, position.y, size.width, size.height);
+	return YES;
+}
+
+static void mac_ax_set_window_frame(AXUIElementRef windowElement, CGRect frame)
+{
+	if (!windowElement)
+		return;
+
+	Boolean canSetPosition = false;
+	Boolean canSetSize = false;
+	CGPoint position = frame.origin;
+	CGSize size = frame.size;
+	AXValueRef positionValue = AXValueCreate(kAXValueCGPointType, &position);
+	AXValueRef sizeValue = AXValueCreate(kAXValueCGSizeType, &size);
+
+	if (!positionValue || !sizeValue)
+	{
+		if (positionValue)
+			CFRelease(positionValue);
+		if (sizeValue)
+			CFRelease(sizeValue);
+		return;
+	}
+
+	if (AXUIElementIsAttributeSettable(windowElement, kAXSizeAttribute, &canSetSize) ==
+	        kAXErrorSuccess &&
+	    canSetSize)
+		(void)AXUIElementSetAttributeValue(windowElement, kAXSizeAttribute, sizeValue);
+
+	if (AXUIElementIsAttributeSettable(windowElement, kAXPositionAttribute, &canSetPosition) ==
+	        kAXErrorSuccess &&
+	    canSetPosition)
+		(void)AXUIElementSetAttributeValue(windowElement, kAXPositionAttribute, positionValue);
+
+	CFRelease(positionValue);
+	CFRelease(sizeValue);
 }
 
 static DISPLAY_CONTROL_MONITOR_LAYOUT mac_display_layout_for_screen(NSScreen *screen,

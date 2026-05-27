@@ -14,6 +14,7 @@
 {
   @public
 	NSWindow *window;
+	NSWindow *spacerWindow;
 	rdpContext *context;
 	MRDPView *mrdpView;
 }
