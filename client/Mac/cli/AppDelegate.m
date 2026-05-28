@@ -56,6 +56,7 @@ static void mac_ax_set_window_frame(AXUIElementRef windowElement, CGRect frame);
 static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenIdentifier";
 static NSString *const MRDPChromaKeyEnabledKey = @"MRDPChromaKeyEnabled";
 static NSString *const MRDPChromaKeyColorKey = @"MRDPChromaKeyColor";
+static NSString *const MRDPChromaKeyToleranceKey = @"MRDPChromaKeyTolerance";
 static NSString *const MRDPAdditionalTransparencyColorsKey = @"MRDPAdditionalTransparencyColors";
 static NSString *const MRDPAdditionalTransparencyLevelsKey = @"MRDPAdditionalTransparencyLevels";
 static NSString *const MRDPAdditionalTransparencyTolerancesKey = @"MRDPAdditionalTransparencyTolerances";
@@ -66,6 +67,7 @@ static NSString *const MRDPStatusSessionWillTerminateNotification = @"org.freerd
 static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusCommand";
 
 static BOOL mac_parse_hex_color_text(NSString *text, uint32_t *color);
+static BOOL mac_parse_chroma_key_text(NSString *text, uint32_t *color, float *tolerance);
 static BOOL mac_parse_hex_alpha_list(NSString *text, uint32_t *colors, UINT32 *transparencies,
                                      UINT32 *tolerances, BOOL *blur, size_t capacity,
                                      size_t *count);
@@ -112,6 +114,38 @@ static BOOL mac_parse_hex_color_text(NSString *text, uint32_t *color)
 		*color = (uint32_t)(colorVal & 0xFFFFFF);
 
 	return valid;
+}
+
+static BOOL mac_parse_chroma_key_text(NSString *text, uint32_t *color, float *tolerance)
+{
+	NSString *trimmed =
+	    [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+	NSArray *parts = [trimmed componentsSeparatedByString:@":"];
+	if ([parts count] < 1 || [parts count] > 2)
+		return FALSE;
+
+	NSString *colorText = [[parts objectAtIndex:0]
+	    stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+	if (!mac_parse_hex_color_text(colorText, color))
+		return FALSE;
+
+	if ([parts count] == 1)
+		return TRUE;
+
+	NSString *toleranceText = [[parts objectAtIndex:1]
+	    stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+	float parsedTolerance = 0;
+	NSScanner *scanner = [NSScanner scannerWithString:toleranceText];
+	if (![scanner scanFloat:&parsedTolerance] || ![scanner isAtEnd] || parsedTolerance < 0 ||
+	    parsedTolerance > 255)
+	{
+		return FALSE;
+	}
+
+	if (tolerance)
+		*tolerance = parsedTolerance;
+
+	return TRUE;
 }
 
 static BOOL mac_parse_hex_alpha_list(NSString *text, uint32_t *colors, UINT32 *transparencies,
@@ -1044,6 +1078,7 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 	{
 		NSNumber *enabled = [info objectForKey:@"enabled"];
 		NSNumber *color = [info objectForKey:@"color"];
+		NSNumber *tolerance = [info objectForKey:@"tolerance"];
 		NSArray *additionalColors = [info objectForKey:@"additionalColors"];
 		NSArray *additionalTransparencies = [info objectForKey:@"additionalTransparencies"];
 		NSArray *additionalTolerances = [info objectForKey:@"additionalTolerances"];
@@ -1054,6 +1089,8 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 			mfc->chromaKeyEnabled = [enabled boolValue];
 		if (color)
 			mfc->chromaKeyColor = (uint32_t)([color integerValue] & 0xFFFFFF);
+		if (tolerance)
+			mfc->chromaKeyTolerance = [tolerance floatValue];
 		if (additionalColors && additionalTransparencies)
 		{
 			if (!additionalTolerances)
@@ -1438,7 +1475,10 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 	[accessoryView addSubview:colorLabel];
 
 	NSTextField *colorInput = [[NSTextField alloc] initWithFrame:NSMakeRect(130, 80, 100, 24)];
-	[colorInput setStringValue:[NSString stringWithFormat:@"#%06X", (unsigned int)(mfc->chromaKeyColor & 0xFFFFFF)]];
+	[colorInput setStringValue:[NSString stringWithFormat:@"#%06X:%.0f",
+	                                                       (unsigned int)(mfc->chromaKeyColor &
+	                                                                      0xFFFFFF),
+	                                                       mfc->chromaKeyTolerance]];
 	[accessoryView addSubview:colorInput];
 
 	NSTextField *additionalLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 48, 120, 20)];
@@ -1468,12 +1508,14 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 	if (result == NSAlertFirstButtonReturn)
 	{
 		uint32_t colorVal = 0;
+		float chromaTolerance = mfc->chromaKeyTolerance;
 		uint32_t additionalColors[16] = { 0 };
 		UINT32 additionalTransparencies[16] = { 0 };
 		UINT32 additionalTolerances[16] = { 0 };
 		BOOL additionalBlur[16] = { 0 };
 		size_t additionalColorCount = 0;
-		BOOL validColor = mac_parse_hex_color_text([colorInput stringValue], &colorVal);
+		BOOL validColor = mac_parse_chroma_key_text([colorInput stringValue], &colorVal,
+		                                            &chromaTolerance);
 		BOOL validAdditionalColors =
 		    mac_parse_hex_alpha_list([additionalInput stringValue], additionalColors,
 		                             additionalTransparencies, additionalTolerances,
@@ -1486,6 +1528,7 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 			mfc->windowShadowsEnabled = [shadowCheckbox state] == NSControlStateValueOn;
 			mfc->chromaKeyEnabled = [enableCheckbox state] == NSControlStateValueOn;
 			mfc->chromaKeyColor = colorVal & 0xFFFFFF;
+			mfc->chromaKeyTolerance = chromaTolerance;
 			mfc->additionalTransparencyColorCount = additionalColorCount;
 			memcpy(mfc->additionalTransparencyColors, additionalColors,
 			       additionalColorCount * sizeof(uint32_t));
@@ -1500,6 +1543,7 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 			[defaults setBool:mfc->windowShadowsEnabled forKey:MRDPWindowShadowsEnabledKey];
 			[defaults setBool:mfc->chromaKeyEnabled forKey:MRDPChromaKeyEnabledKey];
 			[defaults setInteger:(NSInteger)mfc->chromaKeyColor forKey:MRDPChromaKeyColorKey];
+			[defaults setFloat:mfc->chromaKeyTolerance forKey:MRDPChromaKeyToleranceKey];
 			[defaults setObject:mac_hex_color_number_array(mfc)
 			             forKey:MRDPAdditionalTransparencyColorsKey];
 			[defaults setObject:mac_transparency_number_array(mfc)
@@ -1525,6 +1569,7 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 				    dictionaryWithObjectsAndKeys:pid, @"pid", @"chroma", @"command",
 				                                 @(mfc->chromaKeyEnabled), @"enabled",
 				                                 @((NSInteger)mfc->chromaKeyColor), @"color",
+				                                 @(mfc->chromaKeyTolerance), @"tolerance",
 				                                 mac_hex_color_number_array(mfc),
 				                                 @"additionalColors",
 				                                 mac_transparency_number_array(mfc),
@@ -1870,6 +1915,8 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 	mfc->chromaKeyEnabled = [defaults boolForKey:MRDPChromaKeyEnabledKey];
 	if ([defaults objectForKey:MRDPChromaKeyColorKey])
 		mfc->chromaKeyColor = (uint32_t)([defaults integerForKey:MRDPChromaKeyColorKey] & 0xFFFFFF);
+	if ([defaults objectForKey:MRDPChromaKeyToleranceKey])
+		mfc->chromaKeyTolerance = [defaults floatForKey:MRDPChromaKeyToleranceKey];
 	if ([defaults objectForKey:MRDPAdditionalTransparencyColorsKey] &&
 	    [defaults objectForKey:MRDPAdditionalTransparencyLevelsKey])
 	{
