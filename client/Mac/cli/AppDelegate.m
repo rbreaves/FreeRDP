@@ -52,6 +52,7 @@ static void mac_ax_set_window_frame(AXUIElementRef windowElement, CGRect frame);
 static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenIdentifier";
 static NSString *const MRDPChromaKeyEnabledKey = @"MRDPChromaKeyEnabled";
 static NSString *const MRDPChromaKeyColorKey = @"MRDPChromaKeyColor";
+static NSString *const MRDPWindowShadowsEnabledKey = @"MRDPWindowShadowsEnabled";
 static NSString *const MRDPStatusSessionDidUpdateNotification = @"org.freerdp.mac.statusSessionDidUpdate";
 static NSString *const MRDPStatusSessionWillTerminateNotification = @"org.freerdp.mac.statusSessionWillTerminate";
 static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusCommand";
@@ -196,6 +197,7 @@ static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusC
 	[newWindow setDelegate:self];
 	[newWindow setOpaque:NO];
 	[newWindow setBackgroundColor:[NSColor clearColor]];
+	[newWindow setHasShadow:NO];
 
 	if (!NSIsEmptyRect(frameRect))
 		[newWindow setFrame:frameRect display:NO];
@@ -241,6 +243,7 @@ static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusC
 	[window setMovableByWindowBackground:NO];
 	[window setOpaque:NO];
 	[window setBackgroundColor:[NSColor clearColor]];
+	[window setHasShadow:mfc->windowShadowsEnabled];
 
 	if (!decorated && !fullscreen && mfc->fullscreen_mode != 2)
 		mac_position_window_top_left(window);
@@ -351,6 +354,7 @@ static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusC
 		[window setDelegate:self];
 		[window setOpaque:NO];
 		[window setBackgroundColor:[NSColor clearColor]];
+		[window setHasShadow:NO];
 	}
 
 	status = [self ParseCommandLineArguments];
@@ -810,6 +814,17 @@ static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusC
 		if (mrdpView)
 			[mrdpView refreshBitmap];
 	}
+	else if ([command isEqualToString:@"windowShadows"])
+	{
+		NSNumber *enabled = [info objectForKey:@"enabled"];
+		mfContext *mfc = (mfContext *)context;
+
+		if (enabled)
+		{
+			mfc->windowShadowsEnabled = [enabled boolValue];
+			[self applyWindowDecorationsFromSettings];
+		}
+	}
 	else if ([command isEqualToString:@"quit"])
 	{
 		[NSApp terminate:self];
@@ -950,7 +965,7 @@ static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusC
 	[statusMenu addItem:[NSMenuItem separatorItem]];
 
 	NSMenuItem *generalSettingsItem =
-	    [[[NSMenuItem alloc] initWithTitle:@"General Settings"
+	    [[[NSMenuItem alloc] initWithTitle:@"Settings"
 	                                 action:@selector(showGeneralSettingsFromMenuItem:)
 	                          keyEquivalent:@""] autorelease];
 	[generalSettingsItem setTarget:self];
@@ -1141,12 +1156,18 @@ static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusC
 
 	mfContext *mfc = (mfContext *)context;
 	NSAlert *alert = [[NSAlert alloc] init];
-	[alert setMessageText:@"General Settings"];
-	[alert setInformativeText:@"Choose the hex color that should be treated as transparent."];
+	[alert setMessageText:@"Settings"];
+	[alert setInformativeText:@"Choose window display behavior and the hex color that should be treated as transparent."];
 	[alert addButtonWithTitle:@"OK"];
 	[alert addButtonWithTitle:@"Cancel"];
 
-	NSView *accessoryView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 320, 86)];
+	NSView *accessoryView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 320, 116)];
+
+	NSButton *shadowCheckbox = [[NSButton alloc] initWithFrame:NSMakeRect(0, 86, 320, 20)];
+	[shadowCheckbox setButtonType:NSButtonTypeSwitch];
+	[shadowCheckbox setTitle:@"Enable Window Drop Shadows (Experimental)"];
+	[shadowCheckbox setState:mfc->windowShadowsEnabled ? NSControlStateValueOn : NSControlStateValueOff];
+	[accessoryView addSubview:shadowCheckbox];
 
 	NSButton *enableCheckbox = [[NSButton alloc] initWithFrame:NSMakeRect(0, 56, 320, 20)];
 	[enableCheckbox setButtonType:NSButtonTypeSwitch];
@@ -1194,13 +1215,17 @@ static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusC
 
 		if (validColor)
 		{
+			mfc->windowShadowsEnabled = [shadowCheckbox state] == NSControlStateValueOn;
 			mfc->chromaKeyEnabled = [enableCheckbox state] == NSControlStateValueOn;
 			mfc->chromaKeyColor = colorVal & 0xFFFFFF;
 
 			NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+			[defaults setBool:mfc->windowShadowsEnabled forKey:MRDPWindowShadowsEnabledKey];
 			[defaults setBool:mfc->chromaKeyEnabled forKey:MRDPChromaKeyEnabledKey];
 			[defaults setInteger:(NSInteger)mfc->chromaKeyColor forKey:MRDPChromaKeyColorKey];
 			[defaults synchronize];
+
+			[self applyWindowDecorationsFromSettings];
 
 			if (mrdpView)
 				[mrdpView refreshBitmap];
@@ -1220,6 +1245,16 @@ static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusC
 				                  object:nil
 				                userInfo:info
 				      deliverImmediately:YES];
+
+				info = [NSDictionary dictionaryWithObjectsAndKeys:pid, @"pid", @"windowShadows",
+				                                                  @"command",
+				                                                  @(mfc->windowShadowsEnabled),
+				                                                  @"enabled", nil];
+				[[NSDistributedNotificationCenter defaultCenter]
+				    postNotificationName:MRDPStatusCommandNotification
+				                  object:nil
+				                userInfo:info
+				      deliverImmediately:YES];
 			}
 		}
 		else
@@ -1228,6 +1263,7 @@ static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusC
 		}
 	}
 
+	[shadowCheckbox release];
 	[enableCheckbox release];
 	[colorLabel release];
 	[colorInput release];
@@ -1532,6 +1568,7 @@ static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusC
 	NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
 	mfContext *mfc = (mfContext *)context;
 
+	mfc->windowShadowsEnabled = [defaults boolForKey:MRDPWindowShadowsEnabledKey];
 	mfc->chromaKeyEnabled = [defaults boolForKey:MRDPChromaKeyEnabledKey];
 	if ([defaults objectForKey:MRDPChromaKeyColorKey])
 		mfc->chromaKeyColor = (uint32_t)([defaults integerForKey:MRDPChromaKeyColorKey] & 0xFFFFFF);
