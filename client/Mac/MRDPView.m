@@ -799,6 +799,8 @@ DWORD WINAPI mac_client_thread(void *param)
 	}
 
 	NSPoint windowLoc = [event locationInWindow];
+	dragRefreshPending = NO;
+	dragRefreshStartPoint = windowLoc;
 
 	[super mouseDown:event];
 
@@ -828,6 +830,10 @@ DWORD WINAPI mac_client_thread(void *param)
 	int x = (int)windowLoc.x;
 	int y = (int)windowLoc.y;
 	mf_press_mouse_button(context, 0, x, y, FALSE);
+
+	if (dragRefreshPending)
+		[self schedulePostDragRefresh];
+	dragRefreshPending = NO;
 }
 
 - (void)rightMouseDown:(NSEvent *)event
@@ -975,6 +981,11 @@ DWORD WINAPI mac_client_thread(void *param)
 
 	if (!self.is_connected)
 		return;
+
+	const CGFloat dx = windowLoc.x - dragRefreshStartPoint.x;
+	const CGFloat dy = windowLoc.y - dragRefreshStartPoint.y;
+	if ((fabs(dx) > 3.0) || (fabs(dy) > 3.0))
+		dragRefreshPending = YES;
 
 	int x = (int)windowLoc.x;
 	int y = (int)windowLoc.y;
@@ -1485,6 +1496,20 @@ static BOOL mac_send_rdp_scancode(rdpInput *input, UINT32 rdpScancode)
 		                             (int64_t)([delay doubleValue] * NSEC_PER_SEC)),
 		               dispatch_get_main_queue(), ^{
 			               if (self->mfc && self->mfc->chromaKeyEnabled && [self is_connected])
+				               [self refreshBitmap];
+		               });
+	}
+}
+
+- (void)schedulePostDragRefresh
+{
+	NSArray *delays = @[ @0.05, @0.2, @0.6 ];
+	for (NSNumber *delay in delays)
+	{
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+		                             (int64_t)([delay doubleValue] * NSEC_PER_SEC)),
+		               dispatch_get_main_queue(), ^{
+			               if ([self is_connected])
 				               [self refreshBitmap];
 		               });
 	}

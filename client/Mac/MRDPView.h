@@ -58,6 +58,8 @@
 	NSVisualEffectView *additionalTransparencyBlurView;
 	CALayer *additionalTransparencyBlurMaskLayer;
 	BOOL chromaKeyRepaintRequested;
+	BOOL dragRefreshPending;
+	NSPoint dragRefreshStartPoint;
   @public
 	NSPasteboard *pasteboard_rd;
 	NSPasteboard *pasteboard_wr;
@@ -86,6 +88,7 @@
 - (void)refreshBitmap;
 - (void)requestRemoteDesktopRefresh;
 - (void)scheduleChromaKeyRefreshSweep;
+- (void)schedulePostDragRefresh;
 
 @property(assign) int is_connected;
 
