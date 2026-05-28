@@ -27,6 +27,7 @@
 #import "PasswordDialog.h"
 #import "CertificateDialog.h"
 #import "MacKeychain.h"
+#import <QuartzCore/QuartzCore.h>
 
 #include <winpr/crt.h>
 #include <winpr/assert.h>
@@ -74,7 +75,8 @@ static void windows_to_apple_cords(MRDPView *view, NSRect *r);
 static CGContextRef mac_create_bitmap_context(rdpContext *context);
 static BOOL mac_is_chroma_key_pixel(const mfContext *mfc, uint32_t pixel);
 static BOOL mac_additional_transparency_for_pixel(const mfContext *mfc, uint32_t pixel,
-	                                             UINT32 *transparency);
+	                                             UINT32 *transparency, BOOL *blur);
+static void mac_release_mask_data(void *info, const void *data, size_t size);
 static BOOL mac_is_resize_cursor(NSCursor *cursor);
 static BOOL mac_view_point_to_buffer_point(MRDPView *view, const mfContext *mfc,
 	                                       rdpContext *context, NSPoint viewPoint,
@@ -420,6 +422,99 @@ DWORD WINAPI mac_client_thread(void *param)
 		[self setOpaque:NO];
 		initialized = YES;
 	}
+}
+
+- (void)ensureAdditionalTransparencyBlurView
+{
+	NSView *superview = [self superview];
+	if (!superview)
+		return;
+	NSRect blurBounds = context ? mac_smart_sizing_display_rect(self, context) : [self bounds];
+	NSRect blurFrame = [self convertRect:blurBounds toView:superview];
+
+	if (!additionalTransparencyBlurView)
+	{
+		additionalTransparencyBlurView = [[NSVisualEffectView alloc] initWithFrame:blurFrame];
+		[additionalTransparencyBlurView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+		[additionalTransparencyBlurView setBlendingMode:NSVisualEffectBlendingModeBehindWindow];
+		[additionalTransparencyBlurView setMaterial:NSVisualEffectMaterialHUDWindow];
+		[additionalTransparencyBlurView setState:NSVisualEffectStateActive];
+		[additionalTransparencyBlurView setWantsLayer:YES];
+
+		additionalTransparencyBlurMaskLayer = [[CALayer layer] retain];
+		[[additionalTransparencyBlurView layer] setMask:additionalTransparencyBlurMaskLayer];
+	}
+
+	if ([additionalTransparencyBlurView superview] != superview)
+	{
+		[additionalTransparencyBlurView removeFromSuperview];
+		[superview addSubview:additionalTransparencyBlurView
+		           positioned:NSWindowBelow
+		           relativeTo:self];
+	}
+
+	[additionalTransparencyBlurView setFrame:blurFrame];
+	[additionalTransparencyBlurMaskLayer setFrame:[additionalTransparencyBlurView bounds]];
+}
+
+- (void)updateAdditionalTransparencyBlurMask:(uint8_t *)maskData
+                                      width:(size_t)width
+                                     height:(size_t)height
+{
+	if (!maskData || width == 0 || height == 0)
+	{
+		[additionalTransparencyBlurView setHidden:YES];
+		[additionalTransparencyBlurMaskLayer setContents:nil];
+		free(maskData);
+		return;
+	}
+
+	uint8_t *rgbaMask = (uint8_t *)calloc(width * height, 4);
+	if (!rgbaMask)
+	{
+		[additionalTransparencyBlurView setHidden:YES];
+		free(maskData);
+		return;
+	}
+
+	for (size_t i = 0; i < width * height; i++)
+	{
+		rgbaMask[(i * 4) + 0] = 0xFF;
+		rgbaMask[(i * 4) + 1] = 0xFF;
+		rgbaMask[(i * 4) + 2] = 0xFF;
+		rgbaMask[(i * 4) + 3] = maskData[i];
+	}
+	free(maskData);
+
+	[self ensureAdditionalTransparencyBlurView];
+	if (!additionalTransparencyBlurView || !additionalTransparencyBlurMaskLayer)
+	{
+		free(rgbaMask);
+		return;
+	}
+
+	CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+	CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, rgbaMask, width * height * 4,
+	                                                          mac_release_mask_data);
+	CGImageRef maskImage = CGImageCreate(width, height, 8, 32, width * 4, colorSpace,
+	                                     kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big,
+	                                     provider, NULL, FALSE, kCGRenderingIntentDefault);
+	if (!maskImage)
+	{
+		[additionalTransparencyBlurView setHidden:YES];
+		CGDataProviderRelease(provider);
+		CGColorSpaceRelease(colorSpace);
+		return;
+	}
+
+	[additionalTransparencyBlurView setHidden:NO];
+	[additionalTransparencyBlurMaskLayer setContents:(id)maskImage];
+	[additionalTransparencyBlurMaskLayer setContentsGravity:kCAGravityResize];
+	[additionalTransparencyBlurMaskLayer setFrame:[additionalTransparencyBlurView bounds]];
+
+	CGImageRelease(maskImage);
+	CGDataProviderRelease(provider);
+	CGColorSpaceRelease(colorSpace);
 }
 
 	- (void)startMousePassThroughMonitor
@@ -1379,7 +1474,7 @@ static BOOL mac_is_chroma_key_pixel(const mfContext *mfc, uint32_t pixel)
 }
 
 static BOOL mac_additional_transparency_for_pixel(const mfContext *mfc, uint32_t pixel,
-	                                             UINT32 *transparency)
+	                                             UINT32 *transparency, BOOL *blur)
 {
 	if (!mfc)
 		return FALSE;
@@ -1407,11 +1502,20 @@ static BOOL mac_additional_transparency_for_pixel(const mfContext *mfc, uint32_t
 		{
 			if (transparency)
 				*transparency = MIN(mfc->additionalTransparencyLevels[i], 100);
+			if (blur)
+				*blur = mfc->additionalTransparencyBlur[i];
 			return TRUE;
 		}
 	}
 
 	return FALSE;
+}
+
+static void mac_release_mask_data(void *info, const void *data, size_t size)
+{
+	(void)info;
+	(void)size;
+	free((void *)data);
 }
 
 static BOOL mac_is_resize_cursor(NSCursor *cursor)
@@ -1497,6 +1601,11 @@ static BOOL mac_has_chroma_key_margin(const mfContext *mfc, const rdpGdi *gdi, i
 	[self stopMousePassThroughMonitor];
 	[[self window] setIgnoresMouseEvents:NO];
 	mousePassThroughArmed = NO;
+	[additionalTransparencyBlurView removeFromSuperview];
+	[additionalTransparencyBlurView release];
+	additionalTransparencyBlurView = nil;
+	[additionalTransparencyBlurMaskLayer release];
+	additionalTransparencyBlurMaskLayer = nil;
 
 	for (int i = 0; i < argc; i++)
 		free(argv[i]);
@@ -1511,16 +1620,36 @@ static BOOL mac_has_chroma_key_margin(const mfContext *mfc, const rdpGdi *gdi, i
 {
 	if (!self->bitmap_context ||
 	    (!mfc->chromaKeyEnabled && (mfc->additionalTransparencyColorCount == 0)))
+	{
+		[self updateAdditionalTransparencyBlurMask:NULL width:0 height:0];
 		return CGBitmapContextCreateImage(self->bitmap_context);
+	}
 
 	rdpGdi *gdi = context->gdi;
 
 	uint32_t *buffer = (uint32_t *)gdi->primary_buffer;
 	size_t pixelCount = gdi->width * gdi->height;
 	uint8_t *backup = (uint8_t *)malloc(pixelCount * sizeof(uint32_t));
+	uint8_t *blurMask = NULL;
+	BOOL hasBlur = FALSE;
 
 	if (!backup)
 		return CGBitmapContextCreateImage(self->bitmap_context);
+
+	size_t maxAdditionalColors =
+	    sizeof(mfc->additionalTransparencyBlur) / sizeof(mfc->additionalTransparencyBlur[0]);
+	size_t additionalColorCount = MIN(mfc->additionalTransparencyColorCount, maxAdditionalColors);
+	for (size_t i = 0; i < additionalColorCount; i++)
+	{
+		if (mfc->additionalTransparencyBlur[i])
+		{
+			hasBlur = TRUE;
+			break;
+		}
+	}
+
+	if (hasBlur)
+		blurMask = (uint8_t *)calloc(pixelCount, sizeof(uint8_t));
 
 	memcpy(backup, buffer, pixelCount * sizeof(uint32_t));
 
@@ -1535,12 +1664,25 @@ static BOOL mac_has_chroma_key_margin(const mfContext *mfc, const rdpGdi *gdi, i
 		else
 		{
 			UINT32 transparency = 0;
-			if (!mac_additional_transparency_for_pixel(mfc, pixel, &transparency))
+			BOOL blur = FALSE;
+			if (!mac_additional_transparency_for_pixel(mfc, pixel, &transparency, &blur))
 				continue;
 			UINT32 alpha = 255 - (transparency * 255 / 100);
-			buffer[i] = (pixel & 0x00FFFFFF) | (alpha << 24);
+			uint32_t color = pixel & 0x00FFFFFF;
+			if (blur)
+			{
+				color = pixel & 0x00FFFFFF;
+				if (blurMask)
+					blurMask[i] = 0xFF;
+			}
+			buffer[i] = color | (alpha << 24);
 		}
 	}
+
+	if (blurMask)
+		[self updateAdditionalTransparencyBlurMask:blurMask width:gdi->width height:gdi->height];
+	else
+		[self updateAdditionalTransparencyBlurMask:NULL width:0 height:0];
 
 	CGImageRef cgImage = CGBitmapContextCreateImage(self->bitmap_context);
 	memcpy(buffer, backup, pixelCount * sizeof(uint32_t));

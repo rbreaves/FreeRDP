@@ -21,6 +21,7 @@
  */
 
 #import <Cocoa/Cocoa.h>
+#import <QuartzCore/QuartzCore.h>
 
 #import "mfreerdp.h"
 #import "mf_client.h"
@@ -54,6 +55,8 @@
 	id mousePassThroughMonitor;
 	BOOL mousePassThroughArmed;
 	BOOL mousePassThroughSyncScheduled;
+	NSVisualEffectView *additionalTransparencyBlurView;
+	CALayer *additionalTransparencyBlurMaskLayer;
   @public
 	NSPasteboard *pasteboard_rd;
 	NSPasteboard *pasteboard_wr;

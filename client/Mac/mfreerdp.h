@@ -103,6 +103,7 @@ typedef struct
 	uint32_t additionalTransparencyColors[16];
 	UINT32 additionalTransparencyLevels[16];
 	UINT32 additionalTransparencyTolerances[16];
+	BOOL additionalTransparencyBlur[16];
 	size_t additionalTransparencyColorCount;
 	float chromaKeyTolerance;
 

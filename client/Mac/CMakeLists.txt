@@ -16,10 +16,11 @@ find_library(COCOA_LIBRARY Cocoa REQUIRED)
 find_library(APPKIT_LIBRARY AppKit REQUIRED)
 find_library(IOKIT_LIBRARY IOKit REQUIRED)
 find_library(COREGRAPHICS_LIBRARY CoreGraphics REQUIRED)
+find_library(QUARTZCORE_LIBRARY QuartzCore REQUIRED)
 find_library(SECURITY_LIBRARY Security REQUIRED)
 
 set(EXTRA_LIBS ${COCOA_LIBRARY} ${FOUNDATION_LIBRARY} ${APPKIT_LIBRARY} ${IOKIT_LIBRARY}
-               ${SECURITY_LIBRARY})
+               ${QUARTZCORE_LIBRARY} ${SECURITY_LIBRARY})
 
 set(XIBS)  # XIB files require full Xcode (not CLT)
 

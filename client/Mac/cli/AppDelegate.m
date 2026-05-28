@@ -59,6 +59,7 @@ static NSString *const MRDPChromaKeyColorKey = @"MRDPChromaKeyColor";
 static NSString *const MRDPAdditionalTransparencyColorsKey = @"MRDPAdditionalTransparencyColors";
 static NSString *const MRDPAdditionalTransparencyLevelsKey = @"MRDPAdditionalTransparencyLevels";
 static NSString *const MRDPAdditionalTransparencyTolerancesKey = @"MRDPAdditionalTransparencyTolerances";
+static NSString *const MRDPAdditionalTransparencyBlurKey = @"MRDPAdditionalTransparencyBlur";
 static NSString *const MRDPWindowShadowsEnabledKey = @"MRDPWindowShadowsEnabled";
 static NSString *const MRDPStatusSessionDidUpdateNotification = @"org.freerdp.mac.statusSessionDidUpdate";
 static NSString *const MRDPStatusSessionWillTerminateNotification = @"org.freerdp.mac.statusSessionWillTerminate";
@@ -66,14 +67,16 @@ static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusC
 
 static BOOL mac_parse_hex_color_text(NSString *text, uint32_t *color);
 static BOOL mac_parse_hex_alpha_list(NSString *text, uint32_t *colors, UINT32 *transparencies,
-                                     UINT32 *tolerances, size_t capacity, size_t *count);
+                                     UINT32 *tolerances, BOOL *blur, size_t capacity,
+                                     size_t *count);
 static NSString *mac_hex_alpha_list_string(const mfContext *mfc);
 static NSArray *mac_hex_color_number_array(const mfContext *mfc);
 static NSArray *mac_transparency_number_array(const mfContext *mfc);
 static NSArray *mac_tolerance_number_array(const mfContext *mfc);
+static NSArray *mac_blur_number_array(const mfContext *mfc);
 static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, NSArray *colors,
                                                                NSArray *transparencies,
-                                                               NSArray *tolerances);
+                                                               NSArray *tolerances, NSArray *blur);
 
 @interface MRDPClientWindow : NSWindow
 @end
@@ -112,7 +115,8 @@ static BOOL mac_parse_hex_color_text(NSString *text, uint32_t *color)
 }
 
 static BOOL mac_parse_hex_alpha_list(NSString *text, uint32_t *colors, UINT32 *transparencies,
-                                     UINT32 *tolerances, size_t capacity, size_t *count)
+                                     UINT32 *tolerances, BOOL *blur, size_t capacity,
+                                     size_t *count)
 {
 	NSCharacterSet *separators = [NSCharacterSet characterSetWithCharactersInString:@",;\r\n"];
 	NSArray *parts = [text componentsSeparatedByCharactersInSet:separators];
@@ -134,11 +138,23 @@ static BOOL mac_parse_hex_alpha_list(NSString *text, uint32_t *colors, UINT32 *t
 		NSString *colorText = [trimmed substringToIndex:equalsRange.location];
 		NSString *valuesText = [trimmed substringFromIndex:equalsRange.location + 1];
 		NSArray *valueParts = [valuesText componentsSeparatedByString:@":"];
-		if ([valueParts count] < 1 || [valueParts count] > 2)
+		if ([valueParts count] < 1 || [valueParts count] > 3)
 			return FALSE;
 
 		NSString *transparencyText = [valueParts objectAtIndex:0];
-		NSString *toleranceText = ([valueParts count] == 2) ? [valueParts objectAtIndex:1] : @"0";
+		NSString *toleranceText = @"0";
+		BOOL blurEnabled = FALSE;
+
+		for (NSUInteger i = 1; i < [valueParts count]; i++)
+		{
+			NSString *valueText = [[valueParts objectAtIndex:i]
+			    stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+			if ([valueText caseInsensitiveCompare:@"blur"] == NSOrderedSame)
+				blurEnabled = TRUE;
+			else
+				toleranceText = valueText;
+		}
+
 		colorText = [colorText
 		    stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 		transparencyText = [transparencyText
@@ -160,6 +176,7 @@ static BOOL mac_parse_hex_alpha_list(NSString *text, uint32_t *colors, UINT32 *t
 		}
 		transparencies[parsedCount] = (UINT32)scannedTransparency;
 		tolerances[parsedCount] = (UINT32)scannedTolerance;
+		blur[parsedCount] = blurEnabled;
 		parsedCount++;
 	}
 
@@ -179,13 +196,14 @@ static NSString *mac_hex_alpha_list_string(const mfContext *mfc)
 
 	for (size_t i = 0; i < count; i++)
 	{
-		[parts addObject:[NSString stringWithFormat:@"#%06X=%u:%u",
-		                                            (unsigned int)(mfc->additionalTransparencyColors[i] &
-		                                                           0xFFFFFF),
-		                                            (unsigned int)MIN(mfc->additionalTransparencyLevels[i],
-		                                                              100),
-		                                            (unsigned int)MIN(mfc->additionalTransparencyTolerances[i],
-		                                                              255)]];
+		NSString *entry = [NSString
+		    stringWithFormat:@"#%06X=%u:%u",
+		                     (unsigned int)(mfc->additionalTransparencyColors[i] & 0xFFFFFF),
+		                     (unsigned int)MIN(mfc->additionalTransparencyLevels[i], 100),
+		                     (unsigned int)MIN(mfc->additionalTransparencyTolerances[i], 255)];
+		if (mfc->additionalTransparencyBlur[i])
+			entry = [entry stringByAppendingString:@":blur"];
+		[parts addObject:entry];
 	}
 
 	return [parts componentsJoinedByString:@", "];
@@ -233,9 +251,23 @@ static NSArray *mac_tolerance_number_array(const mfContext *mfc)
 	return numbers;
 }
 
+static NSArray *mac_blur_number_array(const mfContext *mfc)
+{
+	NSMutableArray *numbers = [NSMutableArray array];
+	size_t count = mfc ? MIN(mfc->additionalTransparencyColorCount,
+	                         sizeof(mfc->additionalTransparencyColors) /
+	                             sizeof(mfc->additionalTransparencyColors[0]))
+	                   : 0;
+
+	for (size_t i = 0; i < count; i++)
+		[numbers addObject:@(mfc->additionalTransparencyBlur[i])];
+
+	return numbers;
+}
+
 static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, NSArray *colors,
                                                                NSArray *transparencies,
-                                                               NSArray *tolerances)
+                                                               NSArray *tolerances, NSArray *blur)
 {
 	if (!mfc)
 		return;
@@ -247,6 +279,7 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 		id color = [colors objectAtIndex:i];
 		id transparency = (i < [transparencies count]) ? [transparencies objectAtIndex:i] : nil;
 		id tolerance = (i < [tolerances count]) ? [tolerances objectAtIndex:i] : nil;
+		id blurEnabled = (i < [blur count]) ? [blur objectAtIndex:i] : nil;
 		if (![color respondsToSelector:@selector(integerValue)])
 			continue;
 		if (![transparency respondsToSelector:@selector(integerValue)])
@@ -263,6 +296,8 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 		    [tolerance respondsToSelector:@selector(integerValue)]
 		        ? (UINT32)MIN(MAX([tolerance integerValue], 0), 255)
 		        : 0;
+		mfc->additionalTransparencyBlur[count - 1] =
+		    [blurEnabled respondsToSelector:@selector(boolValue)] ? [blurEnabled boolValue] : FALSE;
 	}
 
 	mfc->additionalTransparencyColorCount = count;
@@ -1012,6 +1047,7 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 		NSArray *additionalColors = [info objectForKey:@"additionalColors"];
 		NSArray *additionalTransparencies = [info objectForKey:@"additionalTransparencies"];
 		NSArray *additionalTolerances = [info objectForKey:@"additionalTolerances"];
+		NSArray *additionalBlur = [info objectForKey:@"additionalBlur"];
 		mfContext *mfc = (mfContext *)context;
 
 		if (enabled)
@@ -1022,9 +1058,12 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 		{
 			if (!additionalTolerances)
 				additionalTolerances = [NSArray array];
+			if (!additionalBlur)
+				additionalBlur = [NSArray array];
 			mac_set_additional_transparency_colors_from_arrays(mfc, additionalColors,
 			                                                   additionalTransparencies,
-			                                                   additionalTolerances);
+			                                                   additionalTolerances,
+			                                                   additionalBlur);
 		}
 
 		if (mrdpView)
@@ -1414,7 +1453,7 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 	[accessoryView addSubview:additionalInput];
 
 	NSTextField *hintLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(130, 20, 230, 18)];
-	[hintLabel setStringValue:@"Use #RRGGBB=alpha:tolerance"];
+	[hintLabel setStringValue:@"Use #RRGGBB=alpha:tolerance:blur"];
 	[hintLabel setFont:[NSFont systemFontOfSize:[NSFont smallSystemFontSize]]];
 	[hintLabel setTextColor:[NSColor secondaryLabelColor]];
 	[hintLabel setEditable:NO];
@@ -1432,11 +1471,13 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 		uint32_t additionalColors[16] = { 0 };
 		UINT32 additionalTransparencies[16] = { 0 };
 		UINT32 additionalTolerances[16] = { 0 };
+		BOOL additionalBlur[16] = { 0 };
 		size_t additionalColorCount = 0;
 		BOOL validColor = mac_parse_hex_color_text([colorInput stringValue], &colorVal);
 		BOOL validAdditionalColors =
 		    mac_parse_hex_alpha_list([additionalInput stringValue], additionalColors,
 		                             additionalTransparencies, additionalTolerances,
+		                             additionalBlur,
 		                             sizeof(additionalColors) / sizeof(additionalColors[0]),
 		                             &additionalColorCount);
 
@@ -1452,6 +1493,8 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 			       additionalColorCount * sizeof(UINT32));
 			memcpy(mfc->additionalTransparencyTolerances, additionalTolerances,
 			       additionalColorCount * sizeof(UINT32));
+			memcpy(mfc->additionalTransparencyBlur, additionalBlur,
+			       additionalColorCount * sizeof(BOOL));
 
 			NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
 			[defaults setBool:mfc->windowShadowsEnabled forKey:MRDPWindowShadowsEnabledKey];
@@ -1463,6 +1506,8 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 			             forKey:MRDPAdditionalTransparencyLevelsKey];
 			[defaults setObject:mac_tolerance_number_array(mfc)
 			             forKey:MRDPAdditionalTransparencyTolerancesKey];
+			[defaults setObject:mac_blur_number_array(mfc)
+			             forKey:MRDPAdditionalTransparencyBlurKey];
 			[defaults synchronize];
 
 			[self applyWindowDecorationsFromSettings];
@@ -1485,7 +1530,9 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 				                                 mac_transparency_number_array(mfc),
 				                                 @"additionalTransparencies",
 				                                 mac_tolerance_number_array(mfc),
-				                                 @"additionalTolerances", nil];
+				                                 @"additionalTolerances",
+				                                 mac_blur_number_array(mfc),
+				                                 @"additionalBlur", nil];
 				[[NSDistributedNotificationCenter defaultCenter]
 				    postNotificationName:MRDPStatusCommandNotification
 				                  object:nil
@@ -1827,11 +1874,14 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 	    [defaults objectForKey:MRDPAdditionalTransparencyLevelsKey])
 	{
 		NSArray *tolerances = [defaults arrayForKey:MRDPAdditionalTransparencyTolerancesKey];
+		NSArray *blur = [defaults arrayForKey:MRDPAdditionalTransparencyBlurKey];
 		if (!tolerances)
 			tolerances = [NSArray array];
+		if (!blur)
+			blur = [NSArray array];
 		mac_set_additional_transparency_colors_from_arrays(
 		    mfc, [defaults arrayForKey:MRDPAdditionalTransparencyColorsKey],
-		    [defaults arrayForKey:MRDPAdditionalTransparencyLevelsKey], tolerances);
+		    [defaults arrayForKey:MRDPAdditionalTransparencyLevelsKey], tolerances, blur);
 	}
 }
 
