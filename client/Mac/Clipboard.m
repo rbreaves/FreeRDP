@@ -21,6 +21,10 @@
 #import "Clipboard.h"
 #import "MRDPView.h"
 
+#include <winpr/endian.h>
+
+static UINT mac_cliprdr_send_file_contents_failure(wClipboardDelegate *delegate, UINT32 streamId);
+
 int mac_cliprdr_send_client_format_list(CliprdrClientContext *cliprdr)
 {
 	UINT32 formatId;
@@ -119,7 +123,9 @@ static int mac_cliprdr_send_client_capabilities(CliprdrClientContext *cliprdr)
 	generalCapabilitySet.capabilitySetLength = 12;
 
 	generalCapabilitySet.version = CB_CAPS_VERSION_2;
-	generalCapabilitySet.generalFlags = CB_USE_LONG_FORMAT_NAMES;
+	generalCapabilitySet.generalFlags = CB_USE_LONG_FORMAT_NAMES | CB_STREAM_FILECLIP_ENABLED |
+	                                    CB_FILECLIP_NO_FILE_PATHS |
+	                                    CB_HUGE_FILE_SUPPORT_ENABLED;
 
 	cliprdr->ClientCapabilities(cliprdr, &capabilities);
 
@@ -227,12 +233,12 @@ static UINT mac_cliprdr_server_format_list(CliprdrClientContext *cliprdr,
 		else if (format->formatId == CF_OEMTEXT)
 		{
 			if (formatId == 0)
-				formatId == CF_OEMTEXT;
+				formatId = CF_OEMTEXT;
 		}
 		else if (format->formatId == CF_TEXT)
 		{
 			if (formatId == 0)
-				formatId == CF_TEXT;
+				formatId = CF_TEXT;
 		}
 	}
 
@@ -389,6 +395,43 @@ static UINT
 mac_cliprdr_server_file_contents_request(CliprdrClientContext *cliprdr,
                                          const CLIPRDR_FILE_CONTENTS_REQUEST *fileContentsRequest)
 {
+	WINPR_ASSERT(cliprdr);
+	WINPR_ASSERT(fileContentsRequest);
+
+	mfContext *mfc = (mfContext *)cliprdr->custom;
+	WINPR_ASSERT(mfc);
+
+	wClipboardDelegate *delegate = ClipboardGetDelegate(mfc->clipboard);
+	if (!delegate)
+		return CHANNEL_RC_OK;
+
+	UINT rc = CHANNEL_RC_OK;
+
+	if (fileContentsRequest->dwFlags & FILECONTENTS_SIZE)
+	{
+		wClipboardFileSizeRequest request = { 0 };
+		request.streamId = fileContentsRequest->streamId;
+		request.listIndex = fileContentsRequest->listIndex;
+		rc = delegate->ClientRequestFileSize(delegate, &request);
+	}
+	else if (fileContentsRequest->dwFlags & FILECONTENTS_RANGE)
+	{
+		wClipboardFileRangeRequest request = { 0 };
+		request.streamId = fileContentsRequest->streamId;
+		request.listIndex = fileContentsRequest->listIndex;
+		request.nPositionLow = fileContentsRequest->nPositionLow;
+		request.nPositionHigh = fileContentsRequest->nPositionHigh;
+		request.cbRequested = fileContentsRequest->cbRequested;
+		rc = delegate->ClientRequestFileRange(delegate, &request);
+	}
+	else
+	{
+		rc = ERROR_INVALID_PARAMETER;
+	}
+
+	if (rc != CHANNEL_RC_OK)
+		return mac_cliprdr_send_file_contents_failure(delegate, fileContentsRequest->streamId);
+
 	return CHANNEL_RC_OK;
 }
 
@@ -403,6 +446,62 @@ static UINT mac_cliprdr_server_file_contents_response(
 	return CHANNEL_RC_OK;
 }
 
+static UINT mac_cliprdr_send_file_contents_response(wClipboardDelegate *delegate, UINT32 streamId,
+                                                    UINT16 flags, const BYTE *data, UINT32 size)
+{
+	if (!delegate || !delegate->custom)
+		return ERROR_BAD_ARGUMENTS;
+
+	mfContext *mfc = (mfContext *)delegate->custom;
+	if (!mfc->cliprdr)
+		return ERROR_INVALID_STATE;
+
+	CLIPRDR_FILE_CONTENTS_RESPONSE response = WINPR_C_ARRAY_INIT;
+	response.common.msgType = CB_FILECONTENTS_RESPONSE;
+	response.common.msgFlags = flags;
+	response.common.dataLen = sizeof(UINT32) + size;
+	response.streamId = streamId;
+	response.cbRequested = size;
+	response.requestedData = data;
+	return mfc->cliprdr->ClientFileContentsResponse(mfc->cliprdr, &response);
+}
+
+static UINT mac_cliprdr_send_file_contents_failure(wClipboardDelegate *delegate, UINT32 streamId)
+{
+	return mac_cliprdr_send_file_contents_response(delegate, streamId, CB_RESPONSE_FAIL, nullptr, 0);
+}
+
+static UINT mac_cliprdr_file_size_success(wClipboardDelegate *delegate,
+                                          const wClipboardFileSizeRequest *request, UINT64 fileSize)
+{
+	BYTE data[sizeof(UINT64)] = { 0 };
+	Data_Write_UINT64(data, fileSize);
+	return mac_cliprdr_send_file_contents_response(delegate, request->streamId, CB_RESPONSE_OK, data,
+	                                               sizeof(data));
+}
+
+static UINT mac_cliprdr_file_size_failure(wClipboardDelegate *delegate,
+                                          const wClipboardFileSizeRequest *request,
+                                          UINT errorCode)
+{
+	return mac_cliprdr_send_file_contents_failure(delegate, request->streamId);
+}
+
+static UINT mac_cliprdr_file_range_success(wClipboardDelegate *delegate,
+                                           const wClipboardFileRangeRequest *request,
+                                           const BYTE *data, UINT32 size)
+{
+	return mac_cliprdr_send_file_contents_response(delegate, request->streamId, CB_RESPONSE_OK, data,
+	                                               size);
+}
+
+static UINT mac_cliprdr_file_range_failure(wClipboardDelegate *delegate,
+                                           const wClipboardFileRangeRequest *request,
+                                           UINT errorCode)
+{
+	return mac_cliprdr_send_file_contents_failure(delegate, request->streamId);
+}
+
 void mac_cliprdr_init(mfContext *mfc, CliprdrClientContext *cliprdr)
 {
 	cliprdr->custom = (void *)mfc;
@@ -410,6 +509,15 @@ void mac_cliprdr_init(mfContext *mfc, CliprdrClientContext *cliprdr)
 
 	mfc->clipboard = ClipboardCreate();
 	mfc->clipboardRequestEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+	wClipboardDelegate *delegate = ClipboardGetDelegate(mfc->clipboard);
+	if (delegate)
+	{
+		delegate->custom = mfc;
+		delegate->ClipboardFileSizeSuccess = mac_cliprdr_file_size_success;
+		delegate->ClipboardFileSizeFailure = mac_cliprdr_file_size_failure;
+		delegate->ClipboardFileRangeSuccess = mac_cliprdr_file_range_success;
+		delegate->ClipboardFileRangeFailure = mac_cliprdr_file_range_failure;
+	}
 
 	cliprdr->MonitorReady = mac_cliprdr_monitor_ready;
 	cliprdr->ServerCapabilities = mac_cliprdr_server_capabilities;

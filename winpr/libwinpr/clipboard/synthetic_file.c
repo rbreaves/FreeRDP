@@ -546,6 +546,7 @@ static void* convert_any_uri_list_to_filedescriptors(wClipboard* clipboard,
                                                      UINT32* pSize)
 {
 	FILEDESCRIPTORW* descriptors = nullptr;
+	BYTE* data = nullptr;
 
 	WINPR_ASSERT(clipboard);
 	WINPR_ASSERT(pSize);
@@ -555,9 +556,28 @@ static void* convert_any_uri_list_to_filedescriptors(wClipboard* clipboard,
 	if (!descriptors)
 		return nullptr;
 
-	*pSize = (UINT32)ArrayList_Count(clipboard->localFiles) * sizeof(FILEDESCRIPTORW);
+	const size_t count = ArrayList_Count(clipboard->localFiles);
+	if (count > UINT32_MAX)
+		goto fail;
+
+	const size_t size = sizeof(UINT32) + count * sizeof(FILEDESCRIPTORW);
+	if (size > UINT32_MAX)
+		goto fail;
+
+	data = calloc(1, size);
+	if (!data)
+		goto fail;
+
+	Data_Write_UINT32(data, (UINT32)count);
+	memcpy(&data[sizeof(UINT32)], descriptors, count * sizeof(FILEDESCRIPTORW));
+	*pSize = (UINT32)size;
 	clipboard->fileListSequenceNumber = clipboard->sequenceNumber;
-	return descriptors;
+	free(descriptors);
+	return data;
+
+fail:
+	free(descriptors);
+	return nullptr;
 }
 
 static void* convert_uri_list_to_filedescriptors(wClipboard* clipboard, UINT32 formatId,

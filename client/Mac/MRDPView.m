@@ -1746,8 +1746,41 @@ static BOOL mac_has_chroma_key_margin(const mfContext *mfc, const rdpGdi *gdi, i
 	 */
 	formatMatch = FALSE;
 
+	NSArray *classes = [NSArray arrayWithObject:[NSURL class]];
+	NSDictionary *options =
+	    [NSDictionary dictionaryWithObject:[NSNumber numberWithBool:YES]
+	                                forKey:NSPasteboardURLReadingFileURLsOnlyKey];
+	NSArray *urls = [pasteboard_rd readObjectsForClasses:classes options:options];
+	NSMutableString *uriList = [NSMutableString string];
+
+	for (NSURL *url in urls)
+	{
+		if (![url isFileURL])
+			continue;
+
+		NSURL *pathURL = [url filePathURL];
+		NSString *path = [pathURL path];
+		if (!path || ![[NSFileManager defaultManager] fileExistsAtPath:path])
+			continue;
+
+		[uriList appendString:[pathURL absoluteString]];
+		[uriList appendString:@"\r\n"];
+	}
+
+	if ([uriList length] > 0)
+	{
+		const char *data = [uriList cStringUsingEncoding:NSUTF8StringEncoding];
+		const size_t dataLen = [uriList lengthOfBytesUsingEncoding:NSUTF8StringEncoding];
+		formatId = ClipboardRegisterFormat(mfc->clipboard, "text/uri-list");
+		ClipboardSetData(mfc->clipboard, formatId, data, dataLen + 1);
+		formatMatch = TRUE;
+	}
+
 	for (NSString *type in [item types])
 	{
+		if (formatMatch)
+			break;
+
 		formatType = [type UTF8String];
 
 		if (strcmp(formatType, "public.utf8-plain-text") == 0)
