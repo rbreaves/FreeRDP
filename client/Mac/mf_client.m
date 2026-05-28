@@ -96,6 +96,7 @@ static BOOL mfreerdp_client_new(freerdp *instance, rdpContext *context)
 
 	mfc->chromaKeyEnabled = FALSE;
 	mfc->chromaKeyColor = 0xFF00FF;
+	mfc->additionalTransparencyColorCount = 0;
 	mfc->chromaKeyTolerance = 30.0f;
 	mfc->windowShadowsEnabled = FALSE;
 	mfc->smart_sizing_align = MF_SMART_SIZING_ALIGN_CENTER;

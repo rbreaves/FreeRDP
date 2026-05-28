@@ -5,6 +5,7 @@
 #include <freerdp/client/file.h>
 #include <freerdp/api.h>
 #include <freerdp/freerdp.h>
+#include <stddef.h>
 
 #include <freerdp/gdi/gdi.h>
 #include <freerdp/gdi/dc.h>
@@ -99,6 +100,10 @@ typedef struct
 
 	BOOL chromaKeyEnabled;
 	uint32_t chromaKeyColor;
+	uint32_t additionalTransparencyColors[16];
+	UINT32 additionalTransparencyLevels[16];
+	UINT32 additionalTransparencyTolerances[16];
+	size_t additionalTransparencyColorCount;
 	float chromaKeyTolerance;
 
 	BOOL windowShadowsEnabled;

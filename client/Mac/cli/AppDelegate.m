@@ -56,10 +56,24 @@ static void mac_ax_set_window_frame(AXUIElementRef windowElement, CGRect frame);
 static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenIdentifier";
 static NSString *const MRDPChromaKeyEnabledKey = @"MRDPChromaKeyEnabled";
 static NSString *const MRDPChromaKeyColorKey = @"MRDPChromaKeyColor";
+static NSString *const MRDPAdditionalTransparencyColorsKey = @"MRDPAdditionalTransparencyColors";
+static NSString *const MRDPAdditionalTransparencyLevelsKey = @"MRDPAdditionalTransparencyLevels";
+static NSString *const MRDPAdditionalTransparencyTolerancesKey = @"MRDPAdditionalTransparencyTolerances";
 static NSString *const MRDPWindowShadowsEnabledKey = @"MRDPWindowShadowsEnabled";
 static NSString *const MRDPStatusSessionDidUpdateNotification = @"org.freerdp.mac.statusSessionDidUpdate";
 static NSString *const MRDPStatusSessionWillTerminateNotification = @"org.freerdp.mac.statusSessionWillTerminate";
 static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusCommand";
+
+static BOOL mac_parse_hex_color_text(NSString *text, uint32_t *color);
+static BOOL mac_parse_hex_alpha_list(NSString *text, uint32_t *colors, UINT32 *transparencies,
+                                     UINT32 *tolerances, size_t capacity, size_t *count);
+static NSString *mac_hex_alpha_list_string(const mfContext *mfc);
+static NSArray *mac_hex_color_number_array(const mfContext *mfc);
+static NSArray *mac_transparency_number_array(const mfContext *mfc);
+static NSArray *mac_tolerance_number_array(const mfContext *mfc);
+static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, NSArray *colors,
+                                                               NSArray *transparencies,
+                                                               NSArray *tolerances);
 
 @interface MRDPClientWindow : NSWindow
 @end
@@ -77,6 +91,182 @@ static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusC
 }
 
 @end
+
+static BOOL mac_parse_hex_color_text(NSString *text, uint32_t *color)
+{
+	NSString *colorText = [text
+	    stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+	if ([colorText hasPrefix:@"#"])
+		colorText = [colorText substringFromIndex:1];
+	if ([colorText hasPrefix:@"0x"] || [colorText hasPrefix:@"0X"])
+		colorText = [colorText substringFromIndex:2];
+
+	unsigned long long colorVal = 0;
+	NSScanner *scanner = [NSScanner scannerWithString:colorText];
+	BOOL valid = ([colorText length] == 6) && [scanner scanHexLongLong:&colorVal] &&
+	             [scanner isAtEnd] && (colorVal <= 0xFFFFFF);
+	if (valid && color)
+		*color = (uint32_t)(colorVal & 0xFFFFFF);
+
+	return valid;
+}
+
+static BOOL mac_parse_hex_alpha_list(NSString *text, uint32_t *colors, UINT32 *transparencies,
+                                     UINT32 *tolerances, size_t capacity, size_t *count)
+{
+	NSCharacterSet *separators = [NSCharacterSet characterSetWithCharactersInString:@",;\r\n"];
+	NSArray *parts = [text componentsSeparatedByCharactersInSet:separators];
+	size_t parsedCount = 0;
+
+	for (NSString *part in parts)
+	{
+		NSString *trimmed =
+		    [part stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+		if ([trimmed length] == 0)
+			continue;
+		if (parsedCount >= capacity)
+			return FALSE;
+
+		NSRange equalsRange = [trimmed rangeOfString:@"="];
+		if (equalsRange.location == NSNotFound)
+			return FALSE;
+
+		NSString *colorText = [trimmed substringToIndex:equalsRange.location];
+		NSString *valuesText = [trimmed substringFromIndex:equalsRange.location + 1];
+		NSArray *valueParts = [valuesText componentsSeparatedByString:@":"];
+		if ([valueParts count] < 1 || [valueParts count] > 2)
+			return FALSE;
+
+		NSString *transparencyText = [valueParts objectAtIndex:0];
+		NSString *toleranceText = ([valueParts count] == 2) ? [valueParts objectAtIndex:1] : @"0";
+		colorText = [colorText
+		    stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+		transparencyText = [transparencyText
+		    stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+		toleranceText = [toleranceText
+		    stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+
+		NSScanner *transparencyScanner = [NSScanner scannerWithString:transparencyText];
+		NSScanner *toleranceScanner = [NSScanner scannerWithString:toleranceText];
+		int scannedTransparency = 0;
+		int scannedTolerance = 0;
+		if (!mac_parse_hex_color_text(colorText, &colors[parsedCount]) ||
+		    ![transparencyScanner scanInt:&scannedTransparency] ||
+		    ![transparencyScanner isAtEnd] || scannedTransparency < 0 ||
+		    scannedTransparency > 100 || ![toleranceScanner scanInt:&scannedTolerance] ||
+		    ![toleranceScanner isAtEnd] || scannedTolerance < 0 || scannedTolerance > 255)
+		{
+			return FALSE;
+		}
+		transparencies[parsedCount] = (UINT32)scannedTransparency;
+		tolerances[parsedCount] = (UINT32)scannedTolerance;
+		parsedCount++;
+	}
+
+	if (count)
+		*count = parsedCount;
+
+	return TRUE;
+}
+
+static NSString *mac_hex_alpha_list_string(const mfContext *mfc)
+{
+	NSMutableArray *parts = [NSMutableArray array];
+	size_t count = mfc ? MIN(mfc->additionalTransparencyColorCount,
+	                         sizeof(mfc->additionalTransparencyColors) /
+	                             sizeof(mfc->additionalTransparencyColors[0]))
+	                   : 0;
+
+	for (size_t i = 0; i < count; i++)
+	{
+		[parts addObject:[NSString stringWithFormat:@"#%06X=%u:%u",
+		                                            (unsigned int)(mfc->additionalTransparencyColors[i] &
+		                                                           0xFFFFFF),
+		                                            (unsigned int)MIN(mfc->additionalTransparencyLevels[i],
+		                                                              100),
+		                                            (unsigned int)MIN(mfc->additionalTransparencyTolerances[i],
+		                                                              255)]];
+	}
+
+	return [parts componentsJoinedByString:@", "];
+}
+
+static NSArray *mac_hex_color_number_array(const mfContext *mfc)
+{
+	NSMutableArray *numbers = [NSMutableArray array];
+	size_t count = mfc ? MIN(mfc->additionalTransparencyColorCount,
+	                         sizeof(mfc->additionalTransparencyColors) /
+	                             sizeof(mfc->additionalTransparencyColors[0]))
+	                   : 0;
+
+	for (size_t i = 0; i < count; i++)
+		[numbers addObject:@((NSInteger)(mfc->additionalTransparencyColors[i] & 0xFFFFFF))];
+
+	return numbers;
+}
+
+static NSArray *mac_transparency_number_array(const mfContext *mfc)
+{
+	NSMutableArray *numbers = [NSMutableArray array];
+	size_t count = mfc ? MIN(mfc->additionalTransparencyColorCount,
+	                         sizeof(mfc->additionalTransparencyColors) /
+	                             sizeof(mfc->additionalTransparencyColors[0]))
+	                   : 0;
+
+	for (size_t i = 0; i < count; i++)
+		[numbers addObject:@((NSInteger)MIN(mfc->additionalTransparencyLevels[i], 100))];
+
+	return numbers;
+}
+
+static NSArray *mac_tolerance_number_array(const mfContext *mfc)
+{
+	NSMutableArray *numbers = [NSMutableArray array];
+	size_t count = mfc ? MIN(mfc->additionalTransparencyColorCount,
+	                         sizeof(mfc->additionalTransparencyColors) /
+	                             sizeof(mfc->additionalTransparencyColors[0]))
+	                   : 0;
+
+	for (size_t i = 0; i < count; i++)
+		[numbers addObject:@((NSInteger)MIN(mfc->additionalTransparencyTolerances[i], 255))];
+
+	return numbers;
+}
+
+static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, NSArray *colors,
+                                                               NSArray *transparencies,
+                                                               NSArray *tolerances)
+{
+	if (!mfc)
+		return;
+
+	size_t count = 0;
+	NSUInteger colorCount = [colors count];
+	for (NSUInteger i = 0; i < colorCount; i++)
+	{
+		id color = [colors objectAtIndex:i];
+		id transparency = (i < [transparencies count]) ? [transparencies objectAtIndex:i] : nil;
+		id tolerance = (i < [tolerances count]) ? [tolerances objectAtIndex:i] : nil;
+		if (![color respondsToSelector:@selector(integerValue)])
+			continue;
+		if (![transparency respondsToSelector:@selector(integerValue)])
+			continue;
+		if (count >= sizeof(mfc->additionalTransparencyColors) /
+		                 sizeof(mfc->additionalTransparencyColors[0]))
+			break;
+
+		mfc->additionalTransparencyColors[count++] =
+		    (uint32_t)([color integerValue] & 0xFFFFFF);
+		mfc->additionalTransparencyLevels[count - 1] =
+		    (UINT32)MIN(MAX([transparency integerValue], 0), 100);
+		mfc->additionalTransparencyTolerances[count - 1] =
+		    [tolerance respondsToSelector:@selector(integerValue)]
+		        ? (UINT32)MIN(MAX([tolerance integerValue], 0), 255)
+		        : 0;
+	}
+
+	mfc->additionalTransparencyColorCount = count;
+}
 
 @interface AppDelegate ()
 {
@@ -819,12 +1009,23 @@ static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusC
 	{
 		NSNumber *enabled = [info objectForKey:@"enabled"];
 		NSNumber *color = [info objectForKey:@"color"];
+		NSArray *additionalColors = [info objectForKey:@"additionalColors"];
+		NSArray *additionalTransparencies = [info objectForKey:@"additionalTransparencies"];
+		NSArray *additionalTolerances = [info objectForKey:@"additionalTolerances"];
 		mfContext *mfc = (mfContext *)context;
 
 		if (enabled)
 			mfc->chromaKeyEnabled = [enabled boolValue];
 		if (color)
 			mfc->chromaKeyColor = (uint32_t)([color integerValue] & 0xFFFFFF);
+		if (additionalColors && additionalTransparencies)
+		{
+			if (!additionalTolerances)
+				additionalTolerances = [NSArray array];
+			mac_set_additional_transparency_colors_from_arrays(mfc, additionalColors,
+			                                                   additionalTransparencies,
+			                                                   additionalTolerances);
+		}
 
 		if (mrdpView)
 			[mrdpView refreshBitmap];
@@ -1172,37 +1373,48 @@ static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusC
 	mfContext *mfc = (mfContext *)context;
 	NSAlert *alert = [[NSAlert alloc] init];
 	[alert setMessageText:@"Settings"];
-	[alert setInformativeText:@"Choose window display behavior and the hex color that should be treated as transparent."];
+	[alert setInformativeText:@"Choose window display behavior, chroma key color, and extra per-color transparency."];
 	[alert addButtonWithTitle:@"OK"];
 	[alert addButtonWithTitle:@"Cancel"];
 
-	NSView *accessoryView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 320, 116)];
+	NSView *accessoryView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 360, 174)];
 
-	NSButton *shadowCheckbox = [[NSButton alloc] initWithFrame:NSMakeRect(0, 86, 320, 20)];
+	NSButton *shadowCheckbox = [[NSButton alloc] initWithFrame:NSMakeRect(0, 144, 360, 20)];
 	[shadowCheckbox setButtonType:NSButtonTypeSwitch];
 	[shadowCheckbox setTitle:@"Enable Window Drop Shadows (Experimental)"];
 	[shadowCheckbox setState:mfc->windowShadowsEnabled ? NSControlStateValueOn : NSControlStateValueOff];
 	[accessoryView addSubview:shadowCheckbox];
 
-	NSButton *enableCheckbox = [[NSButton alloc] initWithFrame:NSMakeRect(0, 56, 320, 20)];
+	NSButton *enableCheckbox = [[NSButton alloc] initWithFrame:NSMakeRect(0, 114, 360, 20)];
 	[enableCheckbox setButtonType:NSButtonTypeSwitch];
 	[enableCheckbox setTitle:@"Enable Chroma Key Transparency"];
 	[enableCheckbox setState:mfc->chromaKeyEnabled ? NSControlStateValueOn : NSControlStateValueOff];
 	[accessoryView addSubview:enableCheckbox];
 
-	NSTextField *colorLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 24, 120, 20)];
+	NSTextField *colorLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 82, 120, 20)];
 	[colorLabel setStringValue:@"Chroma Key:"];
 	[colorLabel setEditable:NO];
 	[colorLabel setBezeled:NO];
 	[colorLabel setDrawsBackground:NO];
 	[accessoryView addSubview:colorLabel];
 
-	NSTextField *colorInput = [[NSTextField alloc] initWithFrame:NSMakeRect(125, 22, 100, 24)];
+	NSTextField *colorInput = [[NSTextField alloc] initWithFrame:NSMakeRect(130, 80, 100, 24)];
 	[colorInput setStringValue:[NSString stringWithFormat:@"#%06X", (unsigned int)(mfc->chromaKeyColor & 0xFFFFFF)]];
 	[accessoryView addSubview:colorInput];
 
-	NSTextField *hintLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(125, 0, 195, 18)];
-	[hintLabel setStringValue:@"Format: #RRGGBB"];
+	NSTextField *additionalLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 48, 120, 20)];
+	[additionalLabel setStringValue:@"Extra Colors:"];
+	[additionalLabel setEditable:NO];
+	[additionalLabel setBezeled:NO];
+	[additionalLabel setDrawsBackground:NO];
+	[accessoryView addSubview:additionalLabel];
+
+	NSTextField *additionalInput = [[NSTextField alloc] initWithFrame:NSMakeRect(130, 46, 230, 24)];
+	[additionalInput setStringValue:mac_hex_alpha_list_string(mfc)];
+	[accessoryView addSubview:additionalInput];
+
+	NSTextField *hintLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(130, 20, 230, 18)];
+	[hintLabel setStringValue:@"Use #RRGGBB=alpha:tolerance"];
 	[hintLabel setFont:[NSFont systemFontOfSize:[NSFont smallSystemFontSize]]];
 	[hintLabel setTextColor:[NSColor secondaryLabelColor]];
 	[hintLabel setEditable:NO];
@@ -1216,28 +1428,41 @@ static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusC
 
 	if (result == NSAlertFirstButtonReturn)
 	{
-		NSString *colorText = [[colorInput stringValue]
-		    stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-		if ([colorText hasPrefix:@"#"])
-			colorText = [colorText substringFromIndex:1];
-		if ([colorText hasPrefix:@"0x"] || [colorText hasPrefix:@"0X"])
-			colorText = [colorText substringFromIndex:2];
+		uint32_t colorVal = 0;
+		uint32_t additionalColors[16] = { 0 };
+		UINT32 additionalTransparencies[16] = { 0 };
+		UINT32 additionalTolerances[16] = { 0 };
+		size_t additionalColorCount = 0;
+		BOOL validColor = mac_parse_hex_color_text([colorInput stringValue], &colorVal);
+		BOOL validAdditionalColors =
+		    mac_parse_hex_alpha_list([additionalInput stringValue], additionalColors,
+		                             additionalTransparencies, additionalTolerances,
+		                             sizeof(additionalColors) / sizeof(additionalColors[0]),
+		                             &additionalColorCount);
 
-		unsigned int colorVal = 0;
-		NSScanner *scanner = [NSScanner scannerWithString:colorText];
-		BOOL validColor = ([colorText length] == 6) && [scanner scanHexInt:&colorVal] &&
-		                  [scanner isAtEnd];
-
-		if (validColor)
+		if (validColor && validAdditionalColors)
 		{
 			mfc->windowShadowsEnabled = [shadowCheckbox state] == NSControlStateValueOn;
 			mfc->chromaKeyEnabled = [enableCheckbox state] == NSControlStateValueOn;
 			mfc->chromaKeyColor = colorVal & 0xFFFFFF;
+			mfc->additionalTransparencyColorCount = additionalColorCount;
+			memcpy(mfc->additionalTransparencyColors, additionalColors,
+			       additionalColorCount * sizeof(uint32_t));
+			memcpy(mfc->additionalTransparencyLevels, additionalTransparencies,
+			       additionalColorCount * sizeof(UINT32));
+			memcpy(mfc->additionalTransparencyTolerances, additionalTolerances,
+			       additionalColorCount * sizeof(UINT32));
 
 			NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
 			[defaults setBool:mfc->windowShadowsEnabled forKey:MRDPWindowShadowsEnabledKey];
 			[defaults setBool:mfc->chromaKeyEnabled forKey:MRDPChromaKeyEnabledKey];
 			[defaults setInteger:(NSInteger)mfc->chromaKeyColor forKey:MRDPChromaKeyColorKey];
+			[defaults setObject:mac_hex_color_number_array(mfc)
+			             forKey:MRDPAdditionalTransparencyColorsKey];
+			[defaults setObject:mac_transparency_number_array(mfc)
+			             forKey:MRDPAdditionalTransparencyLevelsKey];
+			[defaults setObject:mac_tolerance_number_array(mfc)
+			             forKey:MRDPAdditionalTransparencyTolerancesKey];
 			[defaults synchronize];
 
 			[self applyWindowDecorationsFromSettings];
@@ -1254,7 +1479,13 @@ static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusC
 				NSDictionary *info = [NSDictionary
 				    dictionaryWithObjectsAndKeys:pid, @"pid", @"chroma", @"command",
 				                                 @(mfc->chromaKeyEnabled), @"enabled",
-				                                 @((NSInteger)mfc->chromaKeyColor), @"color", nil];
+				                                 @((NSInteger)mfc->chromaKeyColor), @"color",
+				                                 mac_hex_color_number_array(mfc),
+				                                 @"additionalColors",
+				                                 mac_transparency_number_array(mfc),
+				                                 @"additionalTransparencies",
+				                                 mac_tolerance_number_array(mfc),
+				                                 @"additionalTolerances", nil];
 				[[NSDistributedNotificationCenter defaultCenter]
 				    postNotificationName:MRDPStatusCommandNotification
 				                  object:nil
@@ -1282,6 +1513,8 @@ static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusC
 	[enableCheckbox release];
 	[colorLabel release];
 	[colorInput release];
+	[additionalLabel release];
+	[additionalInput release];
 	[hintLabel release];
 	[accessoryView release];
 	[alert release];
@@ -1590,6 +1823,16 @@ static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusC
 	mfc->chromaKeyEnabled = [defaults boolForKey:MRDPChromaKeyEnabledKey];
 	if ([defaults objectForKey:MRDPChromaKeyColorKey])
 		mfc->chromaKeyColor = (uint32_t)([defaults integerForKey:MRDPChromaKeyColorKey] & 0xFFFFFF);
+	if ([defaults objectForKey:MRDPAdditionalTransparencyColorsKey] &&
+	    [defaults objectForKey:MRDPAdditionalTransparencyLevelsKey])
+	{
+		NSArray *tolerances = [defaults arrayForKey:MRDPAdditionalTransparencyTolerancesKey];
+		if (!tolerances)
+			tolerances = [NSArray array];
+		mac_set_additional_transparency_colors_from_arrays(
+		    mfc, [defaults arrayForKey:MRDPAdditionalTransparencyColorsKey],
+		    [defaults arrayForKey:MRDPAdditionalTransparencyLevelsKey], tolerances);
+	}
 }
 
 - (void)loadSpacerSettingsFromDefaults

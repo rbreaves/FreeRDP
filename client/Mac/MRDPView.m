@@ -73,6 +73,8 @@ static DWORD WINAPI mac_client_thread(void *param);
 static void windows_to_apple_cords(MRDPView *view, NSRect *r);
 static CGContextRef mac_create_bitmap_context(rdpContext *context);
 static BOOL mac_is_chroma_key_pixel(const mfContext *mfc, uint32_t pixel);
+static BOOL mac_additional_transparency_for_pixel(const mfContext *mfc, uint32_t pixel,
+	                                             UINT32 *transparency);
 static BOOL mac_is_resize_cursor(NSCursor *cursor);
 static BOOL mac_view_point_to_buffer_point(MRDPView *view, const mfContext *mfc,
 	                                       rdpContext *context, NSPoint viewPoint,
@@ -1376,6 +1378,42 @@ static BOOL mac_is_chroma_key_pixel(const mfContext *mfc, uint32_t pixel)
 	return (maxDiff <= tolerance) ? TRUE : FALSE;
 }
 
+static BOOL mac_additional_transparency_for_pixel(const mfContext *mfc, uint32_t pixel,
+	                                             UINT32 *transparency)
+{
+	if (!mfc)
+		return FALSE;
+
+	size_t maxAdditionalColors =
+	    sizeof(mfc->additionalTransparencyColors) / sizeof(mfc->additionalTransparencyColors[0]);
+	size_t colorCount = MIN(mfc->additionalTransparencyColorCount, maxAdditionalColors);
+	uint8_t b = (pixel >> 0) & 0xFF;
+	uint8_t g = (pixel >> 8) & 0xFF;
+	uint8_t r = (pixel >> 16) & 0xFF;
+
+	for (size_t i = 0; i < colorCount; i++)
+	{
+		uint32_t targetColor = mfc->additionalTransparencyColors[i];
+		uint8_t targetR = (targetColor >> 16) & 0xFF;
+		uint8_t targetG = (targetColor >> 8) & 0xFF;
+		uint8_t targetB = targetColor & 0xFF;
+		UINT32 tolerance = MIN(mfc->additionalTransparencyTolerances[i], 255);
+		UINT32 diffR = (r > targetR) ? (UINT32)(r - targetR) : (UINT32)(targetR - r);
+		UINT32 diffG = (g > targetG) ? (UINT32)(g - targetG) : (UINT32)(targetG - g);
+		UINT32 diffB = (b > targetB) ? (UINT32)(b - targetB) : (UINT32)(targetB - b);
+		UINT32 maxDiff = MAX(MAX(diffR, diffG), diffB);
+
+		if (maxDiff <= tolerance)
+		{
+			if (transparency)
+				*transparency = MIN(mfc->additionalTransparencyLevels[i], 100);
+			return TRUE;
+		}
+	}
+
+	return FALSE;
+}
+
 static BOOL mac_is_resize_cursor(NSCursor *cursor)
 {
 	if (!cursor)
@@ -1471,7 +1509,8 @@ static BOOL mac_has_chroma_key_margin(const mfContext *mfc, const rdpGdi *gdi, i
 
 - (CGImageRef)createChromaKeyImage
 {
-	if (!self->bitmap_context || !mfc->chromaKeyEnabled)
+	if (!self->bitmap_context ||
+	    (!mfc->chromaKeyEnabled && (mfc->additionalTransparencyColorCount == 0)))
 		return CGBitmapContextCreateImage(self->bitmap_context);
 
 	rdpGdi *gdi = context->gdi;
@@ -1492,6 +1531,14 @@ static BOOL mac_has_chroma_key_margin(const mfContext *mfc, const rdpGdi *gdi, i
 		if (mac_is_chroma_key_pixel(mfc, pixel))
 		{
 			buffer[i] = 0x00000000;
+		}
+		else
+		{
+			UINT32 transparency = 0;
+			if (!mac_additional_transparency_for_pixel(mfc, pixel, &transparency))
+				continue;
+			UINT32 alpha = 255 - (transparency * 255 / 100);
+			buffer[i] = (pixel & 0x00FFFFFF) | (alpha << 24);
 		}
 	}
 
