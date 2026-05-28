@@ -57,6 +57,7 @@
 	BOOL mousePassThroughSyncScheduled;
 	NSVisualEffectView *additionalTransparencyBlurView;
 	CALayer *additionalTransparencyBlurMaskLayer;
+	BOOL chromaKeyRepaintRequested;
   @public
 	NSPasteboard *pasteboard_rd;
 	NSPasteboard *pasteboard_wr;
@@ -83,6 +84,8 @@
 - (void)sendRemoteCtrlAltDel;
 - (void)sendRemoteBreakKey;
 - (void)refreshBitmap;
+- (void)requestRemoteDesktopRefresh;
+- (void)scheduleChromaKeyRefreshSweep;
 
 @property(assign) int is_connected;
 

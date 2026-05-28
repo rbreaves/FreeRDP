@@ -113,6 +113,7 @@ static const NSEventMask MRDP_PASS_THROUGH_MONITOR_MASK =
 	WINPR_ASSERT(rdp_context);
 	context = rdp_context;
 	mfc = (mfContext *)rdp_context;
+	chromaKeyRepaintRequested = NO;
 	[self startMousePassThroughMonitor];
 
 	instance = context->instance;
@@ -1443,8 +1444,50 @@ static BOOL mac_send_rdp_scancode(rdpInput *input, UINT32 rdpScancode)
 	if (!instance || !instance->context || !instance->context->gdi)
 		return;
 
+	[self requestRemoteDesktopRefresh];
+
 	rdpGdi *gdi = instance->context->gdi;
-	gdi_InvalidateRegion(gdi->primary->hdc, 0, 0, (INT32)gdi->width, (INT32)gdi->height);
+	(void)gdi_InvalidateRegion(gdi->primary->hdc, 0, 0, (INT32)gdi->width, (INT32)gdi->height);
+	[self setNeedsDisplay:YES];
+}
+
+- (void)requestRemoteDesktopRefresh
+{
+	if (!instance || !instance->context || !instance->context->update ||
+	    !instance->context->update->RefreshRect)
+		return;
+
+	rdpContext *rdpContext = instance->context;
+	rdpGdi *gdi = rdpContext->gdi;
+	rdpSettings *settings = rdpContext->settings;
+	if (!gdi || !settings || !freerdp_settings_get_bool(settings, FreeRDP_RefreshRect))
+		return;
+	if ((gdi->width == 0) || (gdi->height == 0))
+		return;
+
+	RECTANGLE_16 area = { 0 };
+	area.left = 0;
+	area.top = 0;
+	area.right = (UINT16)MIN(gdi->width - 1, UINT16_MAX);
+	area.bottom = (UINT16)MIN(gdi->height - 1, UINT16_MAX);
+	(void)rdpContext->update->RefreshRect(rdpContext, 1, &area);
+}
+
+- (void)scheduleChromaKeyRefreshSweep
+{
+	if (!mfc || !mfc->chromaKeyEnabled)
+		return;
+
+	NSArray *delays = @[ @0.5, @1.0, @2.0, @4.0, @8.0, @12.0 ];
+	for (NSNumber *delay in delays)
+	{
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+		                             (int64_t)([delay doubleValue] * NSEC_PER_SEC)),
+		               dispatch_get_main_queue(), ^{
+			               if (self->mfc && self->mfc->chromaKeyEnabled && [self is_connected])
+				               [self refreshBitmap];
+		               });
+	}
 }
 
 static BOOL releaseFlagStates(rdpInput *input, UINT32 aKbdModFlags)
@@ -1653,12 +1696,14 @@ static BOOL mac_has_chroma_key_margin(const mfContext *mfc, const rdpGdi *gdi, i
 
 	memcpy(backup, buffer, pixelCount * sizeof(uint32_t));
 
+	size_t chromaPixelCount = 0;
 	for (size_t i = 0; i < pixelCount; i++)
 	{
 		uint32_t pixel = buffer[i];
 
 		if (mac_is_chroma_key_pixel(mfc, pixel))
 		{
+			chromaPixelCount++;
 			buffer[i] = 0x00000000;
 		}
 		else
@@ -1687,6 +1732,14 @@ static BOOL mac_has_chroma_key_margin(const mfContext *mfc, const rdpGdi *gdi, i
 	CGImageRef cgImage = CGBitmapContextCreateImage(self->bitmap_context);
 	memcpy(buffer, backup, pixelCount * sizeof(uint32_t));
 	free(backup);
+
+	if (!chromaKeyRepaintRequested && (chromaPixelCount > (pixelCount / 20)))
+	{
+		chromaKeyRepaintRequested = YES;
+		dispatch_async(dispatch_get_main_queue(), ^{
+			[self scheduleChromaKeyRefreshSweep];
+		});
+	}
 
 	return cgImage;
 }
@@ -2016,6 +2069,7 @@ BOOL mac_post_connect(freerdp *instance)
 		view->pasteboard_changecount = -1;
 	});
 	[view resume];
+	[view scheduleChromaKeyRefreshSweep];
 	mfc->appleKeyboardType = mac_detect_keyboard_type();
 	return TRUE;
 }
