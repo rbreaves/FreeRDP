@@ -37,6 +37,7 @@ static NSImage *mac_load_svg_image(NSString *resourceName, CGFloat pointSize, BO
 static NSImage *mac_render_image_for_size(NSImage *source, CGFloat pointSize, BOOL templateImage);
 static NSImage *mac_create_freerdp_vector_icon(CGFloat pointSize, BOOL monochrome, BOOL templateImage);
 static BOOL mac_parse_smart_sizing_alignment(const char *value, MF_SMART_SIZING_ALIGN *alignment);
+static BOOL mac_parse_smart_sizing_options(const char *value, mfContext *mfc);
 static NSInteger mac_screen_index_for_screen(NSScreen *screen);
 static NSScreen *mac_screen_for_index(NSInteger screenIndex);
 static NSString *mac_screen_identifier(NSScreen *screen);
@@ -1906,7 +1907,7 @@ static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusC
 			else if (strncmp(context->argv[j], "--smart-sizing:", 15) == 0)
 				value = context->argv[j] + 15;
 
-			if (value && mac_parse_smart_sizing_alignment(value, &mfc->smart_sizing_align))
+			if (value && mac_parse_smart_sizing_options(value, mfc))
 				*(value - 1) = '\0';
 
 			context->argv[filtered_argc++] = context->argv[j];
@@ -1939,6 +1940,53 @@ static BOOL mac_parse_smart_sizing_alignment(const char *value, MF_SMART_SIZING_
 		return FALSE;
 
 	return TRUE;
+}
+
+static BOOL mac_parse_smart_sizing_options(const char *value, mfContext *mfc)
+{
+	if (!value || !mfc)
+		return FALSE;
+
+	char *copy = _strdup(value);
+	if (!copy)
+		return FALSE;
+
+	BOOL parsed = FALSE;
+	BOOL expectOverscanAlignment = FALSE;
+
+	for (char *token = strtok(copy, ":"); token; token = strtok(NULL, ":"))
+	{
+		MF_SMART_SIZING_ALIGN alignment = MF_SMART_SIZING_ALIGN_CENTER;
+
+		if (_stricmp(token, "overscan") == 0)
+		{
+			mfc->smart_sizing_overscan = TRUE;
+			expectOverscanAlignment = TRUE;
+			parsed = TRUE;
+			continue;
+		}
+
+		if (!mac_parse_smart_sizing_alignment(token, &alignment))
+		{
+			free(copy);
+			return FALSE;
+		}
+
+		if (expectOverscanAlignment)
+		{
+			mfc->smart_sizing_overscan_align = alignment;
+			expectOverscanAlignment = FALSE;
+		}
+		else
+		{
+			mfc->smart_sizing_align = alignment;
+		}
+
+		parsed = TRUE;
+	}
+
+	free(copy);
+	return parsed;
 }
 
 - (void)CreateContext

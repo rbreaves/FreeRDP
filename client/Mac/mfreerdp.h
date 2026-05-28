@@ -57,6 +57,8 @@ typedef struct
 	int client_height;
 	int fullscreen_mode;
 	MF_SMART_SIZING_ALIGN smart_sizing_align;
+	BOOL smart_sizing_overscan;
+	MF_SMART_SIZING_ALIGN smart_sizing_overscan_align;
 
 	HANDLE stopEvent;
 	HANDLE keyboardThread;

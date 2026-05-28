@@ -2359,14 +2359,14 @@ static NSRect mac_smart_sizing_display_rect(MRDPView *view, rdpContext *context)
 
 	const CGFloat sx = bounds.size.width / (CGFloat)dw;
 	const CGFloat sy = bounds.size.height / (CGFloat)dh;
-	const CGFloat scale = MIN(sx, sy);
+	const mfContext *mfc = (const mfContext *)context;
+	const CGFloat scale = (mfc && mfc->smart_sizing_overscan) ? MAX(sx, sy) : MIN(sx, sy);
 	NSRect displayRect = NSZeroRect;
 	displayRect.size.width = dw * scale;
 	displayRect.size.height = dh * scale;
 	displayRect.origin.x = bounds.origin.x + (bounds.size.width - displayRect.size.width) / 2.0;
 	displayRect.origin.y = bounds.origin.y + (bounds.size.height - displayRect.size.height) / 2.0;
 
-	const mfContext *mfc = (const mfContext *)context;
 	switch (mfc ? mfc->smart_sizing_align : MF_SMART_SIZING_ALIGN_CENTER)
 	{
 		case MF_SMART_SIZING_ALIGN_TOP:
@@ -2383,6 +2383,27 @@ static NSRect mac_smart_sizing_display_rect(MRDPView *view, rdpContext *context)
 			break;
 		default:
 			break;
+	}
+
+	if (mfc && mfc->smart_sizing_overscan)
+	{
+		switch (mfc->smart_sizing_overscan_align)
+		{
+			case MF_SMART_SIZING_ALIGN_TOP:
+				displayRect.origin.y = NSMinY(bounds);
+				break;
+			case MF_SMART_SIZING_ALIGN_BOTTOM:
+				displayRect.origin.y = NSMaxY(bounds) - displayRect.size.height;
+				break;
+			case MF_SMART_SIZING_ALIGN_LEFT:
+				displayRect.origin.x = NSMaxX(bounds) - displayRect.size.width;
+				break;
+			case MF_SMART_SIZING_ALIGN_RIGHT:
+				displayRect.origin.x = NSMinX(bounds);
+				break;
+			default:
+				break;
+		}
 	}
 	return displayRect;
 }

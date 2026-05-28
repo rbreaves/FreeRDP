@@ -99,6 +99,8 @@ static BOOL mfreerdp_client_new(freerdp *instance, rdpContext *context)
 	mfc->chromaKeyTolerance = 30.0f;
 	mfc->windowShadowsEnabled = FALSE;
 	mfc->smart_sizing_align = MF_SMART_SIZING_ALIGN_CENTER;
+	mfc->smart_sizing_overscan = FALSE;
+	mfc->smart_sizing_overscan_align = MF_SMART_SIZING_ALIGN_CENTER;
 
 	context->instance->PreConnect = mac_pre_connect;
 	context->instance->PostConnect = mac_post_connect;
@@ -137,7 +139,7 @@ static void mf_scale_mouse_coordinates(mfContext *mfc, UINT16 *px, UINT16 *py)
 		NSRect bounds = [view bounds];
 		const CGFloat sx = bounds.size.width / (CGFloat)dw;
 		const CGFloat sy = bounds.size.height / (CGFloat)dh;
-		const CGFloat scale = MIN(sx, sy);
+		const CGFloat scale = mfc->smart_sizing_overscan ? MAX(sx, sy) : MIN(sx, sy);
 		if (scale <= 0)
 			return;
 
@@ -163,6 +165,27 @@ static void mf_scale_mouse_coordinates(mfContext *mfc, UINT16 *px, UINT16 *py)
 				break;
 			default:
 				break;
+		}
+
+		if (mfc->smart_sizing_overscan)
+		{
+			switch (mfc->smart_sizing_overscan_align)
+			{
+				case MF_SMART_SIZING_ALIGN_TOP:
+					displayRect.origin.y = NSMinY(bounds);
+					break;
+				case MF_SMART_SIZING_ALIGN_BOTTOM:
+					displayRect.origin.y = NSMaxY(bounds) - displayRect.size.height;
+					break;
+				case MF_SMART_SIZING_ALIGN_LEFT:
+					displayRect.origin.x = NSMaxX(bounds) - displayRect.size.width;
+					break;
+				case MF_SMART_SIZING_ALIGN_RIGHT:
+					displayRect.origin.x = NSMinX(bounds);
+					break;
+				default:
+					break;
+			}
 		}
 
 		const CGFloat top = bounds.size.height - NSMaxY(displayRect);
