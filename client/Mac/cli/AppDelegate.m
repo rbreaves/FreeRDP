@@ -13,6 +13,7 @@
 #import <MRDPView.h>
 
 #import <winpr/assert.h>
+#import <winpr/string.h>
 #import <freerdp/client/cmdline.h>
 #import <freerdp/client/disp.h>
 #import <freerdp/version.h>
@@ -28,12 +29,14 @@ void AppDelegate_EmbedWindowEventHandler(void *context, const EmbedWindowEventAr
 void AppDelegate_ResizeWindowEventHandler(void *context, const ResizeWindowEventArgs *e);
 void mac_set_view_size(rdpContext *context, MRDPView *view);
 static void mac_position_window_top_left(NSWindow *window);
-static void mac_maximize_window_minus_menubar(NSWindow *window, MRDPView *view);
+static void mac_maximize_window_minus_menubar(rdpContext *context, NSWindow *window, MRDPView *view);
+static void mac_fit_view_to_window_content(rdpContext *context, MRDPView *view);
 static BOOL mac_is_point_on_left_screen_edge(NSPoint point);
 static NSURL *mac_find_resource_url(NSString *resourceName, NSString *extension);
 static NSImage *mac_load_svg_image(NSString *resourceName, CGFloat pointSize, BOOL templateImage);
 static NSImage *mac_render_image_for_size(NSImage *source, CGFloat pointSize, BOOL templateImage);
 static NSImage *mac_create_freerdp_vector_icon(CGFloat pointSize, BOOL monochrome, BOOL templateImage);
+static BOOL mac_parse_smart_sizing_alignment(const char *value, MF_SMART_SIZING_ALIGN *alignment);
 static NSInteger mac_screen_index_for_screen(NSScreen *screen);
 static NSScreen *mac_screen_for_index(NSInteger screenIndex);
 static NSString *mac_screen_identifier(NSScreen *screen);
@@ -373,7 +376,8 @@ static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusC
 
 		WINPR_ASSERT(settings);
 
-		if (freerdp_settings_get_bool(settings, FreeRDP_Fullscreen))
+		if (freerdp_settings_get_bool(settings, FreeRDP_Fullscreen) &&
+		    !freerdp_settings_get_bool(settings, FreeRDP_SmartSizing))
 		{
 			(void)freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth,
 			                                  screenFrame.size.width);
@@ -469,6 +473,16 @@ static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusC
 {
 	(void)notification;
 	[self savePreferredScreenToDefaults];
+	[self broadcastStatusSessionUpdate];
+}
+
+- (void)windowDidResize:(NSNotification *)notification
+{
+	(void)notification;
+
+	if (context && mrdpView)
+		mac_fit_view_to_window_content(context, mrdpView);
+
 	[self broadcastStatusSessionUpdate];
 }
 
@@ -1445,7 +1459,7 @@ static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusC
 		const BOOL resizeRequested = [self requestRemoteResizeForScreen:screen];
 
 		if (!resizeRequested && pseudoFullscreen)
-			mac_maximize_window_minus_menubar(window, mrdpView);
+			mac_maximize_window_minus_menubar(context, window, mrdpView);
 	}
 
 	if (fullscreen && mrdpView)
@@ -1465,6 +1479,9 @@ static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusC
 	const BOOL fullscreen = freerdp_settings_get_bool(settings, FreeRDP_Fullscreen) &&
 	                        (mfc->fullscreen_mode != 2);
 	const BOOL pseudoFullscreen = (mfc->fullscreen_mode == 2);
+
+	if (freerdp_settings_get_bool(settings, FreeRDP_SmartSizing))
+		return NO;
 
 	if (!fullscreen && !pseudoFullscreen)
 		return NO;
@@ -1880,6 +1897,18 @@ static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusC
 		}
 		else
 		{
+			char *value = NULL;
+
+			if (strncmp(context->argv[j], "/smart-sizing:", 14) == 0)
+				value = context->argv[j] + 14;
+			else if (strncmp(context->argv[j], "-smart-sizing:", 14) == 0)
+				value = context->argv[j] + 14;
+			else if (strncmp(context->argv[j], "--smart-sizing:", 15) == 0)
+				value = context->argv[j] + 15;
+
+			if (value && mac_parse_smart_sizing_alignment(value, &mfc->smart_sizing_align))
+				*(value - 1) = '\0';
+
 			context->argv[filtered_argc++] = context->argv[j];
 		}
 	}
@@ -1891,6 +1920,25 @@ static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusC
 	                                                  context->argv);
 
 	return status;
+}
+
+static BOOL mac_parse_smart_sizing_alignment(const char *value, MF_SMART_SIZING_ALIGN *alignment)
+{
+	if (!value || !alignment)
+		return FALSE;
+
+	if (_stricmp(value, "top") == 0)
+		*alignment = MF_SMART_SIZING_ALIGN_TOP;
+	else if (_stricmp(value, "bottom") == 0)
+		*alignment = MF_SMART_SIZING_ALIGN_BOTTOM;
+	else if (_stricmp(value, "left") == 0)
+		*alignment = MF_SMART_SIZING_ALIGN_LEFT;
+	else if (_stricmp(value, "right") == 0)
+		*alignment = MF_SMART_SIZING_ALIGN_RIGHT;
+	else
+		return FALSE;
+
+	return TRUE;
 }
 
 - (void)CreateContext
@@ -2074,24 +2122,37 @@ void mac_set_view_size(rdpContext *context, MRDPView *view)
 	mfContext *mfc = (mfContext *)context;
 	NSWindow *window = [view window];
 	NSScreen *screen = mac_preferred_screen(window);
+	const BOOL smartSizing = freerdp_settings_get_bool(context->settings, FreeRDP_SmartSizing);
 	// set client area to specified dimensions
 	NSRect innerRect;
 	innerRect.origin.x = 0;
 	innerRect.origin.y = 0;
-	innerRect.size.width = freerdp_settings_get_uint32(context->settings, FreeRDP_DesktopWidth);
-	innerRect.size.height = freerdp_settings_get_uint32(context->settings, FreeRDP_DesktopHeight);
+	innerRect.size.width = smartSizing ?
+	    freerdp_settings_get_uint32(context->settings, FreeRDP_SmartSizingWidth) :
+	    0;
+	innerRect.size.height = smartSizing ?
+	    freerdp_settings_get_uint32(context->settings, FreeRDP_SmartSizingHeight) :
+	    0;
+
+	if ((innerRect.size.width <= 0) || (innerRect.size.height <= 0))
+	{
+		innerRect.size.width = freerdp_settings_get_uint32(context->settings, FreeRDP_DesktopWidth);
+		innerRect.size.height = freerdp_settings_get_uint32(context->settings, FreeRDP_DesktopHeight);
+	}
+
 	[view setFrame:innerRect];
+	[view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
 	// calculate window of same size, but keep position
 	NSRect outerRect = [window frame];
 	outerRect.size = [window frameRectForContentRect:innerRect].size;
 	// we are not in RemoteApp mode, disable larger than resolution
-	[window setContentMaxSize:innerRect.size];
+	[window setContentMaxSize:smartSizing ? NSMakeSize(CGFLOAT_MAX, CGFLOAT_MAX) : innerRect.size];
 	// set window to given area
 	[window setFrame:outerRect display:YES];
 
 	if ((mfc->fullscreen_mode == 2) && [view is_connected])
 	{
-		mac_maximize_window_minus_menubar(window, view);
+		mac_maximize_window_minus_menubar(context, window, view);
 	}
 	else if (!freerdp_settings_get_bool(context->settings, FreeRDP_Decorations) &&
 	    !freerdp_settings_get_bool(context->settings, FreeRDP_Fullscreen))
@@ -2107,7 +2168,29 @@ void mac_set_view_size(rdpContext *context, MRDPView *view)
 	    view && screen && ![view isInFullScreenMode])
 	{
 		[view enterFullScreenMode:screen withOptions:nil];
+		mac_fit_view_to_window_content(context, view);
 	}
+}
+
+static void mac_fit_view_to_window_content(rdpContext *context, MRDPView *view)
+{
+	if (!context || !context->settings || !view ||
+	    !freerdp_settings_get_bool(context->settings, FreeRDP_SmartSizing))
+		return;
+
+	NSView *contentView = [[view window] contentView];
+	if (!contentView)
+		return;
+
+	NSRect bounds = [contentView bounds];
+	if ((NSWidth(bounds) <= 0) || (NSHeight(bounds) <= 0))
+		return;
+
+	mfContext *mfc = (mfContext *)context;
+	[view setFrame:bounds];
+	[view setNeedsDisplay:YES];
+	mfc->client_width = (int)NSWidth(bounds);
+	mfc->client_height = (int)NSHeight(bounds);
 }
 
 static void mac_position_window_top_left(NSWindow *window)
@@ -2127,7 +2210,7 @@ static void mac_position_window_top_left(NSWindow *window)
 	[window setFrame:frame display:YES];
 }
 
-static void mac_maximize_window_minus_menubar(NSWindow *window, MRDPView *view)
+static void mac_maximize_window_minus_menubar(rdpContext *context, NSWindow *window, MRDPView *view)
 {
 	if (!window || !view)
 		return;
@@ -2146,6 +2229,7 @@ static void mac_maximize_window_minus_menubar(NSWindow *window, MRDPView *view)
 	);
 
 	[window setFrame:frame display:YES];
+	mac_fit_view_to_window_content(context, view);
 }
 
 static BOOL mac_is_point_on_left_screen_edge(NSPoint point)

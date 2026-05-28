@@ -98,6 +98,7 @@ static BOOL mfreerdp_client_new(freerdp *instance, rdpContext *context)
 	mfc->chromaKeyColor = 0xFF00FF;
 	mfc->chromaKeyTolerance = 30.0f;
 	mfc->windowShadowsEnabled = FALSE;
+	mfc->smart_sizing_align = MF_SMART_SIZING_ALIGN_CENTER;
 
 	context->instance->PreConnect = mac_pre_connect;
 	context->instance->PostConnect = mac_post_connect;
@@ -122,15 +123,55 @@ static void mfreerdp_client_free(freerdp *instance, rdpContext *context)
 
 static void mf_scale_mouse_coordinates(mfContext *mfc, UINT16 *px, UINT16 *py)
 {
-	UINT16 x = *px;
-	UINT16 y = *py;
+	CGFloat x = *px;
+	CGFloat y = *py;
 	UINT32 ww = mfc->client_width;
 	UINT32 wh = mfc->client_height;
 	UINT32 dw = freerdp_settings_get_uint32(mfc->common.context.settings, FreeRDP_DesktopWidth);
 	UINT32 dh = freerdp_settings_get_uint32(mfc->common.context.settings, FreeRDP_DesktopHeight);
+	MRDPView *view = (MRDPView *)mfc->view;
 
-	if (!freerdp_settings_get_bool(mfc->common.context.settings, FreeRDP_SmartSizing) ||
-	    ((ww == dw) && (wh == dh)))
+	if (freerdp_settings_get_bool(mfc->common.context.settings, FreeRDP_SmartSizing) &&
+	    view && (dw > 0) && (dh > 0))
+	{
+		NSRect bounds = [view bounds];
+		const CGFloat sx = bounds.size.width / (CGFloat)dw;
+		const CGFloat sy = bounds.size.height / (CGFloat)dh;
+		const CGFloat scale = MIN(sx, sy);
+		if (scale <= 0)
+			return;
+
+		NSRect displayRect = NSZeroRect;
+		displayRect.size.width = dw * scale;
+		displayRect.size.height = dh * scale;
+		displayRect.origin.x = bounds.origin.x + (bounds.size.width - displayRect.size.width) / 2.0;
+		displayRect.origin.y = bounds.origin.y + (bounds.size.height - displayRect.size.height) / 2.0;
+
+		switch (mfc->smart_sizing_align)
+		{
+			case MF_SMART_SIZING_ALIGN_TOP:
+				displayRect.origin.y = NSMaxY(bounds) - displayRect.size.height;
+				break;
+			case MF_SMART_SIZING_ALIGN_BOTTOM:
+				displayRect.origin.y = NSMinY(bounds);
+				break;
+			case MF_SMART_SIZING_ALIGN_LEFT:
+				displayRect.origin.x = NSMinX(bounds);
+				break;
+			case MF_SMART_SIZING_ALIGN_RIGHT:
+				displayRect.origin.x = NSMaxX(bounds) - displayRect.size.width;
+				break;
+			default:
+				break;
+		}
+
+		const CGFloat top = bounds.size.height - NSMaxY(displayRect);
+		x = MIN(MAX(x - displayRect.origin.x, 0), displayRect.size.width - 1);
+		y = MIN(MAX(y - top, 0), displayRect.size.height - 1);
+		x = x * dw / displayRect.size.width + mfc->xCurrentScroll;
+		y = y * dh / displayRect.size.height + mfc->yCurrentScroll;
+	}
+	else
 	{
 		y = y + mfc->yCurrentScroll;
 		x = x + mfc->xCurrentScroll;
@@ -138,14 +179,9 @@ static void mf_scale_mouse_coordinates(mfContext *mfc, UINT16 *px, UINT16 *py)
 		y -= (dh - wh);
 		x -= (dw - ww);
 	}
-	else
-	{
-		y = y * dh / wh + mfc->yCurrentScroll;
-		x = x * dw / ww + mfc->xCurrentScroll;
-	}
 
-	*px = x;
-	*py = y;
+	*px = (UINT16)MIN(MAX(x, 0), UINT16_MAX);
+	*py = (UINT16)MIN(MAX(y, 0), UINT16_MAX);
 }
 
 void mf_scale_mouse_event(void *context, UINT16 flags, UINT16 x, UINT16 y)
@@ -153,7 +189,9 @@ void mf_scale_mouse_event(void *context, UINT16 flags, UINT16 x, UINT16 y)
 	mfContext *mfc = (mfContext *)context;
 	MRDPView *view = (MRDPView *)mfc->view;
 	// Convert to windows coordinates
-	y = [view frame].size.height - y;
+	NSPoint viewPoint = [view convertPoint:NSMakePoint(x, y) fromView:nil];
+	x = (UINT16)MIN(MAX(viewPoint.x, 0), UINT16_MAX);
+	y = (UINT16)MIN(MAX([view bounds].size.height - viewPoint.y, 0), UINT16_MAX);
 
 	if ((flags & (PTR_FLAGS_WHEEL | PTR_FLAGS_HWHEEL)) == 0)
 		mf_scale_mouse_coordinates(mfc, &x, &y);
@@ -165,7 +203,9 @@ void mf_scale_mouse_event_ex(void *context, UINT16 flags, UINT16 x, UINT16 y)
 	mfContext *mfc = (mfContext *)context;
 	MRDPView *view = (MRDPView *)mfc->view;
 	// Convert to windows coordinates
-	y = [view frame].size.height - y;
+	NSPoint viewPoint = [view convertPoint:NSMakePoint(x, y) fromView:nil];
+	x = (UINT16)MIN(MAX(viewPoint.x, 0), UINT16_MAX);
+	y = (UINT16)MIN(MAX([view bounds].size.height - viewPoint.y, 0), UINT16_MAX);
 
 	mf_scale_mouse_coordinates(mfc, &x, &y);
 	freerdp_client_send_extended_button_event(&mfc->common, FALSE, flags, x, y);

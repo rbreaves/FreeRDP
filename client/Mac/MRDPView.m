@@ -79,6 +79,7 @@ static BOOL mac_view_point_to_buffer_point(MRDPView *view, const mfContext *mfc,
 	                                       int *outX, int *outY);
 static BOOL mac_has_chroma_key_margin(const mfContext *mfc, const rdpGdi *gdi, int x, int y,
 	                                  int radius);
+static NSRect mac_smart_sizing_display_rect(MRDPView *view, rdpContext *context);
 static BOOL mac_send_rdp_scancode(rdpInput *input, UINT32 rdpScancode);
 static NSScreen *mac_startup_preferred_screen(void);
 static NSString *mac_dialog_string_from_utf8(const char *value);
@@ -126,14 +127,16 @@ static const NSEventMask MRDP_PASS_THROUGH_MONITOR_MASK =
 	NSRect screenFrame = [screen frame];
 	NSRect visibleFrame = [screen visibleFrame];
 
-	if (freerdp_settings_get_bool(settings, FreeRDP_Fullscreen) && mfc->fullscreen_mode != 2)
+	if (freerdp_settings_get_bool(settings, FreeRDP_Fullscreen) && mfc->fullscreen_mode != 2 &&
+	    !freerdp_settings_get_bool(settings, FreeRDP_SmartSizing))
 	{
 		if (!freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, screenFrame.size.width))
 			return -1;
 		if (!freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight, screenFrame.size.height))
 			return -1;
 	}
-	else if (mfc->fullscreen_mode == 2)
+	else if ((mfc->fullscreen_mode == 2) &&
+	         !freerdp_settings_get_bool(settings, FreeRDP_SmartSizing))
 	{
 		if (!freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, (UINT32)visibleFrame.size.width))
 			return -1;
@@ -411,6 +414,7 @@ DWORD WINAPI mac_client_thread(void *param)
 		[self addTrackingArea:trackingArea];
 		// Set the default cursor
 		currentCursor = [NSCursor arrowCursor];
+		[self setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
 		[self setOpaque:NO];
 		initialized = YES;
 	}
@@ -1395,7 +1399,7 @@ static BOOL mac_view_point_to_buffer_point(MRDPView *view, const mfContext *mfc,
 	if (!view || !mfc || !mfc->chromaKeyEnabled || !gdi || !gdi->primary_buffer)
 		return FALSE;
 
-	NSRect bounds = [view bounds];
+	NSRect bounds = mac_smart_sizing_display_rect(view, context);
 	if (!NSPointInRect(viewPoint, bounds))
 		return FALSE;
 
@@ -1406,8 +1410,8 @@ static BOOL mac_view_point_to_buffer_point(MRDPView *view, const mfContext *mfc,
 
 	CGFloat xScale = (CGFloat)gdi->width / width;
 	CGFloat yScale = (CGFloat)gdi->height / height;
-	int bx = (int)floor(viewPoint.x * xScale);
-	int by = (int)floor((height - viewPoint.y) * yScale);
+	int bx = (int)floor((viewPoint.x - NSMinX(bounds)) * xScale);
+	int by = (int)floor((NSMaxY(bounds) - viewPoint.y) * yScale);
 
 	if (bx < 0 || bx >= (int)gdi->width || by < 0 || by >= (int)gdi->height)
 		return FALSE;
@@ -1507,12 +1511,12 @@ static BOOL mac_has_chroma_key_margin(const mfContext *mfc, const rdpGdi *gdi, i
 	{
 		CGContextRef cgContext = [[NSGraphicsContext currentContext] CGContext];
 		CGImageRef cgImage = [self createChromaKeyImage];
+		NSRect drawRect = mac_smart_sizing_display_rect(self, context);
 		CGContextSaveGState(cgContext);
+		CGContextClearRect(cgContext, [self bounds]);
 		CGContextClipToRect(
 		    cgContext, CGRectMake(rect.origin.x, rect.origin.y, rect.size.width, rect.size.height));
-		CGContextDrawImage(cgContext,
-		                   CGRectMake(0, 0, [self bounds].size.width, [self bounds].size.height),
-		                   cgImage);
+		CGContextDrawImage(cgContext, drawRect, cgImage);
 		CGContextRestoreGState(cgContext);
 		CGImageRelease(cgImage);
 	}
@@ -2282,8 +2286,6 @@ BOOL mac_end_paint(rdpContext *context)
 	if (!gdi)
 		return FALSE;
 
-	const int ww = mfc->client_width;
-	const int wh = mfc->client_height;
 	const int dw = freerdp_settings_get_uint32(mfc->common.context.settings, FreeRDP_DesktopWidth);
 	const int dh = freerdp_settings_get_uint32(mfc->common.context.settings, FreeRDP_DesktopHeight);
 
@@ -2304,13 +2306,25 @@ BOOL mac_end_paint(rdpContext *context)
 	newDrawRect.size.width = invalid->w;
 	newDrawRect.size.height = invalid->h;
 
-	if (freerdp_settings_get_bool(mfc->common.context.settings, FreeRDP_SmartSizing) &&
-	    (ww != dw || wh != dh))
+	const BOOL smartSizing = freerdp_settings_get_bool(mfc->common.context.settings,
+	                                                   FreeRDP_SmartSizing) &&
+	                         (dw > 0) && (dh > 0);
+
+	if (smartSizing)
 	{
-		newDrawRect.origin.y = newDrawRect.origin.y * wh / dh - 1;
-		newDrawRect.size.height = newDrawRect.size.height * wh / dh + 1;
-		newDrawRect.origin.x = newDrawRect.origin.x * ww / dw - 1;
-		newDrawRect.size.width = newDrawRect.size.width * ww / dw + 1;
+		__block NSRect displayRect = NSZeroRect;
+		dispatch_sync(dispatch_get_main_queue(), ^{
+			displayRect = mac_smart_sizing_display_rect(view, &mfc->common.context);
+		});
+
+		const CGFloat sx = displayRect.size.width / dw;
+		const CGFloat sy = displayRect.size.height / dh;
+		newDrawRect.origin.x = displayRect.origin.x + newDrawRect.origin.x * sx - 1;
+		newDrawRect.origin.y =
+		    displayRect.origin.y + displayRect.size.height -
+		    (newDrawRect.origin.y + newDrawRect.size.height) * sy - 1;
+		newDrawRect.size.width = newDrawRect.size.width * sx + 2;
+		newDrawRect.size.height = newDrawRect.size.height * sy + 2;
 	}
 	else
 	{
@@ -2320,12 +2334,57 @@ BOOL mac_end_paint(rdpContext *context)
 		newDrawRect.size.width = newDrawRect.size.width + 1;
 	}
 
-	windows_to_apple_cords(mfc->view, &newDrawRect);
+	if (!smartSizing)
+		windows_to_apple_cords(mfc->view, &newDrawRect);
 	dispatch_sync(dispatch_get_main_queue(), ^{
 		[view setNeedsDisplayInRect:newDrawRect];
 	});
 	gdi->primary->hdc->hwnd->ninvalid = 0;
 	return TRUE;
+}
+
+static NSRect mac_smart_sizing_display_rect(MRDPView *view, rdpContext *context)
+{
+	NSRect bounds = [view bounds];
+	rdpSettings *settings = context ? context->settings : NULL;
+
+	if (!settings || !freerdp_settings_get_bool(settings, FreeRDP_SmartSizing))
+		return bounds;
+
+	const UINT32 dw = freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth);
+	const UINT32 dh = freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
+
+	if ((dw == 0) || (dh == 0) || (bounds.size.width <= 0) || (bounds.size.height <= 0))
+		return bounds;
+
+	const CGFloat sx = bounds.size.width / (CGFloat)dw;
+	const CGFloat sy = bounds.size.height / (CGFloat)dh;
+	const CGFloat scale = MIN(sx, sy);
+	NSRect displayRect = NSZeroRect;
+	displayRect.size.width = dw * scale;
+	displayRect.size.height = dh * scale;
+	displayRect.origin.x = bounds.origin.x + (bounds.size.width - displayRect.size.width) / 2.0;
+	displayRect.origin.y = bounds.origin.y + (bounds.size.height - displayRect.size.height) / 2.0;
+
+	const mfContext *mfc = (const mfContext *)context;
+	switch (mfc ? mfc->smart_sizing_align : MF_SMART_SIZING_ALIGN_CENTER)
+	{
+		case MF_SMART_SIZING_ALIGN_TOP:
+			displayRect.origin.y = NSMaxY(bounds) - displayRect.size.height;
+			break;
+		case MF_SMART_SIZING_ALIGN_BOTTOM:
+			displayRect.origin.y = NSMinY(bounds);
+			break;
+		case MF_SMART_SIZING_ALIGN_LEFT:
+			displayRect.origin.x = NSMinX(bounds);
+			break;
+		case MF_SMART_SIZING_ALIGN_RIGHT:
+			displayRect.origin.x = NSMaxX(bounds) - displayRect.size.width;
+			break;
+		default:
+			break;
+	}
+	return displayRect;
 }
 
 BOOL mac_desktop_resize(rdpContext *context)

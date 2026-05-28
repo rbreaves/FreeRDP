@@ -27,6 +27,15 @@
 #include "Keyboard.h"
 #include <CoreGraphics/CoreGraphics.h>
 
+typedef enum
+{
+	MF_SMART_SIZING_ALIGN_CENTER = 0,
+	MF_SMART_SIZING_ALIGN_TOP,
+	MF_SMART_SIZING_ALIGN_BOTTOM,
+	MF_SMART_SIZING_ALIGN_LEFT,
+	MF_SMART_SIZING_ALIGN_RIGHT
+} MF_SMART_SIZING_ALIGN;
+
 typedef struct
 {
 	rdpClientContext common;
@@ -47,6 +56,7 @@ typedef struct
 	int client_width;
 	int client_height;
 	int fullscreen_mode;
+	MF_SMART_SIZING_ALIGN smart_sizing_align;
 
 	HANDLE stopEvent;
 	HANDLE keyboardThread;
