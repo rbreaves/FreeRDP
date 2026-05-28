@@ -754,6 +754,13 @@ DWORD WINAPI mac_client_thread(void *param)
 
 - (BOOL)shouldPassMouseEventThrough:(NSEvent *)event
 {
+	NSEventType type = [event type];
+	if ((deferredWindowDragArmed || deferredWindowDragActive || deferredWindowDragCancelled) &&
+	    ((type == NSEventTypeLeftMouseDragged) || (type == NSEventTypeLeftMouseUp)))
+	{
+		return NO;
+	}
+
 	CGEventRef cgEvent = [event CGEvent];
 	if (cgEvent &&
 	    (CGEventGetIntegerValueField(cgEvent, kCGEventSourceUserData) ==
@@ -774,6 +781,183 @@ DWORD WINAPI mac_client_thread(void *param)
 	[self syncMousePassThroughStateForScreenPoint:[NSEvent mouseLocation]];
 
 	return transparent;
+}
+
+- (BOOL)shouldDeferWindowDrag
+{
+	return context && context->settings &&
+	       freerdp_settings_get_bool(context->settings, FreeRDP_DisableFullWindowDrag);
+}
+
+- (NSRect)fallbackDeferredWindowDragRectForPoint:(NSPoint)point
+{
+	const CGFloat side = 96.0;
+	NSRect bounds = [self bounds];
+	NSRect rect = NSMakeRect(point.x - side / 2.0, point.y - side / 2.0, side, side);
+
+	if ((NSWidth(bounds) <= 0) || (NSHeight(bounds) <= 0))
+		return rect;
+
+	rect.origin.x = MIN(MAX(NSMinX(rect), NSMinX(bounds)), MAX(NSMinX(bounds), NSMaxX(bounds) - side));
+	rect.origin.y = MIN(MAX(NSMinY(rect), NSMinY(bounds)), MAX(NSMinY(bounds), NSMaxY(bounds) - side));
+	return NSIntersectionRect(rect, bounds);
+}
+
+- (NSRect)deferredWindowDragRectForPoint:(NSPoint)point
+{
+	if (!mfc || !mfc->chromaKeyEnabled || !context || !context->gdi)
+		return [self fallbackDeferredWindowDragRectForPoint:point];
+
+	rdpGdi *gdi = context->gdi;
+	uint32_t *buffer = (uint32_t *)gdi->primary_buffer;
+	int startX = 0;
+	int startY = 0;
+	if (!buffer || !mac_view_point_to_buffer_point(self, mfc, context, point, &startX, &startY))
+		return [self fallbackDeferredWindowDragRectForPoint:point];
+
+	if (mac_is_chroma_key_pixel(mfc, buffer[(size_t)startY * (size_t)gdi->width + (size_t)startX]))
+		return [self fallbackDeferredWindowDragRectForPoint:point];
+
+	const size_t width = gdi->width;
+	const size_t height = gdi->height;
+	const size_t count = width * height;
+	if ((width == 0) || (height == 0) || (count == 0))
+		return [self fallbackDeferredWindowDragRectForPoint:point];
+
+	uint8_t *visited = (uint8_t *)calloc(count, sizeof(uint8_t));
+	UINT32 *queue = (UINT32 *)malloc(count * sizeof(UINT32));
+	if (!visited || !queue)
+	{
+		free(visited);
+		free(queue);
+		return [self fallbackDeferredWindowDragRectForPoint:point];
+	}
+
+	size_t head = 0;
+	size_t tail = 0;
+	int minX = startX;
+	int maxX = startX;
+	int minY = startY;
+	int maxY = startY;
+	queue[tail++] = (UINT32)((size_t)startY * width + (size_t)startX);
+	visited[(size_t)startY * width + (size_t)startX] = 1;
+
+	while (head < tail)
+	{
+		UINT32 index = queue[head++];
+		int x = (int)(index % width);
+		int y = (int)(index / width);
+		minX = MIN(minX, x);
+		maxX = MAX(maxX, x);
+		minY = MIN(minY, y);
+		maxY = MAX(maxY, y);
+
+		const int nx[4] = { x - 1, x + 1, x, x };
+		const int ny[4] = { y, y, y - 1, y + 1 };
+		for (int i = 0; i < 4; i++)
+		{
+			if ((nx[i] < 0) || (ny[i] < 0) || (nx[i] >= (int)width) || (ny[i] >= (int)height))
+				continue;
+
+			const size_t next = (size_t)ny[i] * width + (size_t)nx[i];
+			if (visited[next] || mac_is_chroma_key_pixel(mfc, buffer[next]))
+				continue;
+
+			visited[next] = 1;
+			queue[tail++] = (UINT32)next;
+		}
+	}
+
+	free(visited);
+	free(queue);
+
+	NSRect displayRect = mac_smart_sizing_display_rect(self, context);
+	if ((NSWidth(displayRect) <= 0) || (NSHeight(displayRect) <= 0))
+		return [self fallbackDeferredWindowDragRectForPoint:point];
+
+	CGFloat sx = NSWidth(displayRect) / (CGFloat)width;
+	CGFloat sy = NSHeight(displayRect) / (CGFloat)height;
+	NSRect rect = NSMakeRect(NSMinX(displayRect) + (CGFloat)minX * sx,
+	                         NSMaxY(displayRect) - (CGFloat)(maxY + 1) * sy,
+	                         (CGFloat)(maxX - minX + 1) * sx,
+	                         (CGFloat)(maxY - minY + 1) * sy);
+	return NSIntersectionRect(NSInsetRect(rect, -1.0, -1.0), [self bounds]);
+}
+
+- (NSRect)deferredWindowDragOutlineForPoint:(NSPoint)point
+{
+	CGFloat dx = point.x - deferredWindowDragStartPoint.x;
+	CGFloat dy = point.y - deferredWindowDragStartPoint.y;
+	return NSOffsetRect(deferredWindowDragBaseRect, dx, dy);
+}
+
+- (void)setDeferredWindowDragNeedsDisplayForRect:(NSRect)rect
+{
+	if (!NSIsEmptyRect(rect))
+		[self setNeedsDisplayInRect:NSInsetRect(rect, -4.0, -4.0)];
+}
+
+- (void)beginDeferredWindowDragAtPoint:(NSPoint)point
+{
+	deferredWindowDragActive = YES;
+	deferredWindowDragStartPoint = point;
+	deferredWindowDragCurrentPoint = point;
+	deferredWindowDragBaseRect = [self deferredWindowDragRectForPoint:point];
+	deferredWindowDragOutlineRect = deferredWindowDragBaseRect;
+	[self setDeferredWindowDragNeedsDisplayForRect:deferredWindowDragOutlineRect];
+}
+
+- (void)updateDeferredWindowDragToPoint:(NSPoint)point
+{
+	NSRect oldRect = deferredWindowDragOutlineRect;
+	deferredWindowDragCurrentPoint = point;
+	deferredWindowDragOutlineRect = [self deferredWindowDragOutlineForPoint:point];
+	[self setDeferredWindowDragNeedsDisplayForRect:NSUnionRect(oldRect, deferredWindowDragOutlineRect)];
+}
+
+- (void)endDeferredWindowDrag
+{
+	deferredWindowDragArmed = NO;
+	if (deferredWindowDragActive)
+		[self setDeferredWindowDragNeedsDisplayForRect:deferredWindowDragOutlineRect];
+	deferredWindowDragActive = NO;
+	deferredWindowDragBaseRect = NSZeroRect;
+	deferredWindowDragOutlineRect = NSZeroRect;
+}
+
+- (void)cancelDeferredWindowDrag
+{
+	if (!deferredWindowDragArmed && !deferredWindowDragActive)
+		return;
+
+	const int x = (int)deferredWindowDragStartPoint.x;
+	const int y = (int)deferredWindowDragStartPoint.y;
+	[self endDeferredWindowDrag];
+	deferredWindowDragCancelled = YES;
+
+	if ([self is_connected])
+		mf_press_mouse_button(context, 0, x, y, FALSE);
+}
+
+- (void)commitDeferredWindowDragAtPoint:(NSPoint)point
+{
+	const int x = (int)point.x;
+	const int y = (int)point.y;
+
+	mf_scale_mouse_event(context, PTR_FLAGS_MOVE, x, y);
+	[self endDeferredWindowDrag];
+
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.015 * NSEC_PER_SEC)),
+	               dispatch_get_main_queue(), ^{
+		               if ([self is_connected])
+			               mf_scale_mouse_event(self->context, PTR_FLAGS_MOVE, x, y);
+	               });
+
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.035 * NSEC_PER_SEC)),
+	               dispatch_get_main_queue(), ^{
+		               if ([self is_connected])
+			               mf_press_mouse_button(self->context, 0, x, y, FALSE);
+	               });
 }
 
 - (void)mouseMoved:(NSEvent *)event
@@ -801,6 +985,12 @@ DWORD WINAPI mac_client_thread(void *param)
 	NSPoint windowLoc = [event locationInWindow];
 	dragRefreshPending = NO;
 	dragRefreshStartPoint = windowLoc;
+	deferredWindowDragArmed = [self shouldDeferWindowDrag];
+	deferredWindowDragActive = NO;
+	deferredWindowDragCancelled = NO;
+	deferredWindowDragEscapeSuppressed = NO;
+	deferredWindowDragStartPoint = windowLoc;
+	deferredWindowDragCurrentPoint = windowLoc;
 
 	[super mouseDown:event];
 
@@ -814,6 +1004,13 @@ DWORD WINAPI mac_client_thread(void *param)
 
 - (void)mouseUp:(NSEvent *)event
 {
+	if (deferredWindowDragCancelled)
+	{
+		deferredWindowDragCancelled = NO;
+		dragRefreshPending = NO;
+		return;
+	}
+
 	if ([self shouldPassMouseEventThrough:event])
 	{
 		[self passMouseEventThrough:event];
@@ -825,11 +1022,24 @@ DWORD WINAPI mac_client_thread(void *param)
 	[super mouseUp:event];
 
 	if (!self.is_connected)
+	{
+		[self endDeferredWindowDrag];
 		return;
+	}
 
 	int x = (int)windowLoc.x;
 	int y = (int)windowLoc.y;
+	if (deferredWindowDragActive)
+	{
+		[self commitDeferredWindowDragAtPoint:windowLoc];
+		if (dragRefreshPending)
+			[self schedulePostDragRefresh];
+		dragRefreshPending = NO;
+		return;
+	}
+
 	mf_press_mouse_button(context, 0, x, y, FALSE);
+	[self endDeferredWindowDrag];
 
 	if (dragRefreshPending)
 		[self schedulePostDragRefresh];
@@ -969,6 +1179,9 @@ DWORD WINAPI mac_client_thread(void *param)
 
 - (void)mouseDragged:(NSEvent *)event
 {
+	if (deferredWindowDragCancelled)
+		return;
+
 	if ([self shouldPassMouseEventThrough:event])
 	{
 		[self passMouseEventThrough:event];
@@ -986,6 +1199,15 @@ DWORD WINAPI mac_client_thread(void *param)
 	const CGFloat dy = windowLoc.y - dragRefreshStartPoint.y;
 	if ((fabs(dx) > 3.0) || (fabs(dy) > 3.0))
 		dragRefreshPending = YES;
+
+	if (deferredWindowDragArmed)
+	{
+		if (!deferredWindowDragActive && dragRefreshPending)
+			[self beginDeferredWindowDragAtPoint:dragRefreshStartPoint];
+		if (deferredWindowDragActive)
+			[self updateDeferredWindowDragToPoint:windowLoc];
+		return;
+	}
 
 	int x = (int)windowLoc.x;
 	int y = (int)windowLoc.y;
@@ -1048,6 +1270,15 @@ static DWORD fixKeyCode(DWORD keyCode, unichar keyChar, enum APPLE_KEYBOARD_TYPE
 	return keyCode;
 }
 
+- (BOOL)isEscapeKeyEvent:(NSEvent *)event
+{
+	NSString *characters = [event charactersIgnoringModifiers];
+	if ([characters length] > 0 && [characters characterAtIndex:0] == 0x1B)
+		return YES;
+
+	return [event keyCode] == 0x35;
+}
+
 - (void)flagsChanged:(NSEvent *)event
 {
 	if (!is_connected)
@@ -1081,6 +1312,13 @@ static DWORD fixKeyCode(DWORD keyCode, unichar keyChar, enum APPLE_KEYBOARD_TYPE
 
 	if (!is_connected)
 		return;
+
+	if ([self isEscapeKeyEvent:event] && (deferredWindowDragArmed || deferredWindowDragActive))
+	{
+		deferredWindowDragEscapeSuppressed = YES;
+		[self cancelDeferredWindowDrag];
+		return;
+	}
 
 	[self flagsChanged:event];
 
@@ -1120,6 +1358,12 @@ static DWORD fixKeyCode(DWORD keyCode, unichar keyChar, enum APPLE_KEYBOARD_TYPE
 
 	if (!is_connected)
 		return;
+
+	if ([self isEscapeKeyEvent:event] && deferredWindowDragEscapeSuppressed)
+	{
+		deferredWindowDragEscapeSuppressed = NO;
+		return;
+	}
 
 	[self flagsChanged:event];
 
@@ -1666,6 +1910,7 @@ static BOOL mac_has_chroma_key_margin(const mfContext *mfc, const rdpGdi *gdi, i
 
 - (void)releaseResources
 {
+	[self endDeferredWindowDrag];
 	[self stopMousePassThroughMonitor];
 	[[self window] setIgnoresMouseEvents:NO];
 	mousePassThroughArmed = NO;
@@ -1792,6 +2037,22 @@ static BOOL mac_has_chroma_key_margin(const mfContext *mfc, const rdpGdi *gdi, i
 		/* Fill the screen with black */
 		[[NSColor blackColor] set];
 		NSRectFill([self bounds]);
+	}
+
+	if (deferredWindowDragActive)
+	{
+		NSBezierPath *path = [NSBezierPath bezierPathWithRect:NSIntegralRect(deferredWindowDragOutlineRect)];
+		CGFloat dash[2] = { 6.0, 4.0 };
+		[path setLineWidth:2.0];
+		[path setLineDash:dash count:2 phase:0.0];
+		[[NSColor colorWithCalibratedWhite:1.0 alpha:0.92] setStroke];
+		[path stroke];
+
+		path = [NSBezierPath bezierPathWithRect:NSIntegralRect(NSInsetRect(deferredWindowDragOutlineRect, 1.0, 1.0))];
+		[path setLineWidth:1.0];
+		[path setLineDash:dash count:2 phase:0.0];
+		[[NSColor colorWithCalibratedWhite:0.0 alpha:0.55] setStroke];
+		[path stroke];
 	}
 
 	[self scheduleMousePassThroughSync];

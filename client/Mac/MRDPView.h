@@ -60,6 +60,14 @@
 	BOOL chromaKeyRepaintRequested;
 	BOOL dragRefreshPending;
 	NSPoint dragRefreshStartPoint;
+	BOOL deferredWindowDragArmed;
+	BOOL deferredWindowDragActive;
+	BOOL deferredWindowDragCancelled;
+	BOOL deferredWindowDragEscapeSuppressed;
+	NSPoint deferredWindowDragStartPoint;
+	NSPoint deferredWindowDragCurrentPoint;
+	NSRect deferredWindowDragBaseRect;
+	NSRect deferredWindowDragOutlineRect;
   @public
 	NSPasteboard *pasteboard_rd;
 	NSPasteboard *pasteboard_wr;
