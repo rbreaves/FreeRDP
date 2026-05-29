@@ -1098,26 +1098,26 @@ DWORD WINAPI mac_client_thread(void *param)
 	return NSIntersectionRect(rect, bounds);
 }
 
-- (NSRect)deferredWindowDragRectForPoint:(NSPoint)point
+- (BOOL)detectedDeferredWindowDragRectForPoint:(NSPoint)point outRect:(NSRect *)outRect
 {
 	if (!mfc || !mfc->chromaKeyEnabled || !context || !context->gdi)
-		return [self fallbackDeferredWindowDragRectForPoint:point];
+		return NO;
 
 	rdpGdi *gdi = context->gdi;
 	uint32_t *buffer = (uint32_t *)gdi->primary_buffer;
 	int startX = 0;
 	int startY = 0;
 	if (!buffer || !mac_view_point_to_buffer_point(self, mfc, context, point, &startX, &startY))
-		return [self fallbackDeferredWindowDragRectForPoint:point];
+		return NO;
 
 	if (mac_is_chroma_key_pixel(mfc, buffer[(size_t)startY * (size_t)gdi->width + (size_t)startX]))
-		return [self fallbackDeferredWindowDragRectForPoint:point];
+		return NO;
 
 	const size_t width = gdi->width;
 	const size_t height = gdi->height;
 	const size_t count = width * height;
 	if ((width == 0) || (height == 0) || (count == 0))
-		return [self fallbackDeferredWindowDragRectForPoint:point];
+		return NO;
 
 	uint8_t *visited = (uint8_t *)calloc(count, sizeof(uint8_t));
 	UINT32 *queue = (UINT32 *)malloc(count * sizeof(UINT32));
@@ -1125,7 +1125,7 @@ DWORD WINAPI mac_client_thread(void *param)
 	{
 		free(visited);
 		free(queue);
-		return [self fallbackDeferredWindowDragRectForPoint:point];
+		return NO;
 	}
 
 	size_t head = 0;
@@ -1161,11 +1161,11 @@ DWORD WINAPI mac_client_thread(void *param)
 	free(visited);
 	free(queue);
 	if (!reconstructed)
-		return [self fallbackDeferredWindowDragRectForPoint:point];
+		return NO;
 
 	NSRect displayRect = mac_smart_sizing_display_rect(self, context);
 	if ((NSWidth(displayRect) <= 0) || (NSHeight(displayRect) <= 0))
-		return [self fallbackDeferredWindowDragRectForPoint:point];
+		return NO;
 
 	CGFloat sx = NSWidth(displayRect) / (CGFloat)width;
 	CGFloat sy = NSHeight(displayRect) / (CGFloat)height;
@@ -1173,7 +1173,22 @@ DWORD WINAPI mac_client_thread(void *param)
 	                         NSMaxY(displayRect) - (CGFloat)candidate.y2 * sy,
 	                         (CGFloat)(candidate.x2 - candidate.x1) * sx,
 	                         (CGFloat)(candidate.y2 - candidate.y1) * sy);
-	return NSIntersectionRect(NSInsetRect(rect, -1.0, -1.0), [self bounds]);
+	rect = NSIntersectionRect(NSInsetRect(rect, -1.0, -1.0), [self bounds]);
+	if (NSIsEmptyRect(rect))
+		return NO;
+
+	if (outRect)
+		*outRect = rect;
+	return YES;
+}
+
+- (NSRect)deferredWindowDragRectForPoint:(NSPoint)point
+{
+	NSRect rect = NSZeroRect;
+	if ([self detectedDeferredWindowDragRectForPoint:point outRect:&rect])
+		return rect;
+
+	return [self fallbackDeferredWindowDragRectForPoint:point];
 }
 
 - (NSRect)deferredWindowDragOutlineForPoint:(NSPoint)point
@@ -1333,24 +1348,100 @@ DWORD WINAPI mac_client_thread(void *param)
 		mf_press_mouse_button(context, 0, x, y, FALSE);
 }
 
-- (void)commitDeferredWindowDragAtPoint:(NSPoint)point
+- (void)sendDeferredWindowDragAttemptFromPoint:(NSPoint)startPoint toPoint:(NSPoint)endPoint retry:(BOOL)retry
 {
-	const int x = (int)point.x;
-	const int y = (int)point.y;
+	const int startX = (int)startPoint.x;
+	const int startY = (int)startPoint.y;
+	const int endX = (int)endPoint.x;
+	const int endY = (int)endPoint.y;
+	const int midX = (startX + endX) / 2;
+	const int midY = (startY + endY) / 2;
 
-	mf_scale_mouse_event(context, PTR_FLAGS_MOVE, x, y);
-	[self endDeferredWindowDrag];
+	if (retry)
+	{
+		mf_scale_mouse_event(context, PTR_FLAGS_MOVE, startX, startY);
+		mf_press_mouse_button(context, 0, startX, startY, TRUE);
+	}
+
+	mf_scale_mouse_event(context, PTR_FLAGS_MOVE, midX, midY);
+	mf_scale_mouse_event(context, PTR_FLAGS_MOVE, endX, endY);
 
 	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.015 * NSEC_PER_SEC)),
 	               dispatch_get_main_queue(), ^{
 		               if ([self is_connected])
-			               mf_scale_mouse_event(self->context, PTR_FLAGS_MOVE, x, y);
+			               mf_scale_mouse_event(self->context, PTR_FLAGS_MOVE, endX, endY);
 	               });
 
 	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.035 * NSEC_PER_SEC)),
 	               dispatch_get_main_queue(), ^{
 		               if ([self is_connected])
-			               mf_press_mouse_button(self->context, 0, x, y, FALSE);
+			               mf_press_mouse_button(self->context, 0, endX, endY, FALSE);
+	               });
+}
+
+- (BOOL)isDeferredWindowDragMoveVisibleAtPoint:(NSPoint)point expectedRect:(NSRect)expectedRect
+{
+	NSRect actualRect = NSZeroRect;
+	if (![self detectedDeferredWindowDragRectForPoint:point outRect:&actualRect])
+		return NO;
+
+	const CGFloat toleranceX = MAX(8.0, NSWidth(expectedRect) * 0.08);
+	const CGFloat toleranceY = MAX(8.0, NSHeight(expectedRect) * 0.08);
+	return (fabs(NSMinX(actualRect) - NSMinX(expectedRect)) <= toleranceX) &&
+	       (fabs(NSMinY(actualRect) - NSMinY(expectedRect)) <= toleranceY) &&
+	       (fabs(NSWidth(actualRect) - NSWidth(expectedRect)) <= toleranceX) &&
+	       (fabs(NSHeight(actualRect) - NSHeight(expectedRect)) <= toleranceY);
+}
+
+- (void)verifyDeferredWindowDragFromPoint:(NSPoint)startPoint
+                                  toPoint:(NSPoint)endPoint
+                             expectedRect:(NSRect)expectedRect
+                                  attempt:(NSUInteger)attempt
+{
+	if (![self is_connected])
+		return;
+
+	[self refreshBitmap];
+	if ([self isDeferredWindowDragMoveVisibleAtPoint:endPoint expectedRect:expectedRect])
+		return;
+
+	WLog_WARN(TAG,
+	          "Deferred window drag move not verified on attempt %" PRIu32
+	          " from %.0f,%.0f to %.0f,%.0f",
+	          (UINT32)attempt, startPoint.x, startPoint.y, endPoint.x, endPoint.y);
+
+	if (attempt >= 6)
+	{
+		WLog_WARN(TAG, "Deferred window drag giving up after %" PRIu32 " attempts",
+		          (UINT32)attempt);
+		return;
+	}
+
+	WLog_WARN(TAG, "Retrying deferred window drag move, attempt %" PRIu32, (UINT32)(attempt + 1));
+	[self sendDeferredWindowDragAttemptFromPoint:startPoint toPoint:endPoint retry:YES];
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.18 * NSEC_PER_SEC)),
+	               dispatch_get_main_queue(), ^{
+		               [self verifyDeferredWindowDragFromPoint:startPoint
+		                                                toPoint:endPoint
+		                                           expectedRect:expectedRect
+		                                                attempt:attempt + 1];
+	               });
+}
+
+- (void)commitDeferredWindowDragAtPoint:(NSPoint)point
+{
+	const NSPoint startPoint = deferredWindowDragStartPoint;
+	const NSRect expectedRect = [self deferredWindowDragOutlineForPoint:point];
+
+	[self sendDeferredWindowDragAttemptFromPoint:startPoint toPoint:point retry:NO];
+	[self endDeferredWindowDrag];
+
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.18 * NSEC_PER_SEC)),
+	               dispatch_get_main_queue(), ^{
+		               [self verifyDeferredWindowDragFromPoint:startPoint
+		                                                toPoint:point
+		                                           expectedRect:expectedRect
+		                                                attempt:1];
 	               });
 }
 
