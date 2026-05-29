@@ -37,6 +37,7 @@
 
 #include <math.h>
 #include <string.h>
+#include <float.h>
 #include <freerdp/constants.h>
 
 #import "freerdp/freerdp.h"
@@ -99,6 +100,262 @@ static const NSEventMask MRDP_PASS_THROUGH_MONITOR_MASK =
 	NSEventMaskMouseMoved | NSEventMaskLeftMouseDragged | NSEventMaskRightMouseDragged |
 	NSEventMaskOtherMouseDragged | NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown |
 	NSEventMaskOtherMouseDown;
+
+typedef struct
+{
+	int x1;
+	int y1;
+	int x2;
+	int y2;
+} MRDPWindowDragCandidateRect;
+
+static int mrdp_int_compare(const void *left, const void *right)
+{
+	const int a = *(const int *)left;
+	const int b = *(const int *)right;
+	return (a > b) - (a < b);
+}
+
+static BOOL mrdp_add_unique_edge(int *edges, size_t *count, size_t capacity, int value)
+{
+	for (size_t i = 0; i < *count; i++)
+	{
+		if (edges[i] == value)
+			return TRUE;
+	}
+
+	if (*count >= capacity)
+		return FALSE;
+
+	edges[(*count)++] = value;
+	return TRUE;
+}
+
+static UINT32 mrdp_integral_rect_count(const UINT32 *integral, size_t stride, int x1, int y1,
+                                       int x2, int y2)
+{
+	return integral[(size_t)y2 * stride + (size_t)x2] -
+	       integral[(size_t)y1 * stride + (size_t)x2] -
+	       integral[(size_t)y2 * stride + (size_t)x1] +
+	       integral[(size_t)y1 * stride + (size_t)x1];
+}
+
+static double mrdp_edge_support(const uint8_t *edgeMask, size_t stride, int start, int end,
+                                int fixed, BOOL horizontal)
+{
+	UINT32 count = 0;
+	UINT32 support = 0;
+
+	if (end <= start)
+		return 0.0;
+
+	for (int i = start; i < end; i++)
+	{
+		count++;
+		if (horizontal ? edgeMask[(size_t)fixed * stride + (size_t)i]
+		               : edgeMask[(size_t)i * stride + (size_t)fixed])
+			support++;
+	}
+
+	return count ? (double)support / (double)count : 0.0;
+}
+
+static BOOL mrdp_reconstruct_window_drag_rect(const uint8_t *mask, const UINT32 *component,
+                                              size_t componentCount, size_t width, size_t height,
+                                              int startX, int startY,
+                                              MRDPWindowDragCandidateRect *outRect)
+{
+	if (!mask || !component || !outRect || (componentCount == 0) || (width == 0) ||
+	    (height == 0))
+		return FALSE;
+
+	int minX = (int)width;
+	int minY = (int)height;
+	int maxX = 0;
+	int maxY = 0;
+	for (size_t i = 0; i < componentCount; i++)
+	{
+		const int x = (int)(component[i] % width);
+		const int y = (int)(component[i] / width);
+		minX = MIN(minX, x);
+		minY = MIN(minY, y);
+		maxX = MAX(maxX, x);
+		maxY = MAX(maxY, y);
+	}
+
+	const int boxW = maxX - minX + 1;
+	const int boxH = maxY - minY + 1;
+	const size_t boxArea = (size_t)boxW * (size_t)boxH;
+	if ((boxW <= 0) || (boxH <= 0))
+		return FALSE;
+
+	if ((double)componentCount >= (double)boxArea * 0.96)
+	{
+		*outRect = (MRDPWindowDragCandidateRect){ minX, minY, maxX + 1, maxY + 1 };
+		return TRUE;
+	}
+
+	UINT32 *verticalEdges = (UINT32 *)calloc(width + 1, sizeof(UINT32));
+	UINT32 *horizontalEdges = (UINT32 *)calloc(height + 1, sizeof(UINT32));
+	UINT32 *integral = (UINT32 *)calloc((width + 1) * (height + 1), sizeof(UINT32));
+	uint8_t *verticalEdgeMask = (uint8_t *)calloc((width + 1) * height, sizeof(uint8_t));
+	uint8_t *horizontalEdgeMask = (uint8_t *)calloc((height + 1) * width, sizeof(uint8_t));
+	if (!verticalEdges || !horizontalEdges || !integral || !verticalEdgeMask ||
+	    !horizontalEdgeMask)
+	{
+		free(verticalEdges);
+		free(horizontalEdges);
+		free(integral);
+		free(verticalEdgeMask);
+		free(horizontalEdgeMask);
+		return FALSE;
+	}
+
+	for (size_t i = 0; i < componentCount; i++)
+	{
+		const int x = (int)(component[i] % width);
+		const int y = (int)(component[i] / width);
+		const size_t index = (size_t)y * width + (size_t)x;
+		if ((x == 0) || !mask[index - 1])
+		{
+			verticalEdges[x]++;
+			verticalEdgeMask[(size_t)y * (width + 1) + (size_t)x] = 1;
+		}
+		if ((x == (int)width - 1) || !mask[index + 1])
+		{
+			verticalEdges[x + 1]++;
+			verticalEdgeMask[(size_t)y * (width + 1) + (size_t)(x + 1)] = 1;
+		}
+		if ((y == 0) || !mask[index - width])
+		{
+			horizontalEdges[y]++;
+			horizontalEdgeMask[(size_t)y * width + (size_t)x] = 1;
+		}
+		if ((y == (int)height - 1) || !mask[index + width])
+		{
+			horizontalEdges[y + 1]++;
+			horizontalEdgeMask[(size_t)(y + 1) * width + (size_t)x] = 1;
+		}
+	}
+
+	const size_t integralStride = width + 1;
+	for (size_t y = 0; y < height; y++)
+	{
+		UINT32 row = 0;
+		for (size_t x = 0; x < width; x++)
+		{
+			row += mask[y * width + x] ? 1U : 0U;
+			integral[(y + 1) * integralStride + (x + 1)] =
+			    integral[y * integralStride + (x + 1)] + row;
+		}
+	}
+
+	enum
+	{
+		MRDP_MAX_RECONSTRUCTION_EDGES = 96
+	};
+	int xEdges[MRDP_MAX_RECONSTRUCTION_EDGES];
+	int yEdges[MRDP_MAX_RECONSTRUCTION_EDGES];
+	size_t xEdgeCount = 0;
+	size_t yEdgeCount = 0;
+	const UINT32 minEdgeSupport =
+	    (UINT32)MAX(4, MIN(32, (int)(sqrt((double)componentCount) / 6.0)));
+
+	mrdp_add_unique_edge(xEdges, &xEdgeCount, MRDP_MAX_RECONSTRUCTION_EDGES, minX);
+	mrdp_add_unique_edge(xEdges, &xEdgeCount, MRDP_MAX_RECONSTRUCTION_EDGES, maxX + 1);
+	mrdp_add_unique_edge(yEdges, &yEdgeCount, MRDP_MAX_RECONSTRUCTION_EDGES, minY);
+	mrdp_add_unique_edge(yEdges, &yEdgeCount, MRDP_MAX_RECONSTRUCTION_EDGES, maxY + 1);
+
+	for (size_t x = 0; x <= width; x++)
+	{
+		if (verticalEdges[x] >= minEdgeSupport)
+			mrdp_add_unique_edge(xEdges, &xEdgeCount, MRDP_MAX_RECONSTRUCTION_EDGES, (int)x);
+	}
+	for (size_t y = 0; y <= height; y++)
+	{
+		if (horizontalEdges[y] >= minEdgeSupport)
+			mrdp_add_unique_edge(yEdges, &yEdgeCount, MRDP_MAX_RECONSTRUCTION_EDGES, (int)y);
+	}
+
+	qsort(xEdges, xEdgeCount, sizeof(int), mrdp_int_compare);
+	qsort(yEdges, yEdgeCount, sizeof(int), mrdp_int_compare);
+
+	BOOL found = FALSE;
+	double bestScore = -DBL_MAX;
+	MRDPWindowDragCandidateRect bestRect = { minX, minY, maxX + 1, maxY + 1 };
+	const int minCandidateW = MIN(48, MAX(12, (int)width / 32));
+	const int minCandidateH = MIN(32, MAX(12, (int)height / 48));
+
+	for (size_t xi1 = 0; xi1 < xEdgeCount; xi1++)
+	{
+		for (size_t xi2 = xi1 + 1; xi2 < xEdgeCount; xi2++)
+		{
+			const int x1 = xEdges[xi1];
+			const int x2 = xEdges[xi2];
+			if ((x2 - x1 < minCandidateW) || (startX < x1) || (startX >= x2))
+				continue;
+
+			for (size_t yi1 = 0; yi1 < yEdgeCount; yi1++)
+			{
+				for (size_t yi2 = yi1 + 1; yi2 < yEdgeCount; yi2++)
+				{
+					const int y1 = yEdges[yi1];
+					const int y2 = yEdges[yi2];
+					if ((y2 - y1 < minCandidateH) || (startY < y1) || (startY >= y2))
+						continue;
+
+					const UINT32 visible =
+					    mrdp_integral_rect_count(integral, integralStride, x1, y1, x2, y2);
+					if (visible < minEdgeSupport)
+						continue;
+
+					const double candidateArea = (double)(x2 - x1) * (double)(y2 - y1);
+					const double fill = (double)visible / candidateArea;
+					const double top =
+					    mrdp_edge_support(horizontalEdgeMask, width, x1, x2, y1, TRUE);
+					const double bottom =
+					    mrdp_edge_support(horizontalEdgeMask, width, x1, x2, y2, TRUE);
+					const double left =
+					    mrdp_edge_support(verticalEdgeMask, width + 1, y1, y2, x1, FALSE);
+					const double right =
+					    mrdp_edge_support(verticalEdgeMask, width + 1, y1, y2, x2, FALSE);
+					if ((top < 0.20) || ((top + bottom + left + right) < 0.85))
+						continue;
+					const double downward =
+					    1.0 - MIN(1.0, (double)(startY - y1) / MAX(1.0, (double)(y2 - y1)));
+					double boundary = 0.0;
+					if ((x1 == 0) || (x2 == (int)width))
+						boundary += 0.25;
+					if ((y1 == 0) || (y2 == (int)height))
+						boundary += 0.25;
+
+					double score = (top * 4.0) + ((left + right) * 1.5) + bottom +
+					               (fill * 2.0) + (downward * 1.5) + boundary;
+					score += sqrt(candidateArea / MAX(1.0, (double)componentCount));
+
+					if (!found || (score > bestScore))
+					{
+						found = TRUE;
+						bestScore = score;
+						bestRect = (MRDPWindowDragCandidateRect){ x1, y1, x2, y2 };
+					}
+				}
+			}
+		}
+	}
+
+	free(verticalEdges);
+	free(horizontalEdges);
+	free(integral);
+	free(verticalEdgeMask);
+	free(horizontalEdgeMask);
+
+	if (!found)
+		return FALSE;
+
+	*outRect = bestRect;
+	return TRUE;
+}
 
 @implementation MRDPView
 
@@ -873,10 +1130,6 @@ DWORD WINAPI mac_client_thread(void *param)
 
 	size_t head = 0;
 	size_t tail = 0;
-	int minX = startX;
-	int maxX = startX;
-	int minY = startY;
-	int maxY = startY;
 	queue[tail++] = (UINT32)((size_t)startY * width + (size_t)startX);
 	visited[(size_t)startY * width + (size_t)startX] = 1;
 
@@ -885,10 +1138,6 @@ DWORD WINAPI mac_client_thread(void *param)
 		UINT32 index = queue[head++];
 		int x = (int)(index % width);
 		int y = (int)(index / width);
-		minX = MIN(minX, x);
-		maxX = MAX(maxX, x);
-		minY = MIN(minY, y);
-		maxY = MAX(maxY, y);
 
 		const int nx[4] = { x - 1, x + 1, x, x };
 		const int ny[4] = { y, y, y - 1, y + 1 };
@@ -906,8 +1155,13 @@ DWORD WINAPI mac_client_thread(void *param)
 		}
 	}
 
+	MRDPWindowDragCandidateRect candidate = { 0 };
+	BOOL reconstructed = mrdp_reconstruct_window_drag_rect(visited, queue, tail, width, height,
+	                                                       startX, startY, &candidate);
 	free(visited);
 	free(queue);
+	if (!reconstructed)
+		return [self fallbackDeferredWindowDragRectForPoint:point];
 
 	NSRect displayRect = mac_smart_sizing_display_rect(self, context);
 	if ((NSWidth(displayRect) <= 0) || (NSHeight(displayRect) <= 0))
@@ -915,10 +1169,10 @@ DWORD WINAPI mac_client_thread(void *param)
 
 	CGFloat sx = NSWidth(displayRect) / (CGFloat)width;
 	CGFloat sy = NSHeight(displayRect) / (CGFloat)height;
-	NSRect rect = NSMakeRect(NSMinX(displayRect) + (CGFloat)minX * sx,
-	                         NSMaxY(displayRect) - (CGFloat)(maxY + 1) * sy,
-	                         (CGFloat)(maxX - minX + 1) * sx,
-	                         (CGFloat)(maxY - minY + 1) * sy);
+	NSRect rect = NSMakeRect(NSMinX(displayRect) + (CGFloat)candidate.x1 * sx,
+	                         NSMaxY(displayRect) - (CGFloat)candidate.y2 * sy,
+	                         (CGFloat)(candidate.x2 - candidate.x1) * sx,
+	                         (CGFloat)(candidate.y2 - candidate.y1) * sy);
 	return NSIntersectionRect(NSInsetRect(rect, -1.0, -1.0), [self bounds]);
 }
 
