@@ -22,8 +22,209 @@
 #import "MRDPView.h"
 
 #include <winpr/endian.h>
+#include <winpr/file.h>
+#include <freerdp/utils/cliprdr_utils.h>
 
 static UINT mac_cliprdr_send_file_contents_failure(wClipboardDelegate *delegate, UINT32 streamId);
+
+#define MAC_CLIPRDR_FILE_CHUNK_SIZE (1024 * 1024)
+
+static const char type_FileGroupDescriptorW[] = "FileGroupDescriptorW";
+
+static BOOL mac_cliprdr_create_remote_file_path(mfContext *mfc, const FILEDESCRIPTORW *descriptor,
+                                                char **path);
+
+static void mac_cliprdr_clear_remote_files(mfContext *mfc)
+{
+	if (!mfc)
+		return;
+
+	for (UINT32 index = 0; index < mfc->remoteFileCount; index++)
+		free(mfc->remoteFiles[index].localPath);
+
+	free(mfc->remoteFiles);
+	mfc->remoteFiles = nullptr;
+	mfc->remoteFileCount = 0;
+	free(mfc->remoteFilePasteDir);
+	mfc->remoteFilePasteDir = nullptr;
+}
+
+static BOOL mac_cliprdr_all_remote_files_complete(const mfContext *mfc)
+{
+	if (!mfc || (mfc->remoteFileCount == 0))
+		return FALSE;
+
+	for (UINT32 index = 0; index < mfc->remoteFileCount; index++)
+	{
+		if (!mfc->remoteFiles[index].complete)
+			return FALSE;
+	}
+
+	return TRUE;
+}
+
+static UINT mac_cliprdr_publish_remote_files(mfContext *mfc)
+{
+	MRDPView *view = (MRDPView *)mfc->view;
+	NSMutableArray *urls = [NSMutableArray arrayWithCapacity:mfc->remoteFileCount];
+
+	for (UINT32 index = 0; index < mfc->remoteFileCount; index++)
+	{
+		const char *path = mfc->remoteFiles[index].localPath;
+		if (!path)
+			continue;
+
+		NSString *nsPath = [NSString stringWithUTF8String:path];
+		if (!nsPath)
+			continue;
+
+		NSURL *url = [NSURL fileURLWithPath:nsPath];
+		if (url)
+			[urls addObject:url];
+	}
+
+	if ([urls count] == 0)
+		return CHANNEL_RC_OK;
+
+	[view->pasteboard_wr clearContents];
+	[view->pasteboard_wr writeObjects:urls];
+	return CHANNEL_RC_OK;
+}
+
+static UINT mac_cliprdr_request_remote_file_range(mfContext *mfc, mfClipboardRemoteFile *file)
+{
+	if (!mfc || !mfc->cliprdr || !file || file->complete)
+		return CHANNEL_RC_OK;
+
+	const UINT64 remaining = file->size - file->received;
+	const UINT32 requested = (remaining > MAC_CLIPRDR_FILE_CHUNK_SIZE)
+	                             ? MAC_CLIPRDR_FILE_CHUNK_SIZE
+	                             : (UINT32)remaining;
+
+	if (requested == 0)
+	{
+		file->complete = TRUE;
+		if (mac_cliprdr_all_remote_files_complete(mfc))
+			return mac_cliprdr_publish_remote_files(mfc);
+		return CHANNEL_RC_OK;
+	}
+
+	CLIPRDR_FILE_CONTENTS_REQUEST request = WINPR_C_ARRAY_INIT;
+	file->streamId = mfc->remoteFileStreamIdNext++;
+	request.common.msgType = CB_FILECONTENTS_REQUEST;
+	request.streamId = file->streamId;
+	request.listIndex = file->listIndex;
+	request.dwFlags = FILECONTENTS_RANGE;
+	request.nPositionLow = (UINT32)(file->received & 0xFFFFFFFF);
+	request.nPositionHigh = (UINT32)(file->received >> 32);
+	request.cbRequested = requested;
+	return mfc->cliprdr->ClientFileContentsRequest(mfc->cliprdr, &request);
+}
+
+static UINT mac_cliprdr_request_next_remote_file(mfContext *mfc)
+{
+	for (UINT32 index = 0; index < mfc->remoteFileCount; index++)
+	{
+		if (!mfc->remoteFiles[index].complete)
+			return mac_cliprdr_request_remote_file_range(mfc, &mfc->remoteFiles[index]);
+	}
+
+	return mac_cliprdr_publish_remote_files(mfc);
+}
+
+static UINT mac_cliprdr_handle_remote_file_list(mfContext *mfc,
+                                                const CLIPRDR_FORMAT_DATA_RESPONSE *response)
+{
+	FILEDESCRIPTORW *descriptors = nullptr;
+	UINT32 descriptorCount = 0;
+
+	mac_cliprdr_clear_remote_files(mfc);
+
+	if (cliprdr_parse_file_list(response->requestedFormatData, response->common.dataLen, &descriptors,
+	                            &descriptorCount) != CHANNEL_RC_OK)
+		return CHANNEL_RC_OK;
+
+	mfc->remoteFiles = (mfClipboardRemoteFile *)calloc(descriptorCount, sizeof(mfClipboardRemoteFile));
+	if (!mfc->remoteFiles)
+	{
+		free(descriptors);
+		return CHANNEL_RC_NO_MEMORY;
+	}
+
+	mfc->remoteFileStreamIdNext = 1;
+
+	for (UINT32 index = 0; index < descriptorCount; index++)
+	{
+		const FILEDESCRIPTORW *descriptor = &descriptors[index];
+		mfClipboardRemoteFile *file = &mfc->remoteFiles[mfc->remoteFileCount];
+
+		if (descriptor->dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+			continue;
+
+		if (!mac_cliprdr_create_remote_file_path(mfc, descriptor, &file->localPath))
+			continue;
+
+		file->listIndex = index;
+		file->size = (((UINT64)descriptor->nFileSizeHigh) << 32) | descriptor->nFileSizeLow;
+		file->received = 0;
+		file->complete = FALSE;
+
+		if (file->size == 0)
+		{
+			NSString *path = [NSString stringWithUTF8String:file->localPath];
+			[[NSFileManager defaultManager] createFileAtPath:path contents:[NSData data] attributes:nil];
+			file->complete = TRUE;
+		}
+
+		mfc->remoteFileCount++;
+	}
+
+	free(descriptors);
+
+	if (mfc->remoteFileCount == 0)
+		return CHANNEL_RC_OK;
+
+	return mac_cliprdr_request_next_remote_file(mfc);
+}
+
+static BOOL mac_cliprdr_create_remote_file_path(mfContext *mfc, const FILEDESCRIPTORW *descriptor,
+                                                char **path)
+{
+	char name[MAX_PATH] = WINPR_C_ARRAY_INIT;
+
+	if (ConvertWCharNToUtf8(descriptor->cFileName, ARRAYSIZE(descriptor->cFileName), name,
+	                        ARRAYSIZE(name)) < 1)
+		return FALSE;
+
+	NSString *fileName = [NSString stringWithUTF8String:name];
+	fileName = [[fileName stringByReplacingOccurrencesOfString:@"\\" withString:@"/"] lastPathComponent];
+
+	if (!fileName || ([fileName length] == 0))
+		return FALSE;
+
+	if (!mfc->remoteFilePasteDir)
+	{
+		NSString *base = [NSTemporaryDirectory() stringByAppendingPathComponent:@"MacFreeRDP-Clipboard"];
+		NSString *session = [base stringByAppendingPathComponent:[[NSUUID UUID] UUIDString]];
+		NSError *error = nil;
+
+		if (![[NSFileManager defaultManager] createDirectoryAtPath:session
+		                                withIntermediateDirectories:YES
+		                                                 attributes:nil
+		                                                      error:&error])
+			return FALSE;
+
+		mfc->remoteFilePasteDir = _strdup([session fileSystemRepresentation]);
+		if (!mfc->remoteFilePasteDir)
+			return FALSE;
+	}
+
+	NSString *dir = [NSString stringWithUTF8String:mfc->remoteFilePasteDir];
+	NSString *filePath = [dir stringByAppendingPathComponent:fileName];
+
+	*path = _strdup([filePath fileSystemRepresentation]);
+	return *path != nullptr;
+}
 
 int mac_cliprdr_send_client_format_list(CliprdrClientContext *cliprdr)
 {
@@ -223,26 +424,32 @@ static UINT mac_cliprdr_server_format_list(CliprdrClientContext *cliprdr,
 
 	mac_cliprdr_send_client_format_list_response(cliprdr, TRUE);
 
-	uint32_t formatId = 0;
+	uint32_t fileFormatId = 0;
+	uint32_t textFormatId = 0;
 	for (UINT32 index = 0; index < mfc->numServerFormats; index++)
 	{
 		const CLIPRDR_FORMAT *format = &(mfc->serverFormats[index]);
 
+		if (format->formatName && (strcmp(format->formatName, type_FileGroupDescriptorW) == 0))
+			fileFormatId = format->formatId;
 		if (format->formatId == CF_UNICODETEXT)
-			formatId = format->formatId;
+			textFormatId = format->formatId;
 		else if (format->formatId == CF_OEMTEXT)
 		{
-			if (formatId == 0)
-				formatId = CF_OEMTEXT;
+			if (textFormatId == 0)
+				textFormatId = CF_OEMTEXT;
 		}
 		else if (format->formatId == CF_TEXT)
 		{
-			if (formatId == 0)
-				formatId = CF_TEXT;
+			if (textFormatId == 0)
+				textFormatId = CF_TEXT;
 		}
 	}
 
-	return mac_cliprdr_send_client_format_data_request(cliprdr, formatId);
+	if (fileFormatId != 0)
+		return mac_cliprdr_send_client_format_data_request(cliprdr, fileFormatId);
+
+	return mac_cliprdr_send_client_format_data_request(cliprdr, textFormatId);
 }
 
 /**
@@ -338,7 +545,7 @@ mac_cliprdr_server_format_data_response(CliprdrClientContext *cliprdr,
 	if (formatDataResponse->common.msgFlags & CB_RESPONSE_FAIL)
 	{
 		(void)SetEvent(mfc->clipboardRequestEvent);
-		return ERROR_INTERNAL_ERROR;
+		return CHANNEL_RC_OK;
 	}
 
 	for (UINT32 index = 0; index < mfc->numServerFormats; index++)
@@ -350,7 +557,13 @@ mac_cliprdr_server_format_data_response(CliprdrClientContext *cliprdr,
 	if (!format)
 	{
 		(void)SetEvent(mfc->clipboardRequestEvent);
-		return ERROR_INTERNAL_ERROR;
+		return CHANNEL_RC_OK;
+	}
+
+	if (format->formatName && (strcmp(format->formatName, type_FileGroupDescriptorW) == 0))
+	{
+		(void)SetEvent(mfc->clipboardRequestEvent);
+		return mac_cliprdr_handle_remote_file_list(mfc, formatDataResponse);
 	}
 
 	if (format->formatName)
@@ -371,6 +584,9 @@ mac_cliprdr_server_format_data_response(CliprdrClientContext *cliprdr,
 		UINT32 dstSize = 0;
 		char *data = ClipboardGetData(mfc->clipboard, formatId, &dstSize);
 
+		if (!data)
+			return CHANNEL_RC_OK;
+
 		dstSize = strnlen(data, dstSize); /* we need the size without the null terminator */
 
 		NSString *str = [[NSString alloc] initWithBytes:(void *)data
@@ -378,9 +594,14 @@ mac_cliprdr_server_format_data_response(CliprdrClientContext *cliprdr,
 		                                       encoding:NSUTF8StringEncoding];
 		free(data);
 
+		if (!str)
+			return CHANNEL_RC_OK;
+
 		NSArray *types = [[NSArray alloc] initWithObjects:NSPasteboardTypeString, nil];
 		[view->pasteboard_wr declareTypes:types owner:view];
 		[view->pasteboard_wr setString:str forType:NSPasteboardTypeString];
+		[str release];
+		[types release];
 	}
 
 	return CHANNEL_RC_OK;
@@ -443,6 +664,41 @@ mac_cliprdr_server_file_contents_request(CliprdrClientContext *cliprdr,
 static UINT mac_cliprdr_server_file_contents_response(
     CliprdrClientContext *cliprdr, const CLIPRDR_FILE_CONTENTS_RESPONSE *fileContentsResponse)
 {
+	WINPR_ASSERT(cliprdr);
+	WINPR_ASSERT(fileContentsResponse);
+
+	mfContext *mfc = (mfContext *)cliprdr->custom;
+	WINPR_ASSERT(mfc);
+
+	if (fileContentsResponse->common.msgFlags & CB_RESPONSE_FAIL)
+		return CHANNEL_RC_OK;
+
+	for (UINT32 index = 0; index < mfc->remoteFileCount; index++)
+	{
+		mfClipboardRemoteFile *file = &mfc->remoteFiles[index];
+
+		if (file->complete || (file->streamId != fileContentsResponse->streamId) || !file->localPath)
+			continue;
+
+		FILE *fp = winpr_fopen(file->localPath, "ab");
+		if (!fp)
+			return CHANNEL_RC_OK;
+
+		if (fileContentsResponse->cbRequested > 0)
+			fwrite(fileContentsResponse->requestedData, 1, fileContentsResponse->cbRequested, fp);
+
+		fclose(fp);
+
+		file->received += fileContentsResponse->cbRequested;
+		if (file->received >= file->size)
+		{
+			file->complete = TRUE;
+			return mac_cliprdr_request_next_remote_file(mfc);
+		}
+
+		return mac_cliprdr_request_remote_file_range(mfc, file);
+	}
+
 	return CHANNEL_RC_OK;
 }
 
@@ -506,6 +762,7 @@ void mac_cliprdr_init(mfContext *mfc, CliprdrClientContext *cliprdr)
 {
 	cliprdr->custom = (void *)mfc;
 	mfc->cliprdr = cliprdr;
+	mfc->remoteFileStreamIdNext = 1;
 
 	mfc->clipboard = ClipboardCreate();
 	mfc->clipboardRequestEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
@@ -535,6 +792,7 @@ void mac_cliprdr_uninit(mfContext *mfc, CliprdrClientContext *cliprdr)
 {
 	cliprdr->custom = nullptr;
 	mfc->cliprdr = nullptr;
+	mac_cliprdr_clear_remote_files(mfc);
 
 	ClipboardDestroy(mfc->clipboard);
 	(void)CloseHandle(mfc->clipboardRequestEvent);

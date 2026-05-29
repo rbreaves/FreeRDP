@@ -39,6 +39,16 @@ typedef enum
 
 typedef struct
 {
+	UINT32 streamId;
+	UINT32 listIndex;
+	UINT64 size;
+	UINT64 received;
+	char* localPath;
+	BOOL complete;
+} mfClipboardRemoteFile;
+
+typedef struct
+{
 	rdpClientContext common;
 
 	void* view;
@@ -74,6 +84,10 @@ typedef struct
 	UINT32 requestedFormatId;
 	HANDLE clipboardRequestEvent;
 	CLIPRDR_FORMAT* serverFormats;
+	mfClipboardRemoteFile* remoteFiles;
+	UINT32 remoteFileCount;
+	UINT32 remoteFileStreamIdNext;
+	char* remoteFilePasteDir;
 	CliprdrClientContext* cliprdr;
 	DispClientContext* disp;
 	UINT32 clipboardCapabilities;
