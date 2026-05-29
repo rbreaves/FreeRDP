@@ -68,6 +68,7 @@
 	NSPoint deferredWindowDragCurrentPoint;
 	NSRect deferredWindowDragBaseRect;
 	NSRect deferredWindowDragOutlineRect;
+	BOOL windowDragTitlebarPreviewVisible;
   @public
 	NSPasteboard *pasteboard_rd;
 	NSPasteboard *pasteboard_wr;
@@ -97,6 +98,7 @@
 - (void)requestRemoteDesktopRefresh;
 - (void)scheduleChromaKeyRefreshSweep;
 - (void)schedulePostDragRefresh;
+- (void)setWindowDragTitlebarPreviewVisible:(BOOL)visible;
 
 @property(assign) int is_connected;
 

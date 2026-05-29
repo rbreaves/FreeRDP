@@ -99,6 +99,7 @@ static BOOL mfreerdp_client_new(freerdp *instance, rdpContext *context)
 	mfc->additionalTransparencyColorCount = 0;
 	mfc->chromaKeyTolerance = 30.0f;
 	mfc->windowShadowsEnabled = FALSE;
+	mfc->windowDragTitlebarHeight = 40;
 	mfc->smart_sizing_align = MF_SMART_SIZING_ALIGN_CENTER;
 	mfc->smart_sizing_overscan = FALSE;
 	mfc->smart_sizing_overscan_align = MF_SMART_SIZING_ALIGN_CENTER;

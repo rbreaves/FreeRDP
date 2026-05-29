@@ -783,10 +783,48 @@ DWORD WINAPI mac_client_thread(void *param)
 	return transparent;
 }
 
-- (BOOL)shouldDeferWindowDrag
+- (CGFloat)windowDragTitlebarHeight
+{
+	if (mfc && mfc->windowDragTitlebarHeight > 0)
+		return (CGFloat)mfc->windowDragTitlebarHeight;
+
+	return 40.0;
+}
+
+- (NSRect)windowDragTitlebarRectForWindowRect:(NSRect)windowRect
+{
+	if (NSIsEmptyRect(windowRect))
+		return NSZeroRect;
+
+	const CGFloat maxY = NSMaxY(windowRect);
+	const CGFloat minY = MAX(NSMinY(windowRect), maxY - [self windowDragTitlebarHeight]);
+	return NSMakeRect(NSMinX(windowRect), minY, NSWidth(windowRect), maxY - minY);
+}
+
+- (BOOL)isPointInWindowDragTitlebar:(NSPoint)point
+{
+	if (!mfc || !mfc->chromaKeyEnabled || !context || !context->gdi ||
+	    !context->gdi->primary_buffer)
+	{
+		NSRect displayRect = mac_smart_sizing_display_rect(self, context);
+		if (NSIsEmptyRect(displayRect))
+			displayRect = [self bounds];
+		return NSPointInRect(point, [self windowDragTitlebarRectForWindowRect:displayRect]);
+	}
+
+	NSRect windowRect = [self deferredWindowDragRectForPoint:point];
+
+	if (NSIsEmptyRect(windowRect))
+		return NO;
+
+	return NSPointInRect(point, [self windowDragTitlebarRectForWindowRect:windowRect]);
+}
+
+- (BOOL)shouldDeferWindowDragAtPoint:(NSPoint)point
 {
 	return context && context->settings &&
-	       freerdp_settings_get_bool(context->settings, FreeRDP_DisableFullWindowDrag);
+	       freerdp_settings_get_bool(context->settings, FreeRDP_DisableFullWindowDrag) &&
+	       [self isPointInWindowDragTitlebar:point];
 }
 
 - (NSRect)fallbackDeferredWindowDragRectForPoint:(NSPoint)point
@@ -897,6 +935,108 @@ DWORD WINAPI mac_client_thread(void *param)
 		[self setNeedsDisplayInRect:NSInsetRect(rect, -4.0, -4.0)];
 }
 
+- (void)setWindowDragTitlebarPreviewVisible:(BOOL)visible
+{
+	if (windowDragTitlebarPreviewVisible == visible)
+		return;
+
+	windowDragTitlebarPreviewVisible = visible;
+	[self setNeedsDisplay:YES];
+}
+
+- (void)drawWindowDragTitlebarPreview
+{
+	const CGFloat titlebarHeight = [self windowDragTitlebarHeight];
+	NSRect displayRect = mac_smart_sizing_display_rect(self, context);
+
+	if ((titlebarHeight <= 0) || (NSWidth(displayRect) <= 0) || (NSHeight(displayRect) <= 0))
+		return;
+
+	[[NSColor colorWithCalibratedRed:0.0 green:0.42 blue:1.0 alpha:0.32] setFill];
+
+	if (!mfc || !mfc->chromaKeyEnabled || !context || !context->gdi ||
+	    !context->gdi->primary_buffer)
+	{
+		NSRect rect = [self windowDragTitlebarRectForWindowRect:displayRect];
+		NSRectFillUsingOperation(NSIntegralRect(rect), NSCompositingOperationSourceOver);
+		return;
+	}
+
+	rdpGdi *gdi = context->gdi;
+	uint32_t *buffer = (uint32_t *)gdi->primary_buffer;
+	const size_t width = gdi->width;
+	const size_t height = gdi->height;
+	const size_t count = width * height;
+	if ((width == 0) || (height == 0) || (count == 0))
+		return;
+
+	uint8_t *visited = (uint8_t *)calloc(count, sizeof(uint8_t));
+	UINT32 *queue = (UINT32 *)malloc(count * sizeof(UINT32));
+	if (!visited || !queue)
+	{
+		free(visited);
+		free(queue);
+		return;
+	}
+
+	const CGFloat sx = NSWidth(displayRect) / (CGFloat)width;
+	const CGFloat sy = NSHeight(displayRect) / (CGFloat)height;
+
+	for (size_t i = 0; i < count; i++)
+	{
+		if (visited[i] || mac_is_chroma_key_pixel(mfc, buffer[i]))
+			continue;
+
+		size_t head = 0;
+		size_t tail = 0;
+		int minX = (int)(i % width);
+		int maxX = minX;
+		int minY = (int)(i / width);
+		int maxY = minY;
+		queue[tail++] = (UINT32)i;
+		visited[i] = 1;
+
+		while (head < tail)
+		{
+			UINT32 index = queue[head++];
+			int x = (int)(index % width);
+			int y = (int)(index / width);
+			minX = MIN(minX, x);
+			maxX = MAX(maxX, x);
+			minY = MIN(minY, y);
+			maxY = MAX(maxY, y);
+
+			const int nx[4] = { x - 1, x + 1, x, x };
+			const int ny[4] = { y, y, y - 1, y + 1 };
+			for (int n = 0; n < 4; n++)
+			{
+				if ((nx[n] < 0) || (ny[n] < 0) || (nx[n] >= (int)width) ||
+				    (ny[n] >= (int)height))
+					continue;
+
+				const size_t next = (size_t)ny[n] * width + (size_t)nx[n];
+				if (visited[next] || mac_is_chroma_key_pixel(mfc, buffer[next]))
+					continue;
+
+				visited[next] = 1;
+				queue[tail++] = (UINT32)next;
+			}
+		}
+
+		NSRect rect = NSMakeRect(NSMinX(displayRect) + (CGFloat)minX * sx,
+		                         NSMaxY(displayRect) - (CGFloat)(maxY + 1) * sy,
+		                         (CGFloat)(maxX - minX + 1) * sx,
+		                         (CGFloat)(maxY - minY + 1) * sy);
+		rect = NSIntersectionRect(NSInsetRect(rect, -1.0, -1.0), [self bounds]);
+		rect = [self windowDragTitlebarRectForWindowRect:rect];
+		if (!NSIsEmptyRect(rect))
+			NSRectFillUsingOperation(NSIntegralRect(rect), NSCompositingOperationSourceOver);
+	}
+
+	free(visited);
+	free(queue);
+}
+
 - (void)beginDeferredWindowDragAtPoint:(NSPoint)point
 {
 	deferredWindowDragActive = YES;
@@ -985,7 +1125,7 @@ DWORD WINAPI mac_client_thread(void *param)
 	NSPoint windowLoc = [event locationInWindow];
 	dragRefreshPending = NO;
 	dragRefreshStartPoint = windowLoc;
-	deferredWindowDragArmed = [self shouldDeferWindowDrag];
+	deferredWindowDragArmed = [self shouldDeferWindowDragAtPoint:windowLoc];
 	deferredWindowDragActive = NO;
 	deferredWindowDragCancelled = NO;
 	deferredWindowDragEscapeSuppressed = NO;
@@ -2054,6 +2194,9 @@ static BOOL mac_has_chroma_key_margin(const mfContext *mfc, const rdpGdi *gdi, i
 		[[NSColor colorWithCalibratedWhite:0.0 alpha:0.55] setStroke];
 		[path stroke];
 	}
+
+	if (windowDragTitlebarPreviewVisible)
+		[self drawWindowDragTitlebarPreview];
 
 	[self scheduleMousePassThroughSync];
 }

@@ -108,6 +108,7 @@ typedef struct
 	float chromaKeyTolerance;
 
 	BOOL windowShadowsEnabled;
+	UINT32 windowDragTitlebarHeight;
 
 	BOOL spacerEnabled;
 	UINT32 spacerPosition; // 0=top, 1=bottom, 2=left, 3=right
