@@ -789,40 +789,26 @@ DWORD WINAPI mac_client_thread(void *param)
 	       freerdp_settings_get_bool(context->settings, FreeRDP_DisableFullWindowDrag);
 }
 
-- (NSRect)fallbackDeferredWindowDragRectForPoint:(NSPoint)point
-{
-	const CGFloat side = 96.0;
-	NSRect bounds = [self bounds];
-	NSRect rect = NSMakeRect(point.x - side / 2.0, point.y - side / 2.0, side, side);
-
-	if ((NSWidth(bounds) <= 0) || (NSHeight(bounds) <= 0))
-		return rect;
-
-	rect.origin.x = MIN(MAX(NSMinX(rect), NSMinX(bounds)), MAX(NSMinX(bounds), NSMaxX(bounds) - side));
-	rect.origin.y = MIN(MAX(NSMinY(rect), NSMinY(bounds)), MAX(NSMinY(bounds), NSMaxY(bounds) - side));
-	return NSIntersectionRect(rect, bounds);
-}
-
-- (NSRect)deferredWindowDragRectForPoint:(NSPoint)point
+- (BOOL)resolvedDeferredWindowDragRect:(NSRect *)outRect forPoint:(NSPoint)point
 {
 	if (!mfc || !mfc->chromaKeyEnabled || !context || !context->gdi)
-		return [self fallbackDeferredWindowDragRectForPoint:point];
+		return NO;
 
 	rdpGdi *gdi = context->gdi;
 	uint32_t *buffer = (uint32_t *)gdi->primary_buffer;
 	int startX = 0;
 	int startY = 0;
 	if (!buffer || !mac_view_point_to_buffer_point(self, mfc, context, point, &startX, &startY))
-		return [self fallbackDeferredWindowDragRectForPoint:point];
+		return NO;
 
 	if (mac_is_chroma_key_pixel(mfc, buffer[(size_t)startY * (size_t)gdi->width + (size_t)startX]))
-		return [self fallbackDeferredWindowDragRectForPoint:point];
+		return NO;
 
 	const size_t width = gdi->width;
 	const size_t height = gdi->height;
 	const size_t count = width * height;
 	if ((width == 0) || (height == 0) || (count == 0))
-		return [self fallbackDeferredWindowDragRectForPoint:point];
+		return NO;
 
 	uint8_t *visited = (uint8_t *)calloc(count, sizeof(uint8_t));
 	UINT32 *queue = (UINT32 *)malloc(count * sizeof(UINT32));
@@ -830,7 +816,7 @@ DWORD WINAPI mac_client_thread(void *param)
 	{
 		free(visited);
 		free(queue);
-		return [self fallbackDeferredWindowDragRectForPoint:point];
+		return NO;
 	}
 
 	size_t head = 0;
@@ -873,7 +859,7 @@ DWORD WINAPI mac_client_thread(void *param)
 
 	NSRect displayRect = mac_smart_sizing_display_rect(self, context);
 	if ((NSWidth(displayRect) <= 0) || (NSHeight(displayRect) <= 0))
-		return [self fallbackDeferredWindowDragRectForPoint:point];
+		return NO;
 
 	CGFloat sx = NSWidth(displayRect) / (CGFloat)width;
 	CGFloat sy = NSHeight(displayRect) / (CGFloat)height;
@@ -881,7 +867,46 @@ DWORD WINAPI mac_client_thread(void *param)
 	                         NSMaxY(displayRect) - (CGFloat)(maxY + 1) * sy,
 	                         (CGFloat)(maxX - minX + 1) * sx,
 	                         (CGFloat)(maxY - minY + 1) * sy);
-	return NSIntersectionRect(NSInsetRect(rect, -1.0, -1.0), [self bounds]);
+
+	if (outRect)
+		*outRect = NSIntersectionRect(NSInsetRect(rect, -1.0, -1.0), [self bounds]);
+
+	return YES;
+}
+
+- (BOOL)isPointInDeferredWindowDragTitlebar:(NSPoint)point
+{
+	NSRect windowRect = NSZeroRect;
+	if (![self resolvedDeferredWindowDragRect:&windowRect forPoint:point])
+		return YES;
+
+	const CGFloat titlebarHeight = MIN(NSHeight(windowRect), MAX(24.0, MIN(40.0, floor(NSHeight(windowRect) * 0.14))));
+	NSRect titlebarRect = NSMakeRect(NSMinX(windowRect), NSMaxY(windowRect) - titlebarHeight,
+	                                 NSWidth(windowRect), titlebarHeight);
+	return NSPointInRect(point, titlebarRect);
+}
+
+- (NSRect)fallbackDeferredWindowDragRectForPoint:(NSPoint)point
+{
+	const CGFloat side = 96.0;
+	NSRect bounds = [self bounds];
+	NSRect rect = NSMakeRect(point.x - side / 2.0, point.y - side / 2.0, side, side);
+
+	if ((NSWidth(bounds) <= 0) || (NSHeight(bounds) <= 0))
+		return rect;
+
+	rect.origin.x = MIN(MAX(NSMinX(rect), NSMinX(bounds)), MAX(NSMinX(bounds), NSMaxX(bounds) - side));
+	rect.origin.y = MIN(MAX(NSMinY(rect), NSMinY(bounds)), MAX(NSMinY(bounds), NSMaxY(bounds) - side));
+	return NSIntersectionRect(rect, bounds);
+}
+
+- (NSRect)deferredWindowDragRectForPoint:(NSPoint)point
+{
+	NSRect rect = NSZeroRect;
+	if ([self resolvedDeferredWindowDragRect:&rect forPoint:point])
+		return rect;
+
+	return [self fallbackDeferredWindowDragRectForPoint:point];
 }
 
 - (NSRect)deferredWindowDragOutlineForPoint:(NSPoint)point
@@ -1202,11 +1227,15 @@ DWORD WINAPI mac_client_thread(void *param)
 
 	if (deferredWindowDragArmed)
 	{
+		if (![self isPointInDeferredWindowDragTitlebar:dragRefreshStartPoint])
+			deferredWindowDragArmed = NO;
+
 		if (!deferredWindowDragActive && dragRefreshPending)
 			[self beginDeferredWindowDragAtPoint:dragRefreshStartPoint];
 		if (deferredWindowDragActive)
 			[self updateDeferredWindowDragToPoint:windowLoc];
-		return;
+		if (deferredWindowDragArmed)
+			return;
 	}
 
 	int x = (int)windowLoc.x;
