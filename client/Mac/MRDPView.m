@@ -95,6 +95,18 @@ static NSString *mac_dialog_setting_string(const rdpSettings *settings, size_t k
 static NSString *mac_resolve_stored_password(NSString *serverName, NSString *username,
 	                                         NSString *domain);
 static UINT32 mac_char_to_scancode(unichar character, BOOL *outNeedsShift);
+static BOOL mac_modifier_keyswap_applies(const mfContext *mfc, const rdpSettings *settings);
+static MF_MODIFIER_KEYSWAP_MODE mac_modifier_keyswap_mode(const mfContext *mfc,
+                                                          const rdpSettings *settings);
+static UINT32 mac_modifier_keyswap_scancode(UINT32 flag, MF_MODIFIER_KEYSWAP_MODE mode,
+                                            UINT32 scancode);
+static DWORD fixKeyCode(DWORD keyCode, unichar keyChar, enum APPLE_KEYBOARD_TYPE type);
+static BOOL updateFlagStates(rdpInput *input, UINT32 modFlags, UINT32 aKbdModFlags,
+                             MF_MODIFIER_KEYSWAP_MODE keyswapMode);
+static BOOL ensureModifierFlagStates(rdpInput *input, UINT32 modFlags,
+                                     MF_MODIFIER_KEYSWAP_MODE keyswapMode);
+static BOOL releaseFlagStates(rdpInput *input, UINT32 aKbdModFlags,
+                              MF_MODIFIER_KEYSWAP_MODE keyswapMode);
 
 static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenIdentifier";
 
@@ -828,6 +840,66 @@ DWORD WINAPI mac_client_thread(void *param)
 - (BOOL)acceptsFirstResponder
 {
 	return YES;
+}
+
+- (BOOL)performKeyEquivalent:(NSEvent *)event
+{
+	if (!is_connected || !instance || !instance->context || !instance->context->input)
+		return [super performKeyEquivalent:event];
+
+	const MF_MODIFIER_KEYSWAP_MODE keyswapMode =
+	    mac_modifier_keyswap_mode(mfc, instance->context->settings);
+	if (keyswapMode == MF_MODIFIER_KEYSWAP_NONE)
+		return [super performKeyEquivalent:event];
+
+	const DWORD modFlags = [event modifierFlags] & NSEventModifierFlagDeviceIndependentFlagsMask;
+	if ((modFlags & (NSEventModifierFlagControl | NSEventModifierFlagOption |
+	                 NSEventModifierFlagCommand)) == 0)
+		return [super performKeyEquivalent:event];
+
+	NSString *characters = [event charactersIgnoringModifiers];
+	if ([characters length] == 0)
+		return [super performKeyEquivalent:event];
+
+	DWORD keyCode = [event keyCode];
+	unichar keyChar = [characters characterAtIndex:0];
+	keyCode = fixKeyCode(keyCode, keyChar, mfc->appleKeyboardType);
+
+	DWORD vkcode = GetVirtualKeyCodeFromKeycode(keyCode, WINPR_KEYCODE_TYPE_APPLE);
+	DWORD scancode = GetVirtualScanCodeFromVirtualKeyCode(vkcode, 4);
+	DWORD keyFlags = (scancode & KBDEXT);
+	scancode &= 0xFF;
+
+	[self flagsChanged:event];
+	ensureModifierFlagStates(instance->context->input, modFlags, keyswapMode);
+
+	(void)freerdp_input_send_keyboard_event(instance->context->input,
+	                                        keyFlags | KBD_FLAGS_DOWN, scancode);
+	(void)freerdp_input_send_keyboard_event(instance->context->input,
+	                                        keyFlags | KBD_FLAGS_RELEASE, scancode);
+	return YES;
+}
+
+- (void)selectAll:(id)sender
+{
+	(void)sender;
+	NSEvent *event = [NSApp currentEvent];
+	if (event && ([event type] == NSEventTypeKeyDown) && [self performKeyEquivalent:event])
+		return;
+
+	if (!is_connected || !instance || !instance->context || !instance->context->input)
+		return;
+
+	const MF_MODIFIER_KEYSWAP_MODE keyswapMode =
+	    mac_modifier_keyswap_mode(mfc, instance->context->settings);
+	if (keyswapMode != MF_MODIFIER_KEYSWAP_APPLE_TO_PC)
+		return;
+
+	rdpInput *input = instance->context->input;
+	(void)freerdp_input_send_keyboard_event_ex(input, TRUE, FALSE, RDP_SCANCODE_LCONTROL);
+	(void)freerdp_input_send_keyboard_event_ex(input, TRUE, FALSE, RDP_SCANCODE_KEY_A);
+	(void)freerdp_input_send_keyboard_event_ex(input, FALSE, FALSE, RDP_SCANCODE_KEY_A);
+	(void)freerdp_input_send_keyboard_event_ex(input, FALSE, FALSE, RDP_SCANCODE_LCONTROL);
 }
 
 - (void)passMouseEventThrough:(NSEvent *)event
@@ -1778,12 +1850,14 @@ static DWORD fixKeyCode(DWORD keyCode, unichar keyChar, enum APPLE_KEYBOARD_TYPE
 	WINPR_ASSERT(instance->context);
 
 	rdpInput *input = instance->context->input;
+	MF_MODIFIER_KEYSWAP_MODE keyswapMode =
+	    mac_modifier_keyswap_mode(mfc, instance->context->settings);
 
 #if defined(WITH_DEBUG_KBD)
 	WLog_DBG(TAG, "flagsChanged: modFlags: 0x%04X kbdModFlags: 0x%04X", modFlags, kbdModFlags);
 #endif
 
-	updateFlagStates(input, modFlags, kbdModFlags);
+	updateFlagStates(input, modFlags, kbdModFlags, keyswapMode);
 	kbdModFlags = modFlags;
 }
 
@@ -1809,6 +1883,10 @@ static DWORD fixKeyCode(DWORD keyCode, unichar keyChar, enum APPLE_KEYBOARD_TYPE
 	}
 
 	[self flagsChanged:event];
+	ensureModifierFlagStates(instance->context->input,
+	                         [event modifierFlags] &
+	                             NSEventModifierFlagDeviceIndependentFlagsMask,
+	                         mac_modifier_keyswap_mode(mfc, instance->context->settings));
 
 	keyFlags = KBD_FLAGS_DOWN;
 	keyCode = [event keyCode];
@@ -1878,7 +1956,8 @@ static DWORD fixKeyCode(DWORD keyCode, unichar keyChar, enum APPLE_KEYBOARD_TYPE
 	freerdp_input_send_keyboard_event(instance->context->input, keyFlags, scancode);
 }
 
-static BOOL updateFlagState(rdpInput *input, DWORD modFlags, DWORD aKbdModFlags, DWORD flag)
+static BOOL updateFlagState(rdpInput *input, DWORD modFlags, DWORD aKbdModFlags, DWORD flag,
+                            MF_MODIFIER_KEYSWAP_MODE keyswapMode)
 {
 	BOOL press = ((modFlags & flag) != 0) && ((aKbdModFlags & flag) == 0);
 	BOOL release = ((modFlags & flag) == 0) && ((aKbdModFlags & flag) != 0);
@@ -1937,6 +2016,7 @@ static BOOL updateFlagState(rdpInput *input, DWORD modFlags, DWORD aKbdModFlags,
 			return FALSE;
 	}
 
+	scancode = mac_modifier_keyswap_scancode(flag, keyswapMode, scancode);
 	keyFlags = (scancode & KBDEXT);
 	scancode &= 0xFF;
 
@@ -1961,15 +2041,97 @@ static BOOL updateFlagState(rdpInput *input, DWORD modFlags, DWORD aKbdModFlags,
 	return TRUE;
 }
 
-static BOOL updateFlagStates(rdpInput *input, UINT32 modFlags, UINT32 aKbdModFlags)
+static BOOL updateFlagStates(rdpInput *input, UINT32 modFlags, UINT32 aKbdModFlags,
+                             MF_MODIFIER_KEYSWAP_MODE keyswapMode)
 {
-	updateFlagState(input, modFlags, aKbdModFlags, NSEventModifierFlagCapsLock);
-	updateFlagState(input, modFlags, aKbdModFlags, NSEventModifierFlagShift);
-	updateFlagState(input, modFlags, aKbdModFlags, NSEventModifierFlagControl);
-	updateFlagState(input, modFlags, aKbdModFlags, NSEventModifierFlagOption);
-	updateFlagState(input, modFlags, aKbdModFlags, NSEventModifierFlagCommand);
-	updateFlagState(input, modFlags, aKbdModFlags, NSEventModifierFlagNumericPad);
+	updateFlagState(input, modFlags, aKbdModFlags, NSEventModifierFlagCapsLock, keyswapMode);
+	updateFlagState(input, modFlags, aKbdModFlags, NSEventModifierFlagShift, keyswapMode);
+	updateFlagState(input, modFlags, aKbdModFlags, NSEventModifierFlagControl, keyswapMode);
+	updateFlagState(input, modFlags, aKbdModFlags, NSEventModifierFlagOption, keyswapMode);
+	updateFlagState(input, modFlags, aKbdModFlags, NSEventModifierFlagCommand, keyswapMode);
+	updateFlagState(input, modFlags, aKbdModFlags, NSEventModifierFlagNumericPad, keyswapMode);
 	return TRUE;
+}
+
+static BOOL ensureModifierFlagStates(rdpInput *input, UINT32 modFlags,
+                                     MF_MODIFIER_KEYSWAP_MODE keyswapMode)
+{
+	if (!input || (keyswapMode == MF_MODIFIER_KEYSWAP_NONE))
+		return TRUE;
+
+	const UINT32 flags[] = { NSEventModifierFlagControl, NSEventModifierFlagOption,
+		                     NSEventModifierFlagCommand };
+	const UINT32 scancodes[] = { RDP_SCANCODE_LCONTROL, RDP_SCANCODE_LMENU,
+		                         RDP_SCANCODE_LWIN };
+
+	for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]); i++)
+	{
+		if ((modFlags & flags[i]) == 0)
+			continue;
+
+		UINT32 scancode = mac_modifier_keyswap_scancode(flags[i], keyswapMode, scancodes[i]);
+		if (!freerdp_input_send_keyboard_event_ex(input, TRUE, FALSE, scancode))
+			return FALSE;
+	}
+
+	return TRUE;
+}
+
+static BOOL mac_modifier_keyswap_applies(const mfContext *mfc, const rdpSettings *settings)
+{
+	if (!mfc || (mfc->modifierKeyswapMode == MF_MODIFIER_KEYSWAP_NONE))
+		return FALSE;
+
+	if (mfc->modifierKeyswapFilter[0] == '\0')
+		return TRUE;
+
+	const char *host = settings ? freerdp_settings_get_string(settings, FreeRDP_ServerHostname) : NULL;
+	if (!host || (host[0] == '\0'))
+		return FALSE;
+
+	char filter[sizeof(mfc->modifierKeyswapFilter)];
+	strncpy(filter, mfc->modifierKeyswapFilter, sizeof(filter) - 1);
+	filter[sizeof(filter) - 1] = '\0';
+
+	char *token = strtok(filter, ",;\r\n\t ");
+	while (token)
+	{
+		if (strcmp(token, host) == 0)
+			return TRUE;
+		token = strtok(NULL, ",;\r\n\t ");
+	}
+
+	return FALSE;
+}
+
+static MF_MODIFIER_KEYSWAP_MODE mac_modifier_keyswap_mode(const mfContext *mfc,
+                                                          const rdpSettings *settings)
+{
+	return mac_modifier_keyswap_applies(mfc, settings) ? mfc->modifierKeyswapMode
+	                                                   : MF_MODIFIER_KEYSWAP_NONE;
+}
+
+static UINT32 mac_modifier_keyswap_scancode(UINT32 flag, MF_MODIFIER_KEYSWAP_MODE mode,
+                                            UINT32 scancode)
+{
+	if (mode == MF_MODIFIER_KEYSWAP_APPLE_TO_PC)
+	{
+		if (flag == NSEventModifierFlagCommand)
+			return RDP_SCANCODE_LCONTROL;
+		if (flag == NSEventModifierFlagControl)
+			return RDP_SCANCODE_LWIN;
+	}
+	else if (mode == MF_MODIFIER_KEYSWAP_PC_TO_APPLE)
+	{
+		if (flag == NSEventModifierFlagOption)
+			return RDP_SCANCODE_LCONTROL;
+		if (flag == NSEventModifierFlagCommand)
+			return RDP_SCANCODE_LMENU;
+		if (flag == NSEventModifierFlagControl)
+			return RDP_SCANCODE_LWIN;
+	}
+
+	return scancode;
 }
 
 static BOOL mac_send_rdp_scancode(rdpInput *input, UINT32 rdpScancode)
@@ -2247,9 +2409,15 @@ static BOOL mac_send_rdp_scancode(rdpInput *input, UINT32 rdpScancode)
 	}
 }
 
-static BOOL releaseFlagStates(rdpInput *input, UINT32 aKbdModFlags)
+static BOOL releaseFlagStates(rdpInput *input, UINT32 aKbdModFlags,
+                              MF_MODIFIER_KEYSWAP_MODE keyswapMode)
 {
-	return updateFlagStates(input, 0, aKbdModFlags);
+	BOOL rc = updateFlagStates(input, 0, aKbdModFlags, keyswapMode);
+
+	(void)freerdp_input_send_keyboard_event_ex(input, FALSE, FALSE, RDP_SCANCODE_LCONTROL);
+	(void)freerdp_input_send_keyboard_event_ex(input, FALSE, FALSE, RDP_SCANCODE_LMENU);
+	(void)freerdp_input_send_keyboard_event_ex(input, FALSE, FALSE, RDP_SCANCODE_LWIN);
+	return rc;
 }
 
 static BOOL mac_is_chroma_key_pixel(const mfContext *mfc, uint32_t pixel)
@@ -2744,7 +2912,8 @@ static BOOL mac_has_chroma_key_margin(const mfContext *mfc, const rdpGdi *gdi, i
 	{
 		[self removeTrackingArea:ta];
 	}
-	releaseFlagStates(instance->context->input, kbdModFlags);
+	releaseFlagStates(instance->context->input, kbdModFlags,
+	                  mac_modifier_keyswap_mode(mfc, instance->context->settings));
 	kbdModFlags = 0;
 }
 
@@ -2775,7 +2944,8 @@ static BOOL mac_has_chroma_key_margin(const mfContext *mfc, const rdpGdi *gdi, i
 	if (!self.is_connected)
 		return;
 
-	releaseFlagStates(instance->context->input, kbdModFlags);
+	releaseFlagStates(instance->context->input, kbdModFlags,
+	                  mac_modifier_keyswap_mode(mfc, instance->context->settings));
 	kbdModFlags = 0;
 	freerdp_input_send_focus_in_event(instance->context->input, 0);
 

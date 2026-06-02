@@ -65,6 +65,8 @@ static NSString *const MRDPAdditionalTransparencyTolerancesKey = @"MRDPAdditiona
 static NSString *const MRDPAdditionalTransparencyBlurKey = @"MRDPAdditionalTransparencyBlur";
 static NSString *const MRDPWindowShadowsEnabledKey = @"MRDPWindowShadowsEnabled";
 static NSString *const MRDPWindowDragTitlebarHeightKey = @"MRDPWindowDragTitlebarHeight";
+static NSString *const MRDPModifierKeyswapModeKey = @"MRDPModifierKeyswapMode";
+static NSString *const MRDPModifierKeyswapFilterKey = @"MRDPModifierKeyswapFilter";
 static NSString *const MRDPStatusSessionDidUpdateNotification = @"org.freerdp.mac.statusSessionDidUpdate";
 static NSString *const MRDPStatusSessionWillTerminateNotification = @"org.freerdp.mac.statusSessionWillTerminate";
 static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusCommand";
@@ -82,6 +84,8 @@ static NSArray *mac_blur_number_array(const mfContext *mfc);
 static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, NSArray *colors,
                                                                NSArray *transparencies,
                                                                NSArray *tolerances, NSArray *blur);
+static NSString *mac_modifier_keyswap_filter_string(const mfContext *mfc);
+static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 
 @interface MRDPClientWindow : NSWindow
 @end
@@ -340,6 +344,32 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 	mfc->additionalTransparencyColorCount = count;
 }
 
+static NSString *mac_modifier_keyswap_filter_string(const mfContext *mfc)
+{
+	if (!mfc || mfc->modifierKeyswapFilter[0] == '\0')
+		return @"";
+
+	return [NSString stringWithUTF8String:mfc->modifierKeyswapFilter];
+}
+
+static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
+{
+	if (!mfc)
+		return;
+
+	NSString *trimmed =
+	    [filter stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+	if (!trimmed)
+		trimmed = @"";
+
+	const char *utf8 = [trimmed UTF8String];
+	if (!utf8)
+		utf8 = "";
+
+	strncpy(mfc->modifierKeyswapFilter, utf8, sizeof(mfc->modifierKeyswapFilter) - 1);
+	mfc->modifierKeyswapFilter[sizeof(mfc->modifierKeyswapFilter) - 1] = '\0';
+}
+
 @interface AppDelegate ()
 {
 	id leftEdgeMouseMonitor;
@@ -352,6 +382,7 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 	NSInteger preferredScreenIndex;
 	NSSlider *windowDragTitlebarHeightSlider;
 	NSTextField *windowDragTitlebarHeightValueLabel;
+	NSTextField *modifierKeyswapFilterField;
 }
 - (void)ensureClientWindow;
 - (void)startLeftEdgeFocusMonitor;
@@ -392,6 +423,7 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 - (void)quitAllFromMenuItem:(id)sender;
 - (void)setSpacerPositionFromMenuItem:(NSMenuItem *)menuItem;
 - (void)showGeneralSettingsFromMenuItem:(id)sender;
+- (void)showModifierKeyswapFilterFromButton:(NSButton *)sender;
 - (void)updateWindowDragTitlebarHeightPreviewFromSlider:(id)sender;
 - (void)showSpacerSettingsFromMenuItem:(id)sender;
 - (void)updateSpacerWindow;
@@ -1142,6 +1174,25 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 				[mrdpView setNeedsDisplay:YES];
 		}
 	}
+	else if ([command isEqualToString:@"modifierKeyswap"])
+	{
+		NSNumber *mode = [info objectForKey:@"mode"];
+		NSString *filter = [info objectForKey:@"filter"];
+		mfContext *mfc = (mfContext *)context;
+
+		if (mode)
+			mfc->modifierKeyswapMode =
+			    (MF_MODIFIER_KEYSWAP_MODE)MIN(MAX([mode integerValue], 0), 2);
+		if (filter)
+			mac_set_modifier_keyswap_filter(mfc, filter);
+
+		NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+		[defaults setInteger:(NSInteger)mfc->modifierKeyswapMode
+		               forKey:MRDPModifierKeyswapModeKey];
+		[defaults setObject:mac_modifier_keyswap_filter_string(mfc)
+		         forKey:MRDPModifierKeyswapFilterKey];
+		[defaults synchronize];
+	}
 	else if ([command isEqualToString:@"quit"])
 	{
 		[NSApp terminate:self];
@@ -1487,6 +1538,29 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 	}
 }
 
+- (void)showModifierKeyswapFilterFromButton:(NSButton *)sender
+{
+	(void)sender;
+	if (!modifierKeyswapFilterField)
+		return;
+
+	NSAlert *alert = [[NSAlert alloc] init];
+	[alert setMessageText:@"Modifier Keyswap Filter"];
+	[alert setInformativeText:@"Comma or newline-separated IP addresses. Leave empty to apply to all hosts."];
+	[alert addButtonWithTitle:@"OK"];
+	[alert addButtonWithTitle:@"Cancel"];
+
+	NSTextField *filterInput = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 320, 24)];
+	[filterInput setStringValue:[modifierKeyswapFilterField stringValue]];
+	[alert setAccessoryView:filterInput];
+
+	if ([alert runModal] == NSAlertFirstButtonReturn)
+		[modifierKeyswapFilterField setStringValue:[filterInput stringValue]];
+
+	[filterInput release];
+	[alert release];
+}
+
 - (void)showGeneralSettingsFromMenuItem:(id)sender
 {
 	(void)sender;
@@ -1496,11 +1570,39 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 	mfContext *mfc = (mfContext *)context;
 	NSAlert *alert = [[NSAlert alloc] init];
 	[alert setMessageText:@"Settings"];
-	[alert setInformativeText:@"Choose window display behavior, drag titlebar height, chroma key color, and extra per-color transparency."];
+	[alert setInformativeText:@"Choose modifier keyswap, window display behavior, drag titlebar height, chroma key color, and extra per-color transparency."];
 	[alert addButtonWithTitle:@"OK"];
 	[alert addButtonWithTitle:@"Cancel"];
 
-	NSView *accessoryView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 360, 252)];
+	NSView *accessoryView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 360, 286)];
+
+	NSTextField *modifierKeyswapLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 256, 120, 20)];
+	[modifierKeyswapLabel setStringValue:@"Modifier keyswap:"];
+	[modifierKeyswapLabel setEditable:NO];
+	[modifierKeyswapLabel setBezeled:NO];
+	[modifierKeyswapLabel setDrawsBackground:NO];
+	[accessoryView addSubview:modifierKeyswapLabel];
+
+	NSPopUpButton *modifierKeyswapPopup =
+	    [[NSPopUpButton alloc] initWithFrame:NSMakeRect(130, 254, 170, 26) pullsDown:NO];
+	[modifierKeyswapPopup addItemWithTitle:@"None"];
+	[modifierKeyswapPopup addItemWithTitle:@"Apple to PC/Linux"];
+	[modifierKeyswapPopup addItemWithTitle:@"PC/Linux to Apple"];
+	[modifierKeyswapPopup selectItemAtIndex:MIN(MAX((NSInteger)mfc->modifierKeyswapMode, 0), 2)];
+	[accessoryView addSubview:modifierKeyswapPopup];
+
+	NSTextField *modifierKeyswapFilterInput =
+	    [[NSTextField alloc] initWithFrame:NSMakeRect(0, 0, 0, 0)];
+	[modifierKeyswapFilterInput setHidden:YES];
+	[modifierKeyswapFilterInput setStringValue:mac_modifier_keyswap_filter_string(mfc)];
+	[accessoryView addSubview:modifierKeyswapFilterInput];
+
+	NSButton *modifierKeyswapFilterButton =
+	    [[NSButton alloc] initWithFrame:NSMakeRect(304, 254, 56, 26)];
+	[modifierKeyswapFilterButton setTitle:@"Filter"];
+	[modifierKeyswapFilterButton setTarget:self];
+	[modifierKeyswapFilterButton setAction:@selector(showModifierKeyswapFilterFromButton:)];
+	[accessoryView addSubview:modifierKeyswapFilterButton];
 
 	NSButton *shadowCheckbox = [[NSButton alloc] initWithFrame:NSMakeRect(0, 222, 360, 20)];
 	[shadowCheckbox setButtonType:NSButtonTypeSwitch];
@@ -1585,6 +1687,7 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 	const UINT32 originalDragTitlebarHeight = mfc->windowDragTitlebarHeight;
 	windowDragTitlebarHeightSlider = dragHeightSlider;
 	windowDragTitlebarHeightValueLabel = dragHeightValueLabel;
+	modifierKeyswapFilterField = modifierKeyswapFilterInput;
 	if (mrdpView)
 		[mrdpView setWindowDragTitlebarPreviewVisible:YES];
 
@@ -1594,6 +1697,7 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 		[mrdpView setWindowDragTitlebarPreviewVisible:NO];
 	windowDragTitlebarHeightSlider = nil;
 	windowDragTitlebarHeightValueLabel = nil;
+	modifierKeyswapFilterField = nil;
 
 	if (result == NSAlertFirstButtonReturn)
 	{
@@ -1618,6 +1722,9 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 			mfc->windowShadowsEnabled = [shadowCheckbox state] == NSControlStateValueOn;
 			mfc->windowDragTitlebarHeight =
 			    (UINT32)MIN(MAX([dragHeightSlider integerValue], 1), 200);
+			mfc->modifierKeyswapMode =
+			    (MF_MODIFIER_KEYSWAP_MODE)MIN(MAX([modifierKeyswapPopup indexOfSelectedItem], 0), 2);
+			mac_set_modifier_keyswap_filter(mfc, [modifierKeyswapFilterInput stringValue]);
 			mfc->chromaKeyEnabled = [enableCheckbox state] == NSControlStateValueOn;
 			mfc->chromaKeyFeatheringEnabled =
 			    [featherCheckbox state] == NSControlStateValueOn;
@@ -1637,6 +1744,10 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 			[defaults setBool:mfc->windowShadowsEnabled forKey:MRDPWindowShadowsEnabledKey];
 			[defaults setInteger:(NSInteger)mfc->windowDragTitlebarHeight
 			               forKey:MRDPWindowDragTitlebarHeightKey];
+			[defaults setInteger:(NSInteger)mfc->modifierKeyswapMode
+			               forKey:MRDPModifierKeyswapModeKey];
+			[defaults setObject:mac_modifier_keyswap_filter_string(mfc)
+			             forKey:MRDPModifierKeyswapFilterKey];
 			[defaults setBool:mfc->chromaKeyEnabled forKey:MRDPChromaKeyEnabledKey];
 			[defaults setBool:mfc->chromaKeyFeatheringEnabled
 			           forKey:MRDPChromaKeyFeatheringEnabledKey];
@@ -1702,6 +1813,16 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 				                  object:nil
 				                userInfo:info
 				      deliverImmediately:YES];
+
+				info = [NSDictionary dictionaryWithObjectsAndKeys:
+				                          pid, @"pid", @"modifierKeyswap", @"command",
+				                          @(mfc->modifierKeyswapMode), @"mode",
+				                          mac_modifier_keyswap_filter_string(mfc), @"filter", nil];
+				[[NSDistributedNotificationCenter defaultCenter]
+				    postNotificationName:MRDPStatusCommandNotification
+				                  object:nil
+				                userInfo:info
+				      deliverImmediately:YES];
 			}
 		}
 		else
@@ -1720,6 +1841,10 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 	}
 
 	[shadowCheckbox release];
+	[modifierKeyswapLabel release];
+	[modifierKeyswapPopup release];
+	[modifierKeyswapFilterInput release];
+	[modifierKeyswapFilterButton release];
 	[dragHeightLabel release];
 	[dragHeightSlider release];
 	[dragHeightValueLabel release];
@@ -2039,6 +2164,14 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 		NSInteger height = [defaults integerForKey:MRDPWindowDragTitlebarHeightKey];
 		mfc->windowDragTitlebarHeight = (UINT32)MIN(MAX(height, 1), 200);
 	}
+	if ([defaults objectForKey:MRDPModifierKeyswapModeKey])
+	{
+		NSInteger mode = [defaults integerForKey:MRDPModifierKeyswapModeKey];
+		mfc->modifierKeyswapMode = (MF_MODIFIER_KEYSWAP_MODE)MIN(MAX(mode, 0), 2);
+	}
+	if ([defaults objectForKey:MRDPModifierKeyswapFilterKey])
+		mac_set_modifier_keyswap_filter(mfc,
+		                                [defaults stringForKey:MRDPModifierKeyswapFilterKey]);
 	mfc->chromaKeyEnabled = [defaults boolForKey:MRDPChromaKeyEnabledKey];
 	mfc->chromaKeyFeatheringEnabled =
 	    [defaults boolForKey:MRDPChromaKeyFeatheringEnabledKey];

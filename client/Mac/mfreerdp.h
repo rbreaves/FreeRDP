@@ -37,6 +37,13 @@ typedef enum
 	MF_SMART_SIZING_ALIGN_RIGHT
 } MF_SMART_SIZING_ALIGN;
 
+typedef enum
+{
+	MF_MODIFIER_KEYSWAP_NONE = 0,
+	MF_MODIFIER_KEYSWAP_APPLE_TO_PC,
+	MF_MODIFIER_KEYSWAP_PC_TO_APPLE
+} MF_MODIFIER_KEYSWAP_MODE;
+
 typedef struct
 {
 	UINT32 streamId;
@@ -124,6 +131,8 @@ typedef struct
 
 	BOOL windowShadowsEnabled;
 	UINT32 windowDragTitlebarHeight;
+	MF_MODIFIER_KEYSWAP_MODE modifierKeyswapMode;
+	char modifierKeyswapFilter[512];
 
 	BOOL spacerEnabled;
 	UINT32 spacerPosition; // 0=top, 1=bottom, 2=left, 3=right
