@@ -96,6 +96,7 @@ static BOOL mfreerdp_client_new(freerdp *instance, rdpContext *context)
 
 	mfc->chromaKeyEnabled = FALSE;
 	mfc->chromaKeyColor = 0xFF00FF;
+	mfc->chromaKeyFeatheringEnabled = FALSE;
 	mfc->additionalTransparencyColorCount = 0;
 	mfc->chromaKeyTolerance = 30.0f;
 	mfc->windowShadowsEnabled = FALSE;

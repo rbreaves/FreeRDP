@@ -75,6 +75,9 @@ static DWORD WINAPI mac_client_thread(void *param);
 static void windows_to_apple_cords(MRDPView *view, NSRect *r);
 static CGContextRef mac_create_bitmap_context(rdpContext *context);
 static BOOL mac_is_chroma_key_pixel(const mfContext *mfc, uint32_t pixel);
+static UINT32 mac_chroma_key_max_diff(const mfContext *mfc, uint32_t pixel);
+static void mac_apply_chroma_key_feathering(const mfContext *mfc, const uint32_t *source,
+                                            uint32_t *buffer, size_t width, size_t height);
 static BOOL mac_additional_transparency_for_pixel(const mfContext *mfc, uint32_t pixel,
 	                                             UINT32 *transparency, BOOL *blur);
 static void mac_release_mask_data(void *info, const void *data, size_t size);
@@ -2254,8 +2257,18 @@ static BOOL mac_is_chroma_key_pixel(const mfContext *mfc, uint32_t pixel)
 	if (!mfc || !mfc->chromaKeyEnabled)
 		return FALSE;
 
+	const float tolerance = fminf(fmaxf(mfc->chromaKeyTolerance, 0.0f), 255.0f);
+	return (mac_chroma_key_max_diff(mfc, pixel) <= (UINT32)lrintf(tolerance))
+	           ? TRUE
+	           : FALSE;
+}
+
+static UINT32 mac_chroma_key_max_diff(const mfContext *mfc, uint32_t pixel)
+{
+	if (!mfc)
+		return UINT32_MAX;
+
 	uint32_t targetColor = mfc->chromaKeyColor;
-	float tolerance = mfc->chromaKeyTolerance;
 	uint8_t targetR = (targetColor >> 16) & 0xFF;
 	uint8_t targetG = (targetColor >> 8) & 0xFF;
 	uint8_t targetB = targetColor & 0xFF;
@@ -2267,7 +2280,49 @@ static BOOL mac_is_chroma_key_pixel(const mfContext *mfc, uint32_t pixel)
 	float diffB = fabsf((float)b - (float)targetB);
 	float maxDiff = fmaxf(fmaxf(diffR, diffG), diffB);
 
-	return (maxDiff <= tolerance) ? TRUE : FALSE;
+	return (UINT32)lrintf(maxDiff);
+}
+
+static void mac_apply_chroma_key_feathering(const mfContext *mfc, const uint32_t *source,
+                                            uint32_t *buffer, size_t width, size_t height)
+{
+	if (!mfc || !mfc->chromaKeyFeatheringEnabled || !source || !buffer || width == 0 ||
+	    height == 0)
+		return;
+
+	const UINT32 tolerance =
+	    (UINT32)lrintf(fminf(fmaxf(mfc->chromaKeyTolerance, 0.0f), 255.0f));
+	const UINT32 fringeThreshold = MIN(255, tolerance + 96);
+
+	for (size_t y = 0; y < height; y++)
+	{
+		for (size_t x = 0; x < width; x++)
+		{
+			const size_t index = (y * width) + x;
+			const uint32_t pixel = source[index];
+			if (mac_is_chroma_key_pixel(mfc, pixel))
+				continue;
+
+			const UINT32 diff = mac_chroma_key_max_diff(mfc, pixel);
+			if ((diff <= tolerance) || (diff > fringeThreshold))
+				continue;
+
+			BOOL nearChroma = FALSE;
+			if ((x > 0) && mac_is_chroma_key_pixel(mfc, source[index - 1]))
+				nearChroma = TRUE;
+			else if (((x + 1) < width) && mac_is_chroma_key_pixel(mfc, source[index + 1]))
+				nearChroma = TRUE;
+			else if ((y > 0) && mac_is_chroma_key_pixel(mfc, source[index - width]))
+				nearChroma = TRUE;
+			else if (((y + 1) < height) && mac_is_chroma_key_pixel(mfc, source[index + width]))
+				nearChroma = TRUE;
+
+			if (!nearChroma)
+				continue;
+
+			buffer[index] = 0x00000000;
+		}
+	}
 }
 
 static BOOL mac_additional_transparency_for_pixel(const mfContext *mfc, uint32_t pixel,
@@ -2478,6 +2533,10 @@ static BOOL mac_has_chroma_key_margin(const mfContext *mfc, const rdpGdi *gdi, i
 			buffer[i] = color | (alpha << 24);
 		}
 	}
+
+	if (mfc->chromaKeyEnabled)
+		mac_apply_chroma_key_feathering(mfc, (const uint32_t *)backup, buffer, gdi->width,
+		                                gdi->height);
 
 	if (blurMask)
 		[self updateAdditionalTransparencyBlurMask:blurMask width:gdi->width height:gdi->height];

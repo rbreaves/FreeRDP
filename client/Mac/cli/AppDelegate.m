@@ -56,6 +56,7 @@ static void mac_ax_set_window_frame(AXUIElementRef windowElement, CGRect frame);
 
 static NSString *const MRDPPreferredScreenIdentifierKey = @"MRDPPreferredScreenIdentifier";
 static NSString *const MRDPChromaKeyEnabledKey = @"MRDPChromaKeyEnabled";
+static NSString *const MRDPChromaKeyFeatheringEnabledKey = @"MRDPChromaKeyFeatheringEnabled";
 static NSString *const MRDPChromaKeyColorKey = @"MRDPChromaKeyColor";
 static NSString *const MRDPChromaKeyToleranceKey = @"MRDPChromaKeyTolerance";
 static NSString *const MRDPAdditionalTransparencyColorsKey = @"MRDPAdditionalTransparencyColors";
@@ -1082,6 +1083,7 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 	else if ([command isEqualToString:@"chroma"])
 	{
 		NSNumber *enabled = [info objectForKey:@"enabled"];
+		NSNumber *featheringEnabled = [info objectForKey:@"featheringEnabled"];
 		NSNumber *color = [info objectForKey:@"color"];
 		NSNumber *tolerance = [info objectForKey:@"tolerance"];
 		NSArray *additionalColors = [info objectForKey:@"additionalColors"];
@@ -1092,6 +1094,8 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 
 		if (enabled)
 			mfc->chromaKeyEnabled = [enabled boolValue];
+		if (featheringEnabled)
+			mfc->chromaKeyFeatheringEnabled = [featheringEnabled boolValue];
 		if (color)
 			mfc->chromaKeyColor = (uint32_t)([color integerValue] & 0xFFFFFF);
 		if (tolerance)
@@ -1496,22 +1500,22 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 	[alert addButtonWithTitle:@"OK"];
 	[alert addButtonWithTitle:@"Cancel"];
 
-	NSView *accessoryView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 360, 224)];
+	NSView *accessoryView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 360, 252)];
 
-	NSButton *shadowCheckbox = [[NSButton alloc] initWithFrame:NSMakeRect(0, 194, 360, 20)];
+	NSButton *shadowCheckbox = [[NSButton alloc] initWithFrame:NSMakeRect(0, 222, 360, 20)];
 	[shadowCheckbox setButtonType:NSButtonTypeSwitch];
 	[shadowCheckbox setTitle:@"Enable Window Drop Shadows (Experimental)"];
 	[shadowCheckbox setState:mfc->windowShadowsEnabled ? NSControlStateValueOn : NSControlStateValueOff];
 	[accessoryView addSubview:shadowCheckbox];
 
-	NSTextField *dragHeightLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 160, 120, 20)];
+	NSTextField *dragHeightLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 188, 120, 20)];
 	[dragHeightLabel setStringValue:@"Drag Titlebar:"];
 	[dragHeightLabel setEditable:NO];
 	[dragHeightLabel setBezeled:NO];
 	[dragHeightLabel setDrawsBackground:NO];
 	[accessoryView addSubview:dragHeightLabel];
 
-	NSSlider *dragHeightSlider = [[NSSlider alloc] initWithFrame:NSMakeRect(130, 158, 160, 24)];
+	NSSlider *dragHeightSlider = [[NSSlider alloc] initWithFrame:NSMakeRect(130, 186, 160, 24)];
 	[dragHeightSlider setMinValue:1.0];
 	[dragHeightSlider setMaxValue:200.0];
 	[dragHeightSlider setContinuous:YES];
@@ -1520,7 +1524,7 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 	[dragHeightSlider setAction:@selector(updateWindowDragTitlebarHeightPreviewFromSlider:)];
 	[accessoryView addSubview:dragHeightSlider];
 
-	NSTextField *dragHeightValueLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(300, 160, 60, 20)];
+	NSTextField *dragHeightValueLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(300, 188, 60, 20)];
 	[dragHeightValueLabel
 	    setStringValue:[NSString stringWithFormat:@"%u px", (unsigned int)MIN(MAX(mfc->windowDragTitlebarHeight, 1), 200)]];
 	[dragHeightValueLabel setAlignment:NSTextAlignmentRight];
@@ -1529,11 +1533,18 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 	[dragHeightValueLabel setDrawsBackground:NO];
 	[accessoryView addSubview:dragHeightValueLabel];
 
-	NSButton *enableCheckbox = [[NSButton alloc] initWithFrame:NSMakeRect(0, 124, 360, 20)];
+	NSButton *enableCheckbox = [[NSButton alloc] initWithFrame:NSMakeRect(0, 152, 360, 20)];
 	[enableCheckbox setButtonType:NSButtonTypeSwitch];
 	[enableCheckbox setTitle:@"Enable Chroma Key Transparency"];
 	[enableCheckbox setState:mfc->chromaKeyEnabled ? NSControlStateValueOn : NSControlStateValueOff];
 	[accessoryView addSubview:enableCheckbox];
+
+	NSButton *featherCheckbox = [[NSButton alloc] initWithFrame:NSMakeRect(18, 124, 342, 20)];
+	[featherCheckbox setButtonType:NSButtonTypeSwitch];
+	[featherCheckbox setTitle:@"Feather Chroma Key Window Corners"];
+	[featherCheckbox setState:mfc->chromaKeyFeatheringEnabled ? NSControlStateValueOn
+	                                                          : NSControlStateValueOff];
+	[accessoryView addSubview:featherCheckbox];
 
 	NSTextField *colorLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 92, 120, 20)];
 	[colorLabel setStringValue:@"Chroma Key:"];
@@ -1608,6 +1619,8 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 			mfc->windowDragTitlebarHeight =
 			    (UINT32)MIN(MAX([dragHeightSlider integerValue], 1), 200);
 			mfc->chromaKeyEnabled = [enableCheckbox state] == NSControlStateValueOn;
+			mfc->chromaKeyFeatheringEnabled =
+			    [featherCheckbox state] == NSControlStateValueOn;
 			mfc->chromaKeyColor = colorVal & 0xFFFFFF;
 			mfc->chromaKeyTolerance = chromaTolerance;
 			mfc->additionalTransparencyColorCount = additionalColorCount;
@@ -1625,6 +1638,8 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 			[defaults setInteger:(NSInteger)mfc->windowDragTitlebarHeight
 			               forKey:MRDPWindowDragTitlebarHeightKey];
 			[defaults setBool:mfc->chromaKeyEnabled forKey:MRDPChromaKeyEnabledKey];
+			[defaults setBool:mfc->chromaKeyFeatheringEnabled
+			           forKey:MRDPChromaKeyFeatheringEnabledKey];
 			[defaults setInteger:(NSInteger)mfc->chromaKeyColor forKey:MRDPChromaKeyColorKey];
 			[defaults setFloat:mfc->chromaKeyTolerance forKey:MRDPChromaKeyToleranceKey];
 			[defaults setObject:mac_hex_color_number_array(mfc)
@@ -1651,6 +1666,8 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 				NSDictionary *info = [NSDictionary
 				    dictionaryWithObjectsAndKeys:pid, @"pid", @"chroma", @"command",
 				                                 @(mfc->chromaKeyEnabled), @"enabled",
+				                                 @(mfc->chromaKeyFeatheringEnabled),
+				                                 @"featheringEnabled",
 				                                 @((NSInteger)mfc->chromaKeyColor), @"color",
 				                                 @(mfc->chromaKeyTolerance), @"tolerance",
 				                                 mac_hex_color_number_array(mfc),
@@ -1707,6 +1724,7 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 	[dragHeightSlider release];
 	[dragHeightValueLabel release];
 	[enableCheckbox release];
+	[featherCheckbox release];
 	[colorLabel release];
 	[colorInput release];
 	[additionalLabel release];
@@ -2022,6 +2040,8 @@ static void mac_set_additional_transparency_colors_from_arrays(mfContext *mfc, N
 		mfc->windowDragTitlebarHeight = (UINT32)MIN(MAX(height, 1), 200);
 	}
 	mfc->chromaKeyEnabled = [defaults boolForKey:MRDPChromaKeyEnabledKey];
+	mfc->chromaKeyFeatheringEnabled =
+	    [defaults boolForKey:MRDPChromaKeyFeatheringEnabledKey];
 	if ([defaults objectForKey:MRDPChromaKeyColorKey])
 		mfc->chromaKeyColor = (uint32_t)([defaults integerForKey:MRDPChromaKeyColorKey] & 0xFFFFFF);
 	if ([defaults objectForKey:MRDPChromaKeyToleranceKey])

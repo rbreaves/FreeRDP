@@ -113,6 +113,7 @@ typedef struct
 	CGEventFlags kbdFlags;
 
 	BOOL chromaKeyEnabled;
+	BOOL chromaKeyFeatheringEnabled;
 	uint32_t chromaKeyColor;
 	uint32_t additionalTransparencyColors[16];
 	UINT32 additionalTransparencyLevels[16];
