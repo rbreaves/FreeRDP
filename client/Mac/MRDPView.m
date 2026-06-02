@@ -2480,14 +2480,30 @@ static BOOL mac_has_chroma_key_margin(const mfContext *mfc, const rdpGdi *gdi, i
 
 	rdpGdi *gdi = context->gdi;
 
-	uint32_t *buffer = (uint32_t *)gdi->primary_buffer;
-	size_t pixelCount = gdi->width * gdi->height;
-	uint8_t *backup = (uint8_t *)malloc(pixelCount * sizeof(uint32_t));
+	uint8_t *source = (uint8_t *)gdi->primary_buffer;
+	const size_t width = gdi->width;
+	const size_t height = gdi->height;
+	const size_t pixelCount = width * height;
+	const size_t sourceStride = gdi->stride;
+	const size_t imageStride = width * sizeof(uint32_t);
+	uint32_t *originalBuffer = (uint32_t *)malloc(pixelCount * sizeof(uint32_t));
+	uint32_t *imageBuffer = (uint32_t *)malloc(pixelCount * sizeof(uint32_t));
+	uint32_t *buffer = imageBuffer;
 	uint8_t *blurMask = NULL;
 	BOOL hasBlur = FALSE;
 
-	if (!backup)
-		return CGBitmapContextCreateImage(self->bitmap_context);
+	if (!source || !originalBuffer || !imageBuffer || (width == 0) || (height == 0) ||
+	    (sourceStride < imageStride))
+	{
+		free(originalBuffer);
+		free(imageBuffer);
+		[self updateAdditionalTransparencyBlurMask:NULL width:0 height:0];
+		return NULL;
+	}
+
+	for (size_t y = 0; y < height; y++)
+		memcpy(&originalBuffer[y * width], &source[y * sourceStride], imageStride);
+	memcpy(imageBuffer, originalBuffer, pixelCount * sizeof(uint32_t));
 
 	size_t maxAdditionalColors =
 	    sizeof(mfc->additionalTransparencyBlur) / sizeof(mfc->additionalTransparencyBlur[0]);
@@ -2503,8 +2519,6 @@ static BOOL mac_has_chroma_key_margin(const mfContext *mfc, const rdpGdi *gdi, i
 
 	if (hasBlur)
 		blurMask = (uint8_t *)calloc(pixelCount, sizeof(uint8_t));
-
-	memcpy(backup, buffer, pixelCount * sizeof(uint32_t));
 
 	size_t chromaPixelCount = 0;
 	for (size_t i = 0; i < pixelCount; i++)
@@ -2535,17 +2549,32 @@ static BOOL mac_has_chroma_key_margin(const mfContext *mfc, const rdpGdi *gdi, i
 	}
 
 	if (mfc->chromaKeyEnabled)
-		mac_apply_chroma_key_feathering(mfc, (const uint32_t *)backup, buffer, gdi->width,
-		                                gdi->height);
+		mac_apply_chroma_key_feathering(mfc, originalBuffer, buffer, width, height);
 
 	if (blurMask)
-		[self updateAdditionalTransparencyBlurMask:blurMask width:gdi->width height:gdi->height];
+		[self updateAdditionalTransparencyBlurMask:blurMask width:width height:height];
 	else
 		[self updateAdditionalTransparencyBlurMask:NULL width:0 height:0];
 
-	CGImageRef cgImage = CGBitmapContextCreateImage(self->bitmap_context);
-	memcpy(buffer, backup, pixelCount * sizeof(uint32_t));
-	free(backup);
+	CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+	CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, imageBuffer,
+	                                                          pixelCount * sizeof(uint32_t),
+	                                                          mac_release_mask_data);
+	if (provider)
+		imageBuffer = NULL;
+	CGImageRef cgImage = NULL;
+	if (colorSpace && provider)
+	{
+		cgImage = CGImageCreate(width, height, 8, 32, imageStride, colorSpace,
+		                        kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst,
+		                        provider, NULL, FALSE, kCGRenderingIntentDefault);
+	}
+	if (provider)
+		CGDataProviderRelease(provider);
+	if (colorSpace)
+		CGColorSpaceRelease(colorSpace);
+	free(originalBuffer);
+	free(imageBuffer);
 
 	if (!chromaKeyRepaintRequested && (chromaPixelCount > (pixelCount / 20)))
 	{
@@ -2570,11 +2599,14 @@ static BOOL mac_has_chroma_key_margin(const mfContext *mfc, const rdpGdi *gdi, i
 		NSRect drawRect = mac_smart_sizing_display_rect(self, context);
 		CGContextSaveGState(cgContext);
 		CGContextClearRect(cgContext, [self bounds]);
-		CGContextClipToRect(
-		    cgContext, CGRectMake(rect.origin.x, rect.origin.y, rect.size.width, rect.size.height));
-		CGContextDrawImage(cgContext, drawRect, cgImage);
+		if (cgImage)
+		{
+			CGContextClipToRect(
+			    cgContext, CGRectMake(rect.origin.x, rect.origin.y, rect.size.width, rect.size.height));
+			CGContextDrawImage(cgContext, drawRect, cgImage);
+			CGImageRelease(cgImage);
+		}
 		CGContextRestoreGState(cgContext);
-		CGImageRelease(cgImage);
 	}
 	else
 	{
