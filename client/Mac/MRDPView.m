@@ -90,6 +90,10 @@ static BOOL mac_has_chroma_key_margin(const mfContext *mfc, const rdpGdi *gdi, i
 static NSRect mac_smart_sizing_display_rect(MRDPView *view, rdpContext *context);
 static BOOL mac_send_rdp_scancode(rdpInput *input, UINT32 rdpScancode);
 static NSScreen *mac_startup_preferred_screen(void);
+static BOOL mac_screen_is_selected(rdpSettings *settings, UINT32 screenIndex);
+static NSRect mac_safe_screen_frame(NSScreen *screen);
+static BOOL mac_monitor_from_screen(NSScreen *screen, UINT32 screenIndex, rdpSettings *settings,
+                                    rdpMonitor *monitor);
 static NSString *mac_dialog_string_from_utf8(const char *value);
 static NSString *mac_dialog_setting_string(const rdpSettings *settings, size_t key);
 static NSString *mac_resolve_stored_password(NSString *serverName, NSString *username,
@@ -404,7 +408,11 @@ static BOOL mrdp_reconstruct_window_drag_rect(const uint8_t *mask, const UINT32 
 	NSRect screenFrame = [screen frame];
 	NSRect visibleFrame = [screen visibleFrame];
 
-	if (freerdp_settings_get_bool(settings, FreeRDP_Fullscreen) && mfc->fullscreen_mode != 2 &&
+	if (!mac_apply_display_properties(settings, mfc->fullscreen_mode == 2))
+		return -1;
+
+	if (!freerdp_settings_get_bool(settings, FreeRDP_UseMultimon) &&
+	    freerdp_settings_get_bool(settings, FreeRDP_Fullscreen) && mfc->fullscreen_mode != 2 &&
 	    !freerdp_settings_get_bool(settings, FreeRDP_SmartSizing))
 	{
 		if (!freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, screenFrame.size.width))
@@ -462,6 +470,167 @@ static NSScreen *mac_startup_preferred_screen(void)
 	}
 
 	return [NSScreen mainScreen] ?: [[NSScreen screens] firstObject];
+}
+
+static BOOL mac_screen_is_selected(rdpSettings *settings, UINT32 screenIndex)
+{
+	const UINT32 count = freerdp_settings_get_uint32(settings, FreeRDP_NumMonitorIds);
+
+	if (count == 0)
+		return TRUE;
+
+	for (UINT32 i = 0; i < count; i++)
+	{
+		const UINT32 *id =
+		    freerdp_settings_get_pointer_array(settings, FreeRDP_MonitorIds, i);
+		if (id && (*id == screenIndex))
+			return TRUE;
+	}
+
+	return FALSE;
+}
+
+static NSRect mac_safe_screen_frame(NSScreen *screen)
+{
+	if (!screen)
+		return NSZeroRect;
+
+	NSRect screenFrame = [screen frame];
+	NSRect safeFrame = [screen visibleFrame];
+	CGFloat reservedTop = NSMaxY(screenFrame) - NSMaxY(safeFrame);
+	if (reservedTop < 1.0)
+	{
+		NSStatusBar *statusBar = [NSStatusBar systemStatusBar];
+		reservedTop = statusBar ? [statusBar thickness] : 24.0;
+	}
+	reservedTop = ceil(MAX(reservedTop, 24.0));
+
+	const CGFloat safeMaxY = NSMaxY(screenFrame) - reservedTop;
+	if (NSMaxY(safeFrame) > safeMaxY)
+		safeFrame.size.height = MAX(1.0, safeFrame.size.height - (NSMaxY(safeFrame) - safeMaxY));
+
+	if (NSHeight(safeFrame) > (safeMaxY - NSMinY(safeFrame)))
+		safeFrame.size.height = MAX(1.0, safeMaxY - NSMinY(safeFrame));
+
+	return safeFrame;
+}
+
+static BOOL mac_monitor_from_screen(NSScreen *screen, UINT32 screenIndex, rdpSettings *settings,
+                                    rdpMonitor *monitor)
+{
+	if (!screen || !settings || !monitor)
+		return FALSE;
+
+	NSRect screenFrame = [screen frame];
+	NSRect frame = mac_safe_screen_frame(screen);
+	NSNumber *screenNumber = [[screen deviceDescription] objectForKey:@"NSScreenNumber"];
+	const CGDirectDisplayID displayId = screenNumber ? [screenNumber unsignedIntValue] : 0;
+	CGSize physicalSize = displayId ? CGDisplayScreenSize(displayId) : CGSizeZero;
+	const BOOL primary = (screen == [NSScreen mainScreen]) ||
+	                     (screenFrame.origin.x == 0 && screenFrame.origin.y == 0);
+
+	if ((frame.size.width <= 0) || (frame.size.height <= 0))
+		return FALSE;
+
+	*monitor = (rdpMonitor){ 0 };
+	monitor->orig_screen = screenIndex;
+	monitor->x = (INT32)round(frame.origin.x);
+	monitor->y = (INT32)round(-NSMaxY(frame));
+	monitor->width = (INT32)round(frame.size.width);
+	monitor->height = (INT32)round(frame.size.height);
+	monitor->is_primary = primary ? TRUE : FALSE;
+	monitor->attributes.physicalWidth = (UINT32)round(physicalSize.width);
+	monitor->attributes.physicalHeight = (UINT32)round(physicalSize.height);
+	monitor->attributes.orientation =
+	    (frame.size.height > frame.size.width) ? ORIENTATION_PORTRAIT : ORIENTATION_LANDSCAPE;
+	monitor->attributes.desktopScaleFactor =
+	    freerdp_settings_get_uint32(settings, FreeRDP_DesktopScaleFactor);
+	monitor->attributes.deviceScaleFactor =
+	    freerdp_settings_get_uint32(settings, FreeRDP_DeviceScaleFactor);
+
+	if (monitor->attributes.desktopScaleFactor == 0)
+		monitor->attributes.desktopScaleFactor = 100;
+	if (monitor->attributes.deviceScaleFactor == 0)
+		monitor->attributes.deviceScaleFactor = 100;
+
+	return TRUE;
+}
+
+BOOL mac_apply_display_properties(rdpSettings *settings, BOOL useVisibleFrame)
+{
+	if (!settings)
+		return FALSE;
+
+	if (useVisibleFrame || !freerdp_settings_get_bool(settings, FreeRDP_UseMultimon))
+		return TRUE;
+
+	NSArray *screens = [NSScreen screens];
+	const NSUInteger screenCount = [screens count];
+	if (screenCount == 0)
+		return FALSE;
+
+	rdpMonitor *monitors = (rdpMonitor *)calloc(screenCount, sizeof(rdpMonitor));
+	if (!monitors)
+		return FALSE;
+
+	UINT32 monitorCount = 0;
+	for (NSUInteger i = 0; i < screenCount; i++)
+	{
+		if (!mac_screen_is_selected(settings, (UINT32)i))
+			continue;
+
+		rdpMonitor monitor = { 0 };
+		if (!mac_monitor_from_screen([screens objectAtIndex:i], (UINT32)i, settings, &monitor))
+		{
+			free(monitors);
+			return FALSE;
+		}
+
+		monitors[monitorCount++] = monitor;
+	}
+
+	if (monitorCount == 0)
+	{
+		free(monitors);
+		return FALSE;
+	}
+
+	BOOL hasPrimary = FALSE;
+	for (UINT32 i = 0; i < monitorCount; i++)
+	{
+		if (monitors[i].is_primary)
+		{
+			hasPrimary = TRUE;
+			break;
+		}
+	}
+	if (!hasPrimary)
+		monitors[0].is_primary = TRUE;
+
+	BOOL success = freerdp_settings_set_monitor_def_array_sorted(settings, monitors, monitorCount);
+	if (success && freerdp_settings_get_bool(settings, FreeRDP_UseMultimon))
+	{
+		INT32 minX = monitors[0].x;
+		INT32 minY = monitors[0].y;
+		INT32 maxX = monitors[0].x + monitors[0].width;
+		INT32 maxY = monitors[0].y + monitors[0].height;
+
+		for (UINT32 i = 1; i < monitorCount; i++)
+		{
+			minX = MIN(minX, monitors[i].x);
+			minY = MIN(minY, monitors[i].y);
+			maxX = MAX(maxX, monitors[i].x + monitors[i].width);
+			maxY = MAX(maxY, monitors[i].y + monitors[i].height);
+		}
+
+		success = freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth,
+		                                      (UINT32)(maxX - minX)) &&
+		          freerdp_settings_set_uint32(settings, FreeRDP_DesktopHeight,
+		                                      (UINT32)(maxY - minY));
+	}
+
+	free(monitors);
+	return success;
 }
 
 static NSString *mac_dialog_string_from_utf8(const char *value)
@@ -2803,6 +2972,67 @@ static BOOL mac_has_chroma_key_margin(const mfContext *mfc, const rdpGdi *gdi, i
 		[self drawWindowDragTitlebarPreview];
 
 	[self scheduleMousePassThroughSync];
+	[[NSNotificationCenter defaultCenter] postNotificationName:@"MRDPMultimonFramebufferDidUpdate"
+	                                                    object:self];
+}
+
+- (CGImageRef)newFramebufferImage
+{
+	if (!context || !self->bitmap_context)
+		return NULL;
+
+	return [self createChromaKeyImage];
+}
+
+- (BOOL)isRemotePixelTransparentAtX:(int)x y:(int)y
+{
+	if (!mfc || !mfc->chromaKeyEnabled || !context || !context->gdi ||
+	    !context->gdi->primary_buffer)
+		return NO;
+
+	rdpGdi *gdi = context->gdi;
+	if (x < 0 || y < 0 || x >= (int)gdi->width || y >= (int)gdi->height)
+		return NO;
+
+	uint32_t *buffer = (uint32_t *)gdi->primary_buffer;
+	uint32_t pixel = buffer[(size_t)y * (size_t)gdi->width + (size_t)x];
+	if (!mac_is_chroma_key_pixel(mfc, pixel))
+		return NO;
+
+	if (mac_is_resize_cursor([NSCursor currentSystemCursor]))
+		return NO;
+
+	return mac_has_chroma_key_margin(mfc, gdi, x, y, 8);
+}
+
+- (void)sendRemoteMouseEventWithFlags:(UINT16)flags x:(UINT16)x y:(UINT16)y
+{
+	if (!self.is_connected || !mfc)
+		return;
+
+	freerdp_client_send_button_event(&mfc->common, FALSE, flags, x, y);
+}
+
+- (void)sendRemoteMouseButton:(int)button x:(UINT16)x y:(UINT16)y down:(BOOL)down
+{
+	UINT16 flags = down ? PTR_FLAGS_DOWN : 0;
+
+	switch (button)
+	{
+		case 0:
+			flags |= PTR_FLAGS_BUTTON1;
+			break;
+		case 1:
+			flags |= PTR_FLAGS_BUTTON2;
+			break;
+		case 2:
+			flags |= PTR_FLAGS_BUTTON3;
+			break;
+		default:
+			return;
+	}
+
+	[self sendRemoteMouseEventWithFlags:flags x:x y:y];
 }
 
 - (void)onPasteboardTimerFired:(NSTimer *)timer
@@ -3649,6 +3879,8 @@ BOOL mac_end_paint(rdpContext *context)
 		windows_to_apple_cords(mfc->view, &newDrawRect);
 	dispatch_sync(dispatch_get_main_queue(), ^{
 		[view setNeedsDisplayInRect:newDrawRect];
+		[[NSNotificationCenter defaultCenter] postNotificationName:@"MRDPMultimonFramebufferDidUpdate"
+		                                                    object:view];
 	});
 	gdi->primary->hdc->hwnd->ninvalid = 0;
 	return TRUE;

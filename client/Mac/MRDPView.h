@@ -99,6 +99,10 @@
 - (void)scheduleChromaKeyRefreshSweep;
 - (void)schedulePostDragRefresh;
 - (void)setWindowDragTitlebarPreviewVisible:(BOOL)visible;
+- (CGImageRef)newFramebufferImage;
+- (BOOL)isRemotePixelTransparentAtX:(int)x y:(int)y;
+- (void)sendRemoteMouseEventWithFlags:(UINT16)flags x:(UINT16)x y:(UINT16)y;
+- (void)sendRemoteMouseButton:(int)button x:(UINT16)x y:(UINT16)y down:(BOOL)down;
 
 @property(assign) int is_connected;
 
@@ -107,6 +111,7 @@
 BOOL mac_pre_connect(freerdp *instance);
 BOOL mac_post_connect(freerdp *instance);
 void mac_post_disconnect(freerdp *instance);
+FREERDP_API BOOL mac_apply_display_properties(rdpSettings *settings, BOOL useVisibleFrame);
 BOOL mac_authenticate_ex(freerdp *instance, char **username, char **password, char **domain,
                          rdp_auth_reason reason);
 

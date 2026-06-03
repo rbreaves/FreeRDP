@@ -30,6 +30,12 @@ void AppDelegate_EmbedWindowEventHandler(void *context, const EmbedWindowEventAr
 void AppDelegate_ResizeWindowEventHandler(void *context, const ResizeWindowEventArgs *e);
 void mac_set_view_size(rdpContext *context, MRDPView *view);
 static void mac_position_window_top_left(NSWindow *window);
+static BOOL mac_screen_is_selected_for_settings(rdpSettings *settings, UINT32 screenIndex);
+static BOOL mac_multimon_content_rect(rdpSettings *settings, NSRect *rect);
+static BOOL mac_multimon_enabled(rdpSettings *settings);
+static NSArray *mac_multimon_slices(rdpSettings *settings);
+static NSRect mac_safe_multimon_window_frame(NSScreen *screen, BOOL decorated);
+static NSRect mac_constrain_window_frame_to_screen(NSRect frame, NSScreen *screen, BOOL decorated);
 static void mac_maximize_window_minus_menubar(rdpContext *context, NSWindow *window, MRDPView *view);
 static void mac_fit_view_to_window_content(rdpContext *context, MRDPView *view);
 static BOOL mac_is_point_on_left_screen_edge(NSPoint point);
@@ -100,6 +106,347 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 - (BOOL)canBecomeMainWindow
 {
 	return YES;
+}
+
+@end
+
+@interface MRDPMonitorSliceView : NSView
+{
+	MRDPView *primaryView;
+	NSRect sourceRect;
+	id mousePassThroughMonitor;
+	BOOL mousePassThroughArmed;
+}
+
+- (id)initWithPrimaryView:(MRDPView *)view sourceRect:(NSRect)rect;
+- (void)setSourceRect:(NSRect)rect;
+
+@end
+
+@implementation MRDPMonitorSliceView
+
+- (id)initWithPrimaryView:(MRDPView *)view sourceRect:(NSRect)rect
+{
+	self = [super initWithFrame:NSMakeRect(0, 0, rect.size.width, rect.size.height)];
+	if (!self)
+		return nil;
+
+	primaryView = view;
+	sourceRect = rect;
+	[self setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+	return self;
+}
+
+- (BOOL)isFlipped
+{
+	return YES;
+}
+
+- (BOOL)acceptsFirstResponder
+{
+	return YES;
+}
+
+- (void)setSourceRect:(NSRect)rect
+{
+	sourceRect = rect;
+	[self setFrameSize:rect.size];
+	[self setNeedsDisplay:YES];
+}
+
+- (void)dealloc
+{
+	if (mousePassThroughMonitor)
+		[NSEvent removeMonitor:mousePassThroughMonitor];
+	[super dealloc];
+}
+
+- (NSPoint)remotePointForEvent:(NSEvent *)event
+{
+	NSPoint point = [self convertPoint:[event locationInWindow] fromView:nil];
+	NSRect bounds = [self bounds];
+	const CGFloat sx = (NSWidth(bounds) > 0) ? sourceRect.size.width / NSWidth(bounds) : 1.0;
+	const CGFloat sy = (NSHeight(bounds) > 0) ? sourceRect.size.height / NSHeight(bounds) : 1.0;
+	point.x = sourceRect.origin.x + point.x * sx;
+	point.y = sourceRect.origin.y + point.y * sy;
+	point.x = MIN(MAX(point.x, 0), UINT16_MAX);
+	point.y = MIN(MAX(point.y, 0), UINT16_MAX);
+	return point;
+}
+
+- (NSPoint)remotePointForScreenPoint:(NSPoint)screenPoint valid:(BOOL *)valid
+{
+	NSWindow *window = [self window];
+	if (!window || !NSPointInRect(screenPoint, [window frame]))
+	{
+		if (valid)
+			*valid = NO;
+		return NSZeroPoint;
+	}
+
+	NSPoint windowPoint = [window convertPointFromScreen:screenPoint];
+	NSPoint point = [self convertPoint:windowPoint fromView:nil];
+	NSRect bounds = [self bounds];
+	if (!NSPointInRect(point, bounds))
+	{
+		if (valid)
+			*valid = NO;
+		return NSZeroPoint;
+	}
+
+	const CGFloat sx = (NSWidth(bounds) > 0) ? sourceRect.size.width / NSWidth(bounds) : 1.0;
+	const CGFloat sy = (NSHeight(bounds) > 0) ? sourceRect.size.height / NSHeight(bounds) : 1.0;
+	if (valid)
+		*valid = YES;
+	return NSMakePoint(sourceRect.origin.x + point.x * sx, sourceRect.origin.y + point.y * sy);
+}
+
+- (BOOL)isRemotePointTransparent:(NSPoint)remotePoint
+{
+	return primaryView &&
+	       [primaryView isRemotePixelTransparentAtX:(int)floor(remotePoint.x)
+	                                              y:(int)floor(remotePoint.y)];
+}
+
+- (void)passMouseEventThrough:(NSEvent *)event
+{
+	NSWindow *window = [self window];
+	CGEventRef sourceEvent = [event CGEvent];
+
+	if (!window || !sourceEvent)
+		return;
+
+	CGEventRef forwardedEvent = CGEventCreateCopy(sourceEvent);
+	if (!forwardedEvent)
+		return;
+
+	CGEventSetIntegerValueField(forwardedEvent, kCGEventSourceUserData, 0x4D52445050544852LL);
+	[window setIgnoresMouseEvents:YES];
+	CGEventPost(kCGHIDEventTap, forwardedEvent);
+	CFRelease(forwardedEvent);
+
+	dispatch_async(dispatch_get_main_queue(), ^{
+		[window setIgnoresMouseEvents:NO];
+	});
+}
+
+- (void)syncMousePassThroughStateForScreenPoint:(NSPoint)screenPoint
+{
+	NSWindow *window = [self window];
+	BOOL valid = NO;
+	NSPoint remotePoint = [self remotePointForScreenPoint:screenPoint valid:&valid];
+	BOOL shouldIgnore = valid && [self isRemotePointTransparent:remotePoint];
+
+	if (mousePassThroughArmed == shouldIgnore)
+		return;
+
+	mousePassThroughArmed = shouldIgnore;
+	[window setIgnoresMouseEvents:shouldIgnore];
+}
+
+- (BOOL)shouldPassMouseEventThrough:(NSEvent *)event
+{
+	CGEventRef cgEvent = [event CGEvent];
+	if (cgEvent &&
+	    (CGEventGetIntegerValueField(cgEvent, kCGEventSourceUserData) == 0x4D52445050544852LL))
+		return NO;
+
+	NSPoint remotePoint = [self remotePointForEvent:event];
+	BOOL transparent = [self isRemotePointTransparent:remotePoint];
+	[self syncMousePassThroughStateForScreenPoint:[NSEvent mouseLocation]];
+	return transparent;
+}
+
+- (void)viewDidMoveToWindow
+{
+	[super viewDidMoveToWindow];
+
+	if (mousePassThroughMonitor)
+	{
+		[NSEvent removeMonitor:mousePassThroughMonitor];
+		mousePassThroughMonitor = nil;
+	}
+
+	if (![self window])
+		return;
+
+	mousePassThroughMonitor =
+	    [NSEvent addGlobalMonitorForEventsMatchingMask:(NSEventMaskMouseMoved |
+	                                                    NSEventMaskLeftMouseDragged |
+	                                                    NSEventMaskRightMouseDragged |
+	                                                    NSEventMaskOtherMouseDragged |
+	                                                    NSEventMaskLeftMouseDown |
+	                                                    NSEventMaskRightMouseDown |
+	                                                    NSEventMaskOtherMouseDown)
+	                                          handler:^(NSEvent *event) {
+		                                          (void)event;
+		                                          dispatch_async(dispatch_get_main_queue(), ^{
+			                                          [self syncMousePassThroughStateForScreenPoint:
+			                                                    [NSEvent mouseLocation]];
+		                                          });
+	                                          }];
+}
+
+- (void)sendMoveForEvent:(NSEvent *)event
+{
+	if (!primaryView || ![primaryView is_connected])
+		return;
+
+	NSPoint point = [self remotePointForEvent:event];
+	[primaryView sendRemoteMouseEventWithFlags:PTR_FLAGS_MOVE
+	                                         x:(UINT16)point.x
+	                                         y:(UINT16)point.y];
+}
+
+- (void)sendButton:(int)button event:(NSEvent *)event down:(BOOL)down
+{
+	if (!primaryView || ![primaryView is_connected])
+		return;
+
+	NSPoint point = [self remotePointForEvent:event];
+	[primaryView sendRemoteMouseButton:button x:(UINT16)point.x y:(UINT16)point.y down:down];
+}
+
+- (void)drawRect:(NSRect)dirtyRect
+{
+	(void)dirtyRect;
+
+	CGImageRef image = primaryView ? [primaryView newFramebufferImage] : NULL;
+	if (!image)
+	{
+		[[NSColor clearColor] set];
+		NSRectFill([self bounds]);
+		return;
+	}
+
+	CGImageRef slice = CGImageCreateWithImageInRect(image, CGRectMake(sourceRect.origin.x,
+	                                                                  sourceRect.origin.y,
+	                                                                  sourceRect.size.width,
+	                                                                  sourceRect.size.height));
+	CGImageRelease(image);
+	if (!slice)
+		return;
+
+	CGContextRef cgContext = [[NSGraphicsContext currentContext] CGContext];
+	NSRect bounds = [self bounds];
+	CGContextSaveGState(cgContext);
+	CGContextClearRect(cgContext, bounds);
+	CGContextTranslateCTM(cgContext, 0, NSHeight(bounds));
+	CGContextScaleCTM(cgContext, 1.0, -1.0);
+	CGContextDrawImage(cgContext, CGRectMake(0, 0, NSWidth(bounds), NSHeight(bounds)), slice);
+	CGContextRestoreGState(cgContext);
+	CGImageRelease(slice);
+}
+
+- (void)mouseMoved:(NSEvent *)event
+{
+	[self syncMousePassThroughStateForScreenPoint:[NSEvent mouseLocation]];
+	[self sendMoveForEvent:event];
+}
+
+- (void)mouseDragged:(NSEvent *)event
+{
+	if ([self shouldPassMouseEventThrough:event])
+	{
+		[self passMouseEventThrough:event];
+		return;
+	}
+	[self sendMoveForEvent:event];
+}
+
+- (void)rightMouseDragged:(NSEvent *)event
+{
+	if ([self shouldPassMouseEventThrough:event])
+	{
+		[self passMouseEventThrough:event];
+		return;
+	}
+	[self sendMoveForEvent:event];
+}
+
+- (void)otherMouseDragged:(NSEvent *)event
+{
+	if ([self shouldPassMouseEventThrough:event])
+	{
+		[self passMouseEventThrough:event];
+		return;
+	}
+	[self sendMoveForEvent:event];
+}
+
+- (void)mouseDown:(NSEvent *)event
+{
+	if ([self shouldPassMouseEventThrough:event])
+	{
+		[self passMouseEventThrough:event];
+		return;
+	}
+	[self sendButton:0 event:event down:YES];
+}
+
+- (void)mouseUp:(NSEvent *)event
+{
+	if ([self shouldPassMouseEventThrough:event])
+	{
+		[self passMouseEventThrough:event];
+		return;
+	}
+	[self sendButton:0 event:event down:NO];
+}
+
+- (void)rightMouseDown:(NSEvent *)event
+{
+	if ([self shouldPassMouseEventThrough:event])
+	{
+		[self passMouseEventThrough:event];
+		return;
+	}
+	[self sendButton:1 event:event down:YES];
+}
+
+- (void)rightMouseUp:(NSEvent *)event
+{
+	if ([self shouldPassMouseEventThrough:event])
+	{
+		[self passMouseEventThrough:event];
+		return;
+	}
+	[self sendButton:1 event:event down:NO];
+}
+
+- (void)otherMouseDown:(NSEvent *)event
+{
+	if ([self shouldPassMouseEventThrough:event])
+	{
+		[self passMouseEventThrough:event];
+		return;
+	}
+	[self sendButton:(int)[event buttonNumber] event:event down:YES];
+}
+
+- (void)otherMouseUp:(NSEvent *)event
+{
+	if ([self shouldPassMouseEventThrough:event])
+	{
+		[self passMouseEventThrough:event];
+		return;
+	}
+	[self sendButton:(int)[event buttonNumber] event:event down:NO];
+}
+
+- (void)keyDown:(NSEvent *)event
+{
+	[primaryView keyDown:event];
+}
+
+- (void)keyUp:(NSEvent *)event
+{
+	[primaryView keyUp:event];
+}
+
+- (void)flagsChanged:(NSEvent *)event
+{
+	[primaryView flagsChanged:event];
 }
 
 @end
@@ -376,6 +723,9 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	NSTimer *leftEdgeFocusTimer;
 	NSStatusItem *statusItem;
 	NSMenu *statusMenu;
+	MRDPMonitorSliceView *primaryMonitorSliceView;
+	NSMutableArray *monitorWindows;
+	NSMutableArray *monitorSliceViews;
 	NSMutableDictionary *statusSessions;
 	NSTimer *statusCoordinationTimer;
 	NSTimer *spacerEnforcementTimer;
@@ -392,6 +742,9 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 - (void)scheduleLeftEdgeFocusTimer;
 - (void)leftEdgeFocusTimerFired:(NSTimer *)timer;
 - (void)focusClientWindow;
+- (void)syncMultimonWindows;
+- (void)closeMultimonWindows;
+- (void)multimonFramebufferDidUpdate:(NSNotification *)notification;
 - (void)applyWindowDecorationsFromSettings;
 - (void)configureMainMenu;
 - (void)configureApplicationIcon;
@@ -459,10 +812,14 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	[self cancelLeftEdgeFocusTimer];
 	[self stopStatusCoordination];
 	[self removeStatusItem];
+	[self closeMultimonWindows];
+	[[NSNotificationCenter defaultCenter] removeObserver:self];
 	[self hideSpacerWindow];
 	[self stopSpacerEnforcement];
 	[statusSessions release];
 	[statusMenu release];
+	[monitorWindows release];
+	[monitorSliceViews release];
 	[super dealloc];
 }
 
@@ -663,6 +1020,10 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	WINPR_ASSERT(mfc);
 	[self applyWindowDecorationsFromSettings];
 	[self startLeftEdgeFocusMonitor];
+	[[NSNotificationCenter defaultCenter] addObserver:self
+	                                         selector:@selector(multimonFramebufferDidUpdate:)
+	                                             name:@"MRDPMultimonFramebufferDidUpdate"
+	                                           object:nil];
 
 	mfc->view = (void *)mrdpView;
 
@@ -674,7 +1035,14 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 
 		WINPR_ASSERT(settings);
 
-		if (freerdp_settings_get_bool(settings, FreeRDP_Fullscreen) &&
+		if (!mac_apply_display_properties(settings, mfc->fullscreen_mode == 2))
+		{
+			[NSApp terminate:self];
+			return;
+		}
+
+		if (!freerdp_settings_get_bool(settings, FreeRDP_UseMultimon) &&
+		    freerdp_settings_get_bool(settings, FreeRDP_Fullscreen) &&
 		    !freerdp_settings_get_bool(settings, FreeRDP_SmartSizing))
 		{
 			(void)freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth,
@@ -683,7 +1051,8 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 			                                  screenFrame.size.height);
 		}
 
-		PubSub_SubscribeConnectionResult(context->pubSub, AppDelegate_ConnectionResultEventHandler);
+		PubSub_SubscribeConnectionResult(context->pubSub,
+		                                 AppDelegate_ConnectionResultEventHandler);
 		PubSub_SubscribeErrorInfo(context->pubSub, AppDelegate_ErrorInfoEventHandler);
 		PubSub_SubscribeEmbedWindow(context->pubSub, AppDelegate_EmbedWindowEventHandler);
 		PubSub_SubscribeResizeWindow(context->pubSub, AppDelegate_ResizeWindowEventHandler);
@@ -740,6 +1109,10 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	[self stopStatusCoordination];
 	[self stopSpacerEnforcement];
 	[self removeStatusItem];
+	[self closeMultimonWindows];
+	[[NSNotificationCenter defaultCenter] removeObserver:self
+	                                                name:@"MRDPMultimonFramebufferDidUpdate"
+	                                              object:nil];
 	freerdp_client_stop(context);
 	[mrdpView releaseResources];
 	_singleDelegate = nil;
@@ -764,7 +1137,16 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 
 - (void)windowDidBecomeKey:(NSNotification *)notification
 {
-	[self focusClientWindow];
+	NSWindow *keyWindow = [notification object];
+	if (keyWindow == window)
+	{
+		[self focusClientWindow];
+		return;
+	}
+
+	NSView *contentView = [keyWindow contentView];
+	if ([contentView isKindOfClass:[MRDPMonitorSliceView class]])
+		[keyWindow makeFirstResponder:contentView];
 }
 
 - (void)windowDidMove:(NSNotification *)notification
@@ -812,6 +1194,145 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	}
 
 	[[window contentView] setNeedsDisplay:YES];
+}
+
+- (void)closeMultimonWindows
+{
+	if (primaryMonitorSliceView)
+	{
+		[primaryMonitorSliceView removeFromSuperview];
+		[primaryMonitorSliceView release];
+		primaryMonitorSliceView = nil;
+	}
+
+	if (mrdpView)
+		[mrdpView setHidden:NO];
+
+	if (monitorWindows)
+	{
+		for (NSWindow *monitorWindow in monitorWindows)
+		{
+			[monitorWindow orderOut:self];
+			[monitorWindow setDelegate:nil];
+		}
+		[monitorWindows removeAllObjects];
+	}
+
+	if (monitorSliceViews)
+		[monitorSliceViews removeAllObjects];
+}
+
+- (void)multimonFramebufferDidUpdate:(NSNotification *)notification
+{
+	if ([notification object] != mrdpView)
+		return;
+
+	[primaryMonitorSliceView setNeedsDisplay:YES];
+	for (NSView *sliceView in monitorSliceViews)
+		[sliceView setNeedsDisplay:YES];
+}
+
+- (void)syncMultimonWindows
+{
+	if (!context || !context->settings || !mrdpView || !mac_multimon_enabled(context->settings))
+	{
+		[self closeMultimonWindows];
+		return;
+	}
+
+	NSArray *slices = mac_multimon_slices(context->settings);
+	if ([slices count] <= 1)
+	{
+		[self closeMultimonWindows];
+		return;
+	}
+
+	if (!monitorWindows)
+		monitorWindows = [[NSMutableArray alloc] init];
+	if (!monitorSliceViews)
+		monitorSliceViews = [[NSMutableArray alloc] init];
+
+	NSDictionary *primarySlice = [slices objectAtIndex:0];
+	NSRect primarySource = [[primarySlice objectForKey:@"source"] rectValue];
+	if (!primaryMonitorSliceView)
+	{
+		primaryMonitorSliceView = [[MRDPMonitorSliceView alloc] initWithPrimaryView:mrdpView
+		                                                                sourceRect:primarySource];
+		primaryMonitorSliceView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+		[[window contentView] addSubview:primaryMonitorSliceView positioned:NSWindowAbove
+		                  relativeTo:mrdpView];
+	}
+	else
+	{
+		[primaryMonitorSliceView setSourceRect:primarySource];
+	}
+	primaryMonitorSliceView.frame = [[window contentView] bounds];
+	[window setInitialFirstResponder:primaryMonitorSliceView];
+	[window makeFirstResponder:primaryMonitorSliceView];
+	[mrdpView setHidden:YES];
+
+	while ([monitorWindows count] > [slices count] - 1)
+	{
+		NSWindow *oldWindow = [monitorWindows lastObject];
+		[oldWindow orderOut:self];
+		[oldWindow setDelegate:nil];
+		[monitorWindows removeLastObject];
+		[monitorSliceViews removeLastObject];
+	}
+
+	NSString *baseTitle = [window title] ?: @"MacFreeRDP";
+	const BOOL decorated = freerdp_settings_get_bool(context->settings, FreeRDP_Decorations);
+	const NSWindowStyleMask styleMask =
+	    decorated ? (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+	                 NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
+	              : NSWindowStyleMaskBorderless;
+	for (NSUInteger i = 1; i < [slices count]; i++)
+	{
+		NSDictionary *slice = [slices objectAtIndex:i];
+		NSRect frame = [[slice objectForKey:@"frame"] rectValue];
+		NSRect source = [[slice objectForKey:@"source"] rectValue];
+		NSUInteger sliceIndex = i - 1;
+		NSWindow *monitorWindow = nil;
+		MRDPMonitorSliceView *sliceView = nil;
+
+		if (sliceIndex < [monitorWindows count])
+		{
+			monitorWindow = [monitorWindows objectAtIndex:sliceIndex];
+			sliceView = [monitorSliceViews objectAtIndex:sliceIndex];
+			[sliceView setSourceRect:source];
+		}
+		else
+		{
+			sliceView = [[[MRDPMonitorSliceView alloc] initWithPrimaryView:mrdpView
+			                                                    sourceRect:source] autorelease];
+			monitorWindow = [[[MRDPClientWindow alloc] initWithContentRect:frame
+			                                                     styleMask:styleMask
+			                                                       backing:NSBackingStoreBuffered
+			                                                         defer:NO] autorelease];
+			[monitorWindow setAcceptsMouseMovedEvents:YES];
+			[monitorWindow setDelegate:self];
+			[monitorWindow setContentView:sliceView];
+			[monitorWindow setInitialFirstResponder:sliceView];
+			[monitorWindow setReleasedWhenClosed:NO];
+			[monitorWindow setOpaque:NO];
+			[monitorWindow setBackgroundColor:[NSColor clearColor]];
+			[monitorWindows addObject:monitorWindow];
+			[monitorSliceViews addObject:sliceView];
+		}
+
+		[monitorWindow setStyleMask:styleMask];
+		[monitorWindow setMovable:decorated];
+		[monitorWindow setTitleVisibility:decorated ? NSWindowTitleVisible : NSWindowTitleHidden];
+		[monitorWindow setTitlebarAppearsTransparent:decorated ? NO : YES];
+		[monitorWindow setTitle:[NSString stringWithFormat:@"%@ [%lu]", baseTitle,
+		                                                   (unsigned long)(i + 1)]];
+		[monitorWindow setFrame:frame display:YES];
+		[monitorWindow setFrame:mac_constrain_window_frame_to_screen([monitorWindow frame],
+		                                                             [slice objectForKey:@"screen"],
+		                                                             decorated)
+		                display:YES];
+		[monitorWindow orderFront:self];
+	}
 }
 
 - (void)configureApplicationIcon
@@ -2006,8 +2527,12 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	const BOOL fullscreen = settings && freerdp_settings_get_bool(settings, FreeRDP_Fullscreen) &&
 	                        mfc && (mfc->fullscreen_mode != 2);
 	const BOOL pseudoFullscreen = mfc && (mfc->fullscreen_mode == 2);
+	const BOOL multimon = settings && freerdp_settings_get_bool(settings, FreeRDP_UseMultimon);
 	const BOOL useVisibleFrame = pseudoFullscreen;
 	NSRect targetRect = useVisibleFrame ? [screen visibleFrame] : [screen frame];
+
+	if (multimon)
+		return;
 
 	if (fullscreen && mrdpView && [mrdpView isInFullScreenMode])
 		[mrdpView exitFullScreenModeWithOptions:nil];
@@ -2052,8 +2577,12 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	const BOOL fullscreen = freerdp_settings_get_bool(settings, FreeRDP_Fullscreen) &&
 	                        (mfc->fullscreen_mode != 2);
 	const BOOL pseudoFullscreen = (mfc->fullscreen_mode == 2);
+	const BOOL multimon = freerdp_settings_get_bool(settings, FreeRDP_UseMultimon);
 
 	if (freerdp_settings_get_bool(settings, FreeRDP_SmartSizing))
+		return NO;
+
+	if (multimon)
 		return NO;
 
 	if (!fullscreen && !pseudoFullscreen)
@@ -2668,7 +3197,8 @@ void AppDelegate_ConnectionResultEventHandler(void *ctx, const ConnectionResultE
 					NSScreen *screen = [_singleDelegate preferredScreen];
 					NSInteger screenIndex = mac_screen_index_for_screen(screen);
 					mac_set_view_size(context, mfc->view);
-					[_singleDelegate moveSessionToScreen:screen screenIndex:screenIndex];
+					if (!mac_multimon_enabled(context->settings))
+						[_singleDelegate moveSessionToScreen:screen screenIndex:screenIndex];
 					[_singleDelegate focusClientWindow];
 				}
 			});
@@ -2773,6 +3303,7 @@ void mac_set_view_size(rdpContext *context, MRDPView *view)
 	NSWindow *window = [view window];
 	NSScreen *screen = mac_preferred_screen(window);
 	const BOOL smartSizing = freerdp_settings_get_bool(context->settings, FreeRDP_SmartSizing);
+	const BOOL multimon = mac_multimon_enabled(context->settings);
 	// set client area to specified dimensions
 	NSRect innerRect;
 	innerRect.origin.x = 0;
@@ -2790,36 +3321,247 @@ void mac_set_view_size(rdpContext *context, MRDPView *view)
 		innerRect.size.height = freerdp_settings_get_uint32(context->settings, FreeRDP_DesktopHeight);
 	}
 
-	[view setFrame:innerRect];
+	NSRect viewRect = innerRect;
+	NSArray *slices = multimon ? mac_multimon_slices(context->settings) : nil;
+	NSDictionary *primarySlice = ([slices count] > 0) ? [slices objectAtIndex:0] : nil;
+	if (primarySlice && !smartSizing)
+	{
+		NSValue *sourceValue = [primarySlice objectForKey:@"source"];
+		if (sourceValue)
+		{
+			NSRect sourceRect = [sourceValue rectValue];
+			viewRect.origin.x = -NSMinX(sourceRect);
+			viewRect.origin.y = -(freerdp_settings_get_uint32(context->settings,
+			                                                  FreeRDP_DesktopHeight) -
+			                      NSMaxY(sourceRect));
+		}
+	}
+
+	[view setFrame:viewRect];
 	[view setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
 	// calculate window of same size, but keep position
 	NSRect outerRect = [window frame];
-	outerRect.size = [window frameRectForContentRect:innerRect].size;
+	if (primarySlice && !smartSizing)
+	{
+		NSValue *frameValue = [primarySlice objectForKey:@"frame"];
+		NSRect contentRect = frameValue ? [frameValue rectValue] : NSZeroRect;
+		outerRect = !NSIsEmptyRect(contentRect) ? contentRect
+		                                        : [window frameRectForContentRect:innerRect];
+		[window setCollectionBehavior:NSWindowCollectionBehaviorDefault];
+	}
+	else
+	{
+		outerRect.size = [window frameRectForContentRect:innerRect].size;
+	}
 	// we are not in RemoteApp mode, disable larger than resolution
-	[window setContentMaxSize:smartSizing ? NSMakeSize(CGFLOAT_MAX, CGFLOAT_MAX) : innerRect.size];
+	[window setContentMaxSize:(smartSizing || multimon) ? NSMakeSize(CGFLOAT_MAX, CGFLOAT_MAX)
+	                                                     : innerRect.size];
 	// set window to given area
 	[window setFrame:outerRect display:YES];
+	if (primarySlice && !smartSizing)
+	{
+		[window setFrame:mac_constrain_window_frame_to_screen(
+		                     [window frame], [primarySlice objectForKey:@"screen"],
+		                     freerdp_settings_get_bool(context->settings, FreeRDP_Decorations))
+		          display:YES];
+	}
 
 	if ((mfc->fullscreen_mode == 2) && [view is_connected])
 	{
 		mac_maximize_window_minus_menubar(context, window, view);
 	}
 	else if (!freerdp_settings_get_bool(context->settings, FreeRDP_Decorations) &&
-	    !freerdp_settings_get_bool(context->settings, FreeRDP_Fullscreen))
+	    !freerdp_settings_get_bool(context->settings, FreeRDP_Fullscreen) && !multimon)
 	{
 		mac_position_window_top_left(window);
 	}
 
+	if (_singleDelegate)
+		[_singleDelegate syncMultimonWindows];
+
 	// set window to front
 	[NSApp activateIgnoringOtherApps:YES];
 
-	if ([view is_connected] && freerdp_settings_get_bool(context->settings, FreeRDP_Fullscreen) &&
+	if ([view is_connected] && !multimon &&
+	    freerdp_settings_get_bool(context->settings, FreeRDP_Fullscreen) &&
 	    mfc->fullscreen_mode != 2 &&
 	    view && screen && ![view isInFullScreenMode])
 	{
 		[view enterFullScreenMode:screen withOptions:nil];
 		mac_fit_view_to_window_content(context, view);
 	}
+}
+
+static BOOL mac_screen_is_selected_for_settings(rdpSettings *settings, UINT32 screenIndex)
+{
+	const UINT32 count = freerdp_settings_get_uint32(settings, FreeRDP_NumMonitorIds);
+
+	if (count == 0)
+		return TRUE;
+
+	for (UINT32 i = 0; i < count; i++)
+	{
+		const UINT32 *id =
+		    freerdp_settings_get_pointer_array(settings, FreeRDP_MonitorIds, i);
+		if (id && (*id == screenIndex))
+			return TRUE;
+	}
+
+	return FALSE;
+}
+
+static BOOL mac_multimon_enabled(rdpSettings *settings)
+{
+	return settings && freerdp_settings_get_bool(settings, FreeRDP_UseMultimon);
+}
+
+static NSRect mac_safe_multimon_window_frame(NSScreen *screen, BOOL decorated)
+{
+	(void)decorated;
+
+	if (!screen)
+		return NSZeroRect;
+
+	NSRect screenFrame = [screen frame];
+	NSRect safeFrame = [screen visibleFrame];
+
+	CGFloat reservedTop = NSMaxY(screenFrame) - NSMaxY(safeFrame);
+	if (reservedTop < 1.0)
+	{
+		NSStatusBar *statusBar = [NSStatusBar systemStatusBar];
+		reservedTop = statusBar ? [statusBar thickness] : 24.0;
+	}
+	reservedTop = ceil(MAX(reservedTop, 24.0));
+
+	const CGFloat safeMaxY = NSMaxY(screenFrame) - reservedTop;
+	if (NSMaxY(safeFrame) > safeMaxY)
+	{
+		const CGFloat delta = NSMaxY(safeFrame) - safeMaxY;
+		safeFrame.size.height = MAX(1.0, safeFrame.size.height - delta);
+	}
+
+	if (NSHeight(safeFrame) > (safeMaxY - NSMinY(safeFrame)))
+		safeFrame.size.height = MAX(1.0, safeMaxY - NSMinY(safeFrame));
+
+	return safeFrame;
+}
+
+static NSRect mac_constrain_window_frame_to_screen(NSRect frame, NSScreen *screen, BOOL decorated)
+{
+	NSRect safeFrame = mac_safe_multimon_window_frame(screen, decorated);
+	if (!screen || NSIsEmptyRect(safeFrame))
+		return frame;
+
+	if (NSWidth(frame) > NSWidth(safeFrame))
+		frame.size.width = NSWidth(safeFrame);
+	if (NSHeight(frame) > NSHeight(safeFrame))
+		frame.size.height = NSHeight(safeFrame);
+
+	if (NSMaxX(frame) > NSMaxX(safeFrame))
+		frame.origin.x -= NSMaxX(frame) - NSMaxX(safeFrame);
+	if (NSMinX(frame) < NSMinX(safeFrame))
+		frame.origin.x = NSMinX(safeFrame);
+
+	if (NSMaxY(frame) > NSMaxY(safeFrame))
+		frame.origin.y -= NSMaxY(frame) - NSMaxY(safeFrame);
+	if (NSMinY(frame) < NSMinY(safeFrame))
+		frame.origin.y = NSMinY(safeFrame);
+
+	return frame;
+}
+
+static NSArray *mac_multimon_slices(rdpSettings *settings)
+{
+	if (!mac_multimon_enabled(settings))
+		return nil;
+
+	NSArray *screens = [NSScreen screens];
+	const NSUInteger screenCount = [screens count];
+	NSMutableArray *rawSlices = [NSMutableArray array];
+	const BOOL decorated = freerdp_settings_get_bool(settings, FreeRDP_Decorations);
+	CGFloat minX = 0;
+	CGFloat minY = 0;
+	CGFloat maxX = 0;
+	CGFloat maxY = 0;
+	BOOL found = FALSE;
+
+	for (NSUInteger i = 0; i < screenCount; i++)
+	{
+		if (!mac_screen_is_selected_for_settings(settings, (UINT32)i))
+			continue;
+
+		NSScreen *screen = [screens objectAtIndex:i];
+		NSRect visibleFrame = mac_safe_multimon_window_frame(screen, decorated);
+		NSRect remoteRect = NSMakeRect(NSMinX(visibleFrame), -NSMaxY(visibleFrame),
+		                               NSWidth(visibleFrame), NSHeight(visibleFrame));
+		if (!found)
+		{
+			minX = NSMinX(remoteRect);
+			minY = NSMinY(remoteRect);
+			maxX = NSMaxX(remoteRect);
+			maxY = NSMaxY(remoteRect);
+			found = TRUE;
+		}
+		else
+		{
+			minX = MIN(minX, NSMinX(remoteRect));
+			minY = MIN(minY, NSMinY(remoteRect));
+			maxX = MAX(maxX, NSMaxX(remoteRect));
+			maxY = MAX(maxY, NSMaxY(remoteRect));
+		}
+
+		[rawSlices addObject:@{
+			@"screen" : screen,
+			@"frame" : [NSValue valueWithRect:visibleFrame],
+			@"remote" : [NSValue valueWithRect:remoteRect]
+		}];
+	}
+
+	if ([rawSlices count] == 0)
+		return nil;
+
+	NSMutableArray *slices = [NSMutableArray arrayWithCapacity:[rawSlices count]];
+	for (NSDictionary *slice in rawSlices)
+	{
+		NSRect remoteRect = [[slice objectForKey:@"remote"] rectValue];
+		NSRect sourceRect = NSMakeRect(NSMinX(remoteRect) - minX,
+		                               NSMinY(remoteRect) - minY,
+		                               NSWidth(remoteRect), NSHeight(remoteRect));
+		[slices addObject:@{
+			@"screen" : [slice objectForKey:@"screen"],
+			@"frame" : [slice objectForKey:@"frame"],
+			@"source" : [NSValue valueWithRect:sourceRect]
+		}];
+	}
+
+	return slices;
+}
+
+static BOOL mac_multimon_content_rect(rdpSettings *settings, NSRect *rect)
+{
+	if (!settings || !rect)
+		return FALSE;
+
+	NSArray *screens = [NSScreen screens];
+	const NSUInteger screenCount = [screens count];
+	BOOL found = FALSE;
+	NSRect unionRect = NSZeroRect;
+
+	for (NSUInteger i = 0; i < screenCount; i++)
+	{
+		if (!mac_screen_is_selected_for_settings(settings, (UINT32)i))
+			continue;
+
+		NSRect frame = [[screens objectAtIndex:i] frame];
+		unionRect = found ? NSUnionRect(unionRect, frame) : frame;
+		found = TRUE;
+	}
+
+	if (!found)
+		return FALSE;
+
+	*rect = unionRect;
+	return TRUE;
 }
 
 static void mac_fit_view_to_window_content(rdpContext *context, MRDPView *view)
