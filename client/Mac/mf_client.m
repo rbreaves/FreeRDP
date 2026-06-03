@@ -106,6 +106,8 @@ static BOOL mfreerdp_client_new(freerdp *instance, rdpContext *context)
 	mfc->smart_sizing_align = MF_SMART_SIZING_ALIGN_CENTER;
 	mfc->smart_sizing_overscan = FALSE;
 	mfc->smart_sizing_overscan_align = MF_SMART_SIZING_ALIGN_CENTER;
+	mfc->taskbarHide = FALSE;
+	mfc->taskbarHideHeight = 48;
 
 	context->instance->PreConnect = mac_pre_connect;
 	context->instance->PostConnect = mac_post_connect;

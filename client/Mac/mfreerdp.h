@@ -137,6 +137,8 @@ typedef struct
 	BOOL spacerEnabled;
 	UINT32 spacerPosition; // 0=top, 1=bottom, 2=left, 3=right
 	UINT32 spacerSize;     // width for left/right, height for top/bottom (in pixels)
+	BOOL taskbarHide;
+	UINT32 taskbarHideHeight;
 } mfContext;
 
 #endif /* FREERDP_CLIENT_MAC_FREERDP_H */

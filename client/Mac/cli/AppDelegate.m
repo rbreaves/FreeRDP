@@ -34,6 +34,8 @@ static BOOL mac_screen_is_selected_for_settings(rdpSettings *settings, UINT32 sc
 static BOOL mac_multimon_content_rect(rdpSettings *settings, NSRect *rect);
 static BOOL mac_multimon_enabled(rdpSettings *settings);
 static NSArray *mac_multimon_slices(rdpSettings *settings);
+static BOOL mac_taskbar_hide_enabled(mfContext *mfc);
+static BOOL mac_taskbar_mouse_should_reveal(NSPoint mouse, NSRect taskbarFrame);
 static NSRect mac_safe_multimon_window_frame(NSScreen *screen, BOOL decorated);
 static NSRect mac_constrain_window_frame_to_screen(NSRect frame, NSScreen *screen, BOOL decorated);
 static void mac_maximize_window_minus_menubar(rdpContext *context, NSWindow *window, MRDPView *view);
@@ -120,6 +122,8 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 
 - (id)initWithPrimaryView:(MRDPView *)view sourceRect:(NSRect)rect;
 - (void)setSourceRect:(NSRect)rect;
+- (NSPoint)remotePointForScreenPoint:(NSPoint)screenPoint valid:(BOOL *)valid;
+- (BOOL)isRemotePointTransparent:(NSPoint)remotePoint;
 
 @end
 
@@ -726,9 +730,12 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	MRDPMonitorSliceView *primaryMonitorSliceView;
 	NSMutableArray *monitorWindows;
 	NSMutableArray *monitorSliceViews;
+	NSMutableArray *taskbarWindows;
+	NSMutableArray *taskbarSliceViews;
 	NSMutableDictionary *statusSessions;
 	NSTimer *statusCoordinationTimer;
 	NSTimer *spacerEnforcementTimer;
+	NSTimer *taskbarHideTimer;
 	NSInteger preferredScreenIndex;
 	NSSlider *windowDragTitlebarHeightSlider;
 	NSTextField *windowDragTitlebarHeightValueLabel;
@@ -744,6 +751,11 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 - (void)focusClientWindow;
 - (void)syncMultimonWindows;
 - (void)closeMultimonWindows;
+- (void)syncTaskbarHideWindows;
+- (void)closeTaskbarHideWindows;
+- (void)startTaskbarHideMonitor;
+- (void)stopTaskbarHideMonitor;
+- (void)taskbarHideTimerFired:(NSTimer *)timer;
 - (void)multimonFramebufferDidUpdate:(NSNotification *)notification;
 - (void)applyWindowDecorationsFromSettings;
 - (void)configureMainMenu;
@@ -812,6 +824,8 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	[self cancelLeftEdgeFocusTimer];
 	[self stopStatusCoordination];
 	[self removeStatusItem];
+	[self stopTaskbarHideMonitor];
+	[self closeTaskbarHideWindows];
 	[self closeMultimonWindows];
 	[[NSNotificationCenter defaultCenter] removeObserver:self];
 	[self hideSpacerWindow];
@@ -820,6 +834,8 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	[statusMenu release];
 	[monitorWindows release];
 	[monitorSliceViews release];
+	[taskbarWindows release];
+	[taskbarSliceViews release];
 	[super dealloc];
 }
 
@@ -1019,6 +1035,8 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	mfc = (mfContext *)context;
 	WINPR_ASSERT(mfc);
 	[self applyWindowDecorationsFromSettings];
+	if (mac_taskbar_hide_enabled(mfc))
+		[self startTaskbarHideMonitor];
 	[self startLeftEdgeFocusMonitor];
 	[[NSNotificationCenter defaultCenter] addObserver:self
 	                                         selector:@selector(multimonFramebufferDidUpdate:)
@@ -1107,8 +1125,10 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	[self savePreferredScreenToDefaults];
 	[self broadcastStatusSessionWillTerminate];
 	[self stopStatusCoordination];
+	[self stopTaskbarHideMonitor];
 	[self stopSpacerEnforcement];
 	[self removeStatusItem];
+	[self closeTaskbarHideWindows];
 	[self closeMultimonWindows];
 	[[NSNotificationCenter defaultCenter] removeObserver:self
 	                                                name:@"MRDPMultimonFramebufferDidUpdate"
@@ -1230,20 +1250,60 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	[primaryMonitorSliceView setNeedsDisplay:YES];
 	for (NSView *sliceView in monitorSliceViews)
 		[sliceView setNeedsDisplay:YES];
+	for (NSView *sliceView in taskbarSliceViews)
+		[sliceView setNeedsDisplay:YES];
 }
 
 - (void)syncMultimonWindows
 {
-	if (!context || !context->settings || !mrdpView || !mac_multimon_enabled(context->settings))
+	if (!context)
 	{
 		[self closeMultimonWindows];
+		[self closeTaskbarHideWindows];
 		return;
 	}
 
-	NSArray *slices = mac_multimon_slices(context->settings);
-	if ([slices count] <= 1)
+	mfContext *mfc = (mfContext *)context;
+	const BOOL taskbarHide = mac_taskbar_hide_enabled(mfc);
+
+	if (!context || !context->settings || !mrdpView ||
+	    (!mac_multimon_enabled(context->settings) && !taskbarHide))
 	{
 		[self closeMultimonWindows];
+		[self closeTaskbarHideWindows];
+		return;
+	}
+
+	NSArray *slices = mac_multimon_enabled(context->settings) ? mac_multimon_slices(context->settings) : nil;
+	if ([slices count] == 0)
+	{
+		const UINT32 desktopWidth =
+		    freerdp_settings_get_uint32(context->settings, FreeRDP_DesktopWidth);
+		const UINT32 desktopHeight =
+		    freerdp_settings_get_uint32(context->settings, FreeRDP_DesktopHeight);
+		NSRect frame = [window frame];
+		if (taskbarHide && primaryMonitorSliceView)
+		{
+			const CGFloat taskbarHeight =
+			    MIN((CGFloat)mfc->taskbarHideHeight, (CGFloat)desktopHeight - 1.0);
+			frame.origin.y -= taskbarHeight;
+			frame.size.height += taskbarHeight;
+		}
+		NSScreen *screen = mac_preferred_screen(window);
+		if (!screen)
+			screen = [NSScreen mainScreen];
+		NSDictionary *slice = @{
+			@"screen" : screen,
+			@"frame" : [NSValue valueWithRect:frame],
+			@"source" : [NSValue valueWithRect:NSMakeRect(0, 0, desktopWidth, desktopHeight)]
+		};
+		slices = [NSArray arrayWithObject:slice];
+	}
+
+	if ([slices count] <= 1 && !taskbarHide)
+	{
+		[self closeMultimonWindows];
+		[self closeTaskbarHideWindows];
 		return;
 	}
 
@@ -1251,9 +1311,24 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		monitorWindows = [[NSMutableArray alloc] init];
 	if (!monitorSliceViews)
 		monitorSliceViews = [[NSMutableArray alloc] init];
+	if (!taskbarWindows)
+		taskbarWindows = [[NSMutableArray alloc] init];
+	if (!taskbarSliceViews)
+		taskbarSliceViews = [[NSMutableArray alloc] init];
 
 	NSDictionary *primarySlice = [slices objectAtIndex:0];
 	NSRect primarySource = [[primarySlice objectForKey:@"source"] rectValue];
+	NSRect primaryFrame = [[primarySlice objectForKey:@"frame"] rectValue];
+	const CGFloat taskbarHeight =
+	    taskbarHide ? MIN((CGFloat)mfc->taskbarHideHeight, NSHeight(primarySource) - 1.0) : 0.0;
+	if (taskbarHeight > 0.0)
+	{
+		primarySource.size.height -= taskbarHeight;
+		primaryFrame.origin.y += taskbarHeight;
+		primaryFrame.size.height = MAX(1.0, primaryFrame.size.height - taskbarHeight);
+		[window setFrame:primaryFrame display:YES];
+	}
+
 	if (!primaryMonitorSliceView)
 	{
 		primaryMonitorSliceView = [[MRDPMonitorSliceView alloc] initWithPrimaryView:mrdpView
@@ -1270,6 +1345,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	[window setInitialFirstResponder:primaryMonitorSliceView];
 	[window makeFirstResponder:primaryMonitorSliceView];
 	[mrdpView setHidden:YES];
+	[self syncTaskbarHideWindows];
 
 	while ([monitorWindows count] > [slices count] - 1)
 	{
@@ -1291,6 +1367,12 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		NSDictionary *slice = [slices objectAtIndex:i];
 		NSRect frame = [[slice objectForKey:@"frame"] rectValue];
 		NSRect source = [[slice objectForKey:@"source"] rectValue];
+		if (taskbarHeight > 0.0)
+		{
+			source.size.height -= taskbarHeight;
+			frame.origin.y += taskbarHeight;
+			frame.size.height = MAX(1.0, frame.size.height - taskbarHeight);
+		}
 		NSUInteger sliceIndex = i - 1;
 		NSWindow *monitorWindow = nil;
 		MRDPMonitorSliceView *sliceView = nil;
@@ -1333,6 +1415,183 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		                display:YES];
 		[monitorWindow orderFront:self];
 	}
+}
+
+- (void)syncTaskbarHideWindows
+{
+	if (!context || !context->settings || !mrdpView)
+	{
+		[self closeTaskbarHideWindows];
+		return;
+	}
+
+	mfContext *mfc = (mfContext *)context;
+	if (!mac_taskbar_hide_enabled(mfc))
+	{
+		[self closeTaskbarHideWindows];
+		return;
+	}
+
+	NSArray *slices = mac_multimon_enabled(context->settings) ? mac_multimon_slices(context->settings) : nil;
+	if ([slices count] == 0)
+	{
+		const UINT32 desktopWidth =
+		    freerdp_settings_get_uint32(context->settings, FreeRDP_DesktopWidth);
+		const UINT32 desktopHeight =
+		    freerdp_settings_get_uint32(context->settings, FreeRDP_DesktopHeight);
+		NSRect mainFrame = [window frame];
+		NSRect originalFrame = NSMakeRect(NSMinX(mainFrame), NSMinY(mainFrame) - mfc->taskbarHideHeight,
+		                                  NSWidth(mainFrame),
+		                                  NSHeight(mainFrame) + mfc->taskbarHideHeight);
+		NSScreen *screen = mac_preferred_screen(window);
+		if (!screen)
+			screen = [NSScreen mainScreen];
+		NSDictionary *slice = @{
+			@"screen" : screen,
+			@"frame" : [NSValue valueWithRect:originalFrame],
+			@"source" : [NSValue valueWithRect:NSMakeRect(0, 0, desktopWidth, desktopHeight)]
+		};
+		slices = [NSArray arrayWithObject:slice];
+	}
+
+	if (!taskbarWindows)
+		taskbarWindows = [[NSMutableArray alloc] init];
+	if (!taskbarSliceViews)
+		taskbarSliceViews = [[NSMutableArray alloc] init];
+
+	while ([taskbarWindows count] > [slices count])
+	{
+		NSWindow *oldWindow = [taskbarWindows lastObject];
+		[oldWindow orderOut:self];
+		[oldWindow setDelegate:nil];
+		[taskbarWindows removeLastObject];
+		[taskbarSliceViews removeLastObject];
+	}
+
+	NSString *baseTitle = [window title] ?: @"MacFreeRDP";
+	NSPoint mouse = [NSEvent mouseLocation];
+	for (NSUInteger i = 0; i < [slices count]; i++)
+	{
+		NSDictionary *slice = [slices objectAtIndex:i];
+		NSRect frame = [[slice objectForKey:@"frame"] rectValue];
+		NSRect source = [[slice objectForKey:@"source"] rectValue];
+		const CGFloat taskbarHeight = MIN((CGFloat)mfc->taskbarHideHeight, NSHeight(source) - 1.0);
+
+		if (taskbarHeight <= 0.0)
+			continue;
+
+		NSRect taskbarFrame = NSMakeRect(NSMinX(frame), NSMinY(frame), NSWidth(frame), taskbarHeight);
+		NSRect taskbarSource = NSMakeRect(NSMinX(source), NSMaxY(source) - taskbarHeight,
+		                                  NSWidth(source), taskbarHeight);
+		NSWindow *taskbarWindow = nil;
+		MRDPMonitorSliceView *sliceView = nil;
+
+		if (i < [taskbarWindows count])
+		{
+			taskbarWindow = [taskbarWindows objectAtIndex:i];
+			sliceView = [taskbarSliceViews objectAtIndex:i];
+			[sliceView setSourceRect:taskbarSource];
+		}
+		else
+		{
+			sliceView = [[[MRDPMonitorSliceView alloc] initWithPrimaryView:mrdpView
+			                                                    sourceRect:taskbarSource] autorelease];
+			taskbarWindow = [[[MRDPClientWindow alloc] initWithContentRect:taskbarFrame
+			                                                     styleMask:NSWindowStyleMaskBorderless
+			                                                       backing:NSBackingStoreBuffered
+			                                                         defer:NO] autorelease];
+			[taskbarWindow setAcceptsMouseMovedEvents:YES];
+			[taskbarWindow setDelegate:self];
+			[taskbarWindow setContentView:sliceView];
+			[taskbarWindow setInitialFirstResponder:sliceView];
+			[taskbarWindow setReleasedWhenClosed:NO];
+			[taskbarWindow setOpaque:NO];
+			[taskbarWindow setBackgroundColor:[NSColor clearColor]];
+			[taskbarWindow setHasShadow:NO];
+			[taskbarWindow setLevel:(NSWindowLevel)(CGWindowLevelForKey(kCGDockWindowLevelKey) - 1)];
+			[taskbarWindows addObject:taskbarWindow];
+			[taskbarSliceViews addObject:sliceView];
+		}
+
+		[taskbarWindow setStyleMask:NSWindowStyleMaskBorderless];
+		[taskbarWindow setLevel:(NSWindowLevel)(CGWindowLevelForKey(kCGDockWindowLevelKey) - 1)];
+		[taskbarWindow setMovable:NO];
+		[taskbarWindow setTitleVisibility:NSWindowTitleHidden];
+		[taskbarWindow setTitlebarAppearsTransparent:YES];
+		[taskbarWindow setTitle:[NSString stringWithFormat:@"%@ Taskbar [%lu]", baseTitle,
+		                                                    (unsigned long)(i + 1)]];
+		[taskbarWindow setFrame:taskbarFrame display:YES];
+
+		const BOOL mouseInsideTaskbar = NSPointInRect(mouse, taskbarFrame);
+		const BOOL shouldReveal =
+		    mouseInsideTaskbar || (![taskbarWindow isVisible] &&
+		                           mac_taskbar_mouse_should_reveal(mouse, taskbarFrame));
+		if (shouldReveal)
+		{
+			[taskbarWindow orderFront:self];
+			if (mouseInsideTaskbar)
+			{
+				BOOL valid = NO;
+				NSPoint remotePoint = [sliceView remotePointForScreenPoint:mouse valid:&valid];
+				if (valid && ![sliceView isRemotePointTransparent:remotePoint])
+				{
+					[NSApp activateIgnoringOtherApps:YES];
+					[taskbarWindow makeKeyAndOrderFront:self];
+					[taskbarWindow makeFirstResponder:sliceView];
+				}
+			}
+		}
+		else
+		{
+			[taskbarWindow orderOut:self];
+		}
+	}
+}
+
+- (void)closeTaskbarHideWindows
+{
+	if (taskbarWindows)
+	{
+		for (NSWindow *taskbarWindow in taskbarWindows)
+		{
+			[taskbarWindow orderOut:self];
+			[taskbarWindow setDelegate:nil];
+		}
+		[taskbarWindows removeAllObjects];
+	}
+
+	if (taskbarSliceViews)
+		[taskbarSliceViews removeAllObjects];
+}
+
+- (void)startTaskbarHideMonitor
+{
+	if (taskbarHideTimer)
+		return;
+
+	taskbarHideTimer = [NSTimer scheduledTimerWithTimeInterval:0.1
+	                                                    target:self
+	                                                  selector:@selector(taskbarHideTimerFired:)
+	                                                  userInfo:nil
+	                                                   repeats:YES];
+	[taskbarHideTimer setTolerance:0.03];
+}
+
+- (void)stopTaskbarHideMonitor
+{
+	if (!taskbarHideTimer)
+		return;
+
+	[taskbarHideTimer invalidate];
+	taskbarHideTimer = nil;
+}
+
+- (void)taskbarHideTimerFired:(NSTimer *)timer
+{
+	if (timer != taskbarHideTimer)
+		return;
+
+	[self syncTaskbarHideWindows];
 }
 
 - (void)configureApplicationIcon
@@ -3027,6 +3286,12 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		{
 			mfc->fullscreen_mode = 2;
 		}
+		else if (strcmp(context->argv[j], "/taskbar-hide") == 0 ||
+		         strcmp(context->argv[j], "-taskbar-hide") == 0 ||
+		         strcmp(context->argv[j], "--taskbar-hide") == 0)
+		{
+			mfc->taskbarHide = TRUE;
+		}
 		else
 		{
 			char *value = NULL;
@@ -3413,6 +3678,34 @@ static BOOL mac_screen_is_selected_for_settings(rdpSettings *settings, UINT32 sc
 static BOOL mac_multimon_enabled(rdpSettings *settings)
 {
 	return settings && freerdp_settings_get_bool(settings, FreeRDP_UseMultimon);
+}
+
+static BOOL mac_taskbar_hide_enabled(mfContext *mfc)
+{
+	if (!mfc || !mfc->common.context.settings || !mfc->taskbarHide)
+		return FALSE;
+
+	rdpSettings *settings = mfc->common.context.settings;
+	const BOOL multimon = freerdp_settings_get_bool(settings, FreeRDP_UseMultimon);
+	return !freerdp_settings_get_bool(settings, FreeRDP_Decorations) &&
+	       (multimon || !freerdp_settings_get_bool(settings, FreeRDP_Fullscreen)) &&
+	       (mfc->taskbarHideHeight > 0);
+}
+
+static BOOL mac_taskbar_mouse_should_reveal(NSPoint mouse, NSRect taskbarFrame)
+{
+	if (NSIsEmptyRect(taskbarFrame))
+		return FALSE;
+
+	const CGFloat edgeTolerance = 2.0;
+	const CGFloat horizontalPadding = 8.0;
+	const BOOL onBottomEdge =
+	    (mouse.y >= NSMinY(taskbarFrame)) && (mouse.y <= NSMinY(taskbarFrame) + edgeTolerance);
+	const BOOL withinSessionWidth =
+	    (mouse.x >= NSMinX(taskbarFrame) - horizontalPadding) &&
+	    (mouse.x <= NSMaxX(taskbarFrame) + horizontalPadding);
+
+	return onBottomEdge && withinSessionWidth;
 }
 
 static NSRect mac_safe_multimon_window_frame(NSScreen *screen, BOOL decorated)
