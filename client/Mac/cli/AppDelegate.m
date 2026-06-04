@@ -127,15 +127,18 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 	NSRect sourceRect;
 	id mousePassThroughMonitor;
 	NSTrackingArea *cursorTrackingArea;
+	mfContext *context;
 	BOOL mousePassThroughArmed;
 	BOOL allowMousePassThrough;
 	BOOL activateOnOpaqueMouseDown;
 	BOOL ignoreTransparentMouseEvents;
 	BOOL acceptFirstMouseEvent;
+	BOOL applySmartSizing;
 }
 
-- (id)initWithPrimaryView:(MRDPView *)view sourceRect:(NSRect)rect;
+- (id)initWithPrimaryView:(MRDPView *)view sourceRect:(NSRect)rect context:(mfContext *)mfc;
 - (void)setSourceRect:(NSRect)rect;
+- (void)setAppliesSmartSizing:(BOOL)apply;
 - (void)setAllowsMousePassThrough:(BOOL)allow;
 - (void)setActivatesOnOpaqueMouseDown:(BOOL)activate;
 - (void)setIgnoresTransparentMouseEvents:(BOOL)ignore;
@@ -149,7 +152,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 
 @implementation MRDPMonitorSliceView
 
-- (id)initWithPrimaryView:(MRDPView *)view sourceRect:(NSRect)rect
+- (id)initWithPrimaryView:(MRDPView *)view sourceRect:(NSRect)rect context:(mfContext *)mfc
 {
 	self = [super initWithFrame:NSMakeRect(0, 0, rect.size.width, rect.size.height)];
 	if (!self)
@@ -157,10 +160,12 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 
 	primaryView = view;
 	sourceRect = rect;
+	context = mfc;
 	allowMousePassThrough = YES;
 	activateOnOpaqueMouseDown = NO;
 	ignoreTransparentMouseEvents = NO;
 	acceptFirstMouseEvent = NO;
+	applySmartSizing = NO;
 	[self setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
 	cursorTrackingArea =
 	    [[NSTrackingArea alloc] initWithRect:NSZeroRect
@@ -198,6 +203,12 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 {
 	sourceRect = rect;
 	[self setFrameSize:rect.size];
+	[self setNeedsDisplay:YES];
+}
+
+- (void)setAppliesSmartSizing:(BOOL)apply
+{
+	applySmartSizing = apply;
 	[self setNeedsDisplay:YES];
 }
 
@@ -277,6 +288,70 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 	[self addCursorRect:[self visibleRect] cursor:[self remoteCursor]];
 }
 
+- (NSRect)displayRectForBounds:(NSRect)bounds
+{
+	if (!applySmartSizing || !context || !context->common.context.settings ||
+	    !freerdp_settings_get_bool(context->common.context.settings, FreeRDP_SmartSizing))
+		return bounds;
+
+	if ((sourceRect.size.width <= 0.0) || (sourceRect.size.height <= 0.0) ||
+	    (bounds.size.width <= 0.0) || (bounds.size.height <= 0.0))
+		return bounds;
+
+	const CGFloat sx = bounds.size.width / sourceRect.size.width;
+	const CGFloat sy = bounds.size.height / sourceRect.size.height;
+	const CGFloat scale = context->smart_sizing_overscan ? MAX(sx, sy) : MIN(sx, sy);
+	if (scale <= 0.0)
+		return bounds;
+
+	NSRect displayRect = NSZeroRect;
+	displayRect.size.width = sourceRect.size.width * scale;
+	displayRect.size.height = sourceRect.size.height * scale;
+	displayRect.origin.x = bounds.origin.x + (bounds.size.width - displayRect.size.width) / 2.0;
+	displayRect.origin.y = bounds.origin.y + (bounds.size.height - displayRect.size.height) / 2.0;
+
+	switch (context->smart_sizing_align)
+	{
+		case MF_SMART_SIZING_ALIGN_TOP:
+			displayRect.origin.y = NSMaxY(bounds) - displayRect.size.height;
+			break;
+		case MF_SMART_SIZING_ALIGN_BOTTOM:
+			displayRect.origin.y = NSMinY(bounds);
+			break;
+		case MF_SMART_SIZING_ALIGN_LEFT:
+			displayRect.origin.x = NSMinX(bounds);
+			break;
+		case MF_SMART_SIZING_ALIGN_RIGHT:
+			displayRect.origin.x = NSMaxX(bounds) - displayRect.size.width;
+			break;
+		default:
+			break;
+	}
+
+	if (context->smart_sizing_overscan)
+	{
+		switch (context->smart_sizing_overscan_align)
+		{
+			case MF_SMART_SIZING_ALIGN_TOP:
+				displayRect.origin.y = NSMinY(bounds);
+				break;
+			case MF_SMART_SIZING_ALIGN_BOTTOM:
+				displayRect.origin.y = NSMaxY(bounds) - displayRect.size.height;
+				break;
+			case MF_SMART_SIZING_ALIGN_LEFT:
+				displayRect.origin.x = NSMaxX(bounds) - displayRect.size.width;
+				break;
+			case MF_SMART_SIZING_ALIGN_RIGHT:
+				displayRect.origin.x = NSMinX(bounds);
+				break;
+			default:
+				break;
+		}
+	}
+
+	return displayRect;
+}
+
 - (void)cursorUpdate:(NSEvent *)event
 {
 	(void)event;
@@ -287,10 +362,13 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 {
 	NSPoint point = [self convertPoint:[event locationInWindow] fromView:nil];
 	NSRect bounds = [self bounds];
-	const CGFloat sx = (NSWidth(bounds) > 0) ? sourceRect.size.width / NSWidth(bounds) : 1.0;
-	const CGFloat sy = (NSHeight(bounds) > 0) ? sourceRect.size.height / NSHeight(bounds) : 1.0;
-	point.x = sourceRect.origin.x + point.x * sx;
-	point.y = sourceRect.origin.y + point.y * sy;
+	NSRect displayRect = [self displayRectForBounds:bounds];
+	const CGFloat sx = (NSWidth(displayRect) > 0) ? sourceRect.size.width / NSWidth(displayRect) : 1.0;
+	const CGFloat sy = (NSHeight(displayRect) > 0) ? sourceRect.size.height / NSHeight(displayRect) : 1.0;
+	point.x = sourceRect.origin.x + (point.x - NSMinX(displayRect)) * sx;
+	point.y = sourceRect.origin.y + (point.y - NSMinY(displayRect)) * sy;
+	point.x = MIN(MAX(point.x, NSMinX(sourceRect)), NSMaxX(sourceRect) - 1.0);
+	point.y = MIN(MAX(point.y, NSMinY(sourceRect)), NSMaxY(sourceRect) - 1.0);
 	point.x = MIN(MAX(point.x, 0), UINT16_MAX);
 	point.y = MIN(MAX(point.y, 0), UINT16_MAX);
 	return point;
@@ -318,9 +396,19 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 
 	const CGFloat sx = (NSWidth(bounds) > 0) ? sourceRect.size.width / NSWidth(bounds) : 1.0;
 	const CGFloat sy = (NSHeight(bounds) > 0) ? sourceRect.size.height / NSHeight(bounds) : 1.0;
+	NSRect displayRect = [self displayRectForBounds:bounds];
+	const CGFloat smartSx =
+	    (NSWidth(displayRect) > 0) ? sourceRect.size.width / NSWidth(displayRect) : sx;
+	const CGFloat smartSy =
+	    (NSHeight(displayRect) > 0) ? sourceRect.size.height / NSHeight(displayRect) : sy;
 	if (valid)
 		*valid = YES;
-	return NSMakePoint(sourceRect.origin.x + point.x * sx, sourceRect.origin.y + point.y * sy);
+	NSPoint remotePoint =
+	    NSMakePoint(sourceRect.origin.x + (point.x - NSMinX(displayRect)) * smartSx,
+	                sourceRect.origin.y + (point.y - NSMinY(displayRect)) * smartSy);
+	remotePoint.x = MIN(MAX(remotePoint.x, NSMinX(sourceRect)), NSMaxX(sourceRect) - 1.0);
+	remotePoint.y = MIN(MAX(remotePoint.y, NSMinY(sourceRect)), NSMaxY(sourceRect) - 1.0);
+	return remotePoint;
 }
 
 - (BOOL)isRemotePointTransparent:(NSPoint)remotePoint
@@ -491,9 +579,14 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 	NSRect bounds = [self bounds];
 	CGContextSaveGState(cgContext);
 	CGContextClearRect(cgContext, bounds);
+	CGContextClipToRect(cgContext, bounds);
 	CGContextTranslateCTM(cgContext, 0, NSHeight(bounds));
 	CGContextScaleCTM(cgContext, 1.0, -1.0);
-	CGContextDrawImage(cgContext, CGRectMake(0, 0, NSWidth(bounds), NSHeight(bounds)), slice);
+	NSRect displayRect = [self displayRectForBounds:bounds];
+	CGContextDrawImage(cgContext,
+	                   CGRectMake(NSMinX(displayRect), NSMinY(displayRect),
+	                              NSWidth(displayRect), NSHeight(displayRect)),
+	                   slice);
 	CGContextRestoreGState(cgContext);
 	CGImageRelease(slice);
 }
@@ -1549,7 +1642,8 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	if (!primaryMonitorSliceView)
 	{
 		primaryMonitorSliceView = [[MRDPMonitorSliceView alloc] initWithPrimaryView:mrdpView
-		                                                                sourceRect:primarySource];
+		                                                                sourceRect:primarySource
+		                                                                   context:mfc];
 		primaryMonitorSliceView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
 		[[window contentView] addSubview:primaryMonitorSliceView positioned:NSWindowAbove
 		                  relativeTo:mrdpView];
@@ -1558,7 +1652,12 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	{
 		[primaryMonitorSliceView setSourceRect:primarySource];
 	}
-	primaryMonitorSliceView.frame = [[window contentView] bounds];
+	[primaryMonitorSliceView setAppliesSmartSizing:taskbarHide];
+	NSRect primarySliceFrame = [[window contentView] bounds];
+	if (taskbarSize > 0.0 && extendedCanvas)
+		primarySliceFrame = mac_taskbar_visible_frame(primarySliceFrame, taskbarPosition,
+		                                               taskbarSize);
+	primaryMonitorSliceView.frame = primarySliceFrame;
 	[window setInitialFirstResponder:primaryMonitorSliceView];
 	[window makeFirstResponder:primaryMonitorSliceView];
 	[mrdpView setHidden:YES];
@@ -1608,7 +1707,8 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		else
 		{
 			sliceView = [[[MRDPMonitorSliceView alloc] initWithPrimaryView:mrdpView
-			                                                    sourceRect:source] autorelease];
+			                                                    sourceRect:source
+			                                                       context:mfc] autorelease];
 			monitorWindow = [[[MRDPClientWindow alloc] initWithContentRect:frame
 			                                                     styleMask:styleMask
 			                                                       backing:NSBackingStoreBuffered
@@ -1624,6 +1724,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 			[monitorSliceViews addObject:sliceView];
 		}
 
+		[sliceView setAppliesSmartSizing:taskbarHide];
 		[monitorWindow setStyleMask:styleMask];
 		[monitorWindow setMovable:decorated];
 		[monitorWindow setTitleVisibility:decorated ? NSWindowTitleVisible : NSWindowTitleHidden];
@@ -1739,7 +1840,8 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		else
 		{
 			sliceView = [[[MRDPMonitorSliceView alloc] initWithPrimaryView:mrdpView
-			                                                    sourceRect:taskbarSource] autorelease];
+			                                                    sourceRect:taskbarSource
+			                                                       context:mfc] autorelease];
 			taskbarWindow = [[[MRDPClientWindow alloc] initWithContentRect:taskbarFrame
 			                                                     styleMask:NSWindowStyleMaskBorderless
 			                                                       backing:NSBackingStoreBuffered
@@ -1765,6 +1867,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		[taskbarWindow setTitle:[NSString stringWithFormat:@"%@ Taskbar [%lu]", baseTitle,
 		                                                    (unsigned long)(i + 1)]];
 		[taskbarWindow setFrame:taskbarFrame display:YES];
+		[sliceView setAppliesSmartSizing:NO];
 		[sliceView setAllowsMousePassThrough:NO];
 		[sliceView setActivatesOnOpaqueMouseDown:YES];
 		[sliceView setIgnoresTransparentMouseEvents:YES];
