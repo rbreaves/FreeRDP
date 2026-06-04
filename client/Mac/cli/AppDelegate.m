@@ -84,6 +84,7 @@ static NSString *const MRDPWindowShadowsEnabledKey = @"MRDPWindowShadowsEnabled"
 static NSString *const MRDPWindowDragTitlebarHeightKey = @"MRDPWindowDragTitlebarHeight";
 static NSString *const MRDPModifierKeyswapModeKey = @"MRDPModifierKeyswapMode";
 static NSString *const MRDPModifierKeyswapFilterKey = @"MRDPModifierKeyswapFilter";
+static NSString *const MRDPTaskbarHideZOrderPIDsKey = @"MRDPTaskbarHideZOrderPIDs";
 static NSString *const MRDPStatusSessionDidUpdateNotification = @"org.freerdp.mac.statusSessionDidUpdate";
 static NSString *const MRDPStatusSessionWillTerminateNotification = @"org.freerdp.mac.statusSessionWillTerminate";
 static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusCommand";
@@ -1081,6 +1082,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 - (void)updateWindowDragTitlebarHeightPreviewFromSlider:(id)sender;
 - (void)showSpacerSettingsFromMenuItem:(id)sender;
 - (void)setTaskbarPositionFromMenuItem:(NSMenuItem *)menuItem;
+- (void)adjustTaskbarZOrderFromMenuItem:(NSMenuItem *)menuItem;
 - (void)showTaskbarSettingsFromMenuItem:(id)sender;
 - (void)updateSpacerWindow;
 - (void)showSpacerWindow;
@@ -1104,6 +1106,12 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 - (void)savePreferredScreenToDefaults;
 - (void)loadChromaKeySettingsFromDefaults;
 - (void)loadTaskbarSettingsFromDefaults;
+- (NSArray *)taskbarHideSessionPIDs;
+- (NSArray *)normalizedTaskbarHideZOrderPIDs;
+- (NSInteger)taskbarHideZOrderForPID:(NSNumber *)pid;
+- (void)saveTaskbarHideZOrderPIDs:(NSArray *)orderedPIDs;
+- (void)moveTaskbarHideSession:(NSDictionary *)session byDelta:(NSInteger)delta;
+- (BOOL)canMoveTaskbarHideSession:(NSDictionary *)session byDelta:(NSInteger)delta;
 - (NSString *)sessionMenuTitle;
 - (NSArray *)runningMacFreeRDPApplications;
 @end
@@ -1416,6 +1424,10 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 {
 	NSLog(@"Stopping...\n");
 	[self savePreferredScreenToDefaults];
+	NSMutableArray *orderedTaskbarPIDs = [[self normalizedTaskbarHideZOrderPIDs] mutableCopy];
+	[orderedTaskbarPIDs removeObject:[self localStatusSessionPID]];
+	[self saveTaskbarHideZOrderPIDs:orderedTaskbarPIDs];
+	[orderedTaskbarPIDs release];
 	[self broadcastStatusSessionWillTerminate];
 	[self stopStatusCoordination];
 	[self stopTaskbarHideMonitor];
@@ -1797,6 +1809,10 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	NSString *baseTitle = [window title] ?: @"MacFreeRDP";
 	NSPoint mouse = [NSEvent mouseLocation];
 	const UINT32 taskbarPosition = mfc->taskbarHidePosition;
+	const NSInteger taskbarZOrder = [self taskbarHideZOrderForPID:[self localStatusSessionPID]];
+	const NSWindowLevel taskbarWindowLevel =
+	    (NSWindowLevel)(CGWindowLevelForKey(kCGDockWindowLevelKey) - 1 - taskbarZOrder);
+	mfc->taskbarHideZOrder = (int)taskbarZOrder;
 	for (NSUInteger i = 0; i < [slices count]; i++)
 	{
 		NSDictionary *slice = [slices objectAtIndex:i];
@@ -1854,13 +1870,13 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 			[taskbarWindow setOpaque:NO];
 			[taskbarWindow setBackgroundColor:[NSColor clearColor]];
 			[taskbarWindow setHasShadow:NO];
-			[taskbarWindow setLevel:(NSWindowLevel)(CGWindowLevelForKey(kCGDockWindowLevelKey) - 1)];
+			[taskbarWindow setLevel:taskbarWindowLevel];
 			[taskbarWindows addObject:taskbarWindow];
 			[taskbarSliceViews addObject:sliceView];
 		}
 
 		[taskbarWindow setStyleMask:NSWindowStyleMaskBorderless];
-		[taskbarWindow setLevel:(NSWindowLevel)(CGWindowLevelForKey(kCGDockWindowLevelKey) - 1)];
+		[taskbarWindow setLevel:taskbarWindowLevel];
 		[taskbarWindow setMovable:NO];
 		[taskbarWindow setTitleVisibility:NSWindowTitleHidden];
 		[taskbarWindow setTitlebarAppearsTransparent:YES];
@@ -2187,15 +2203,23 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 
 	[statusSessions setObject:info forKey:pid];
 	[self reevaluateStatusItemOwnership];
+	[self syncTaskbarHideWindows];
 }
 
 - (void)handleStatusSessionWillTerminate:(NSNotification *)notification
 {
 	NSNumber *pid = [[notification userInfo] objectForKey:@"pid"];
 	if (pid)
+	{
 		[statusSessions removeObjectForKey:pid];
+		NSMutableArray *ordered = [[self normalizedTaskbarHideZOrderPIDs] mutableCopy];
+		[ordered removeObject:pid];
+		[self saveTaskbarHideZOrderPIDs:ordered];
+		[ordered release];
+	}
 
 	[self reevaluateStatusItemOwnership];
+	[self syncTaskbarHideWindows];
 }
 
 - (void)handleStatusCommand:(NSNotification *)notification
@@ -2231,6 +2255,31 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	else if ([command isEqualToString:@"spacerSettings"])
 	{
 		[self showSpacerSettingsFromMenuItem:nil];
+	}
+	else if ([command isEqualToString:@"taskbarHidePosition"])
+	{
+		NSNumber *position = [info objectForKey:@"value"];
+		mfContext *mfc = (mfContext *)context;
+		if (!position || !mfc)
+			return;
+
+		mfc->taskbarHidePosition = (UINT32)MIN(MAX([position integerValue], 0), 3);
+		NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+		[defaults setInteger:(NSInteger)mfc->taskbarHidePosition forKey:@"MRDPTaskbarHidePosition"];
+		[defaults synchronize];
+
+		[self syncTaskbarHideWindows];
+		[self broadcastStatusSessionUpdate];
+	}
+	else if ([command isEqualToString:@"taskbarSettings"])
+	{
+		[self showTaskbarSettingsFromMenuItem:nil];
+	}
+	else if ([command isEqualToString:@"taskbarZOrder"])
+	{
+		NSNumber *delta = [info objectForKey:@"value"];
+		if (delta)
+			[self moveTaskbarHideSession:[self statusSessionInfo] byDelta:[delta integerValue]];
 	}
 	else if ([command isEqualToString:@"chroma"])
 	{
@@ -2330,6 +2379,8 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	                         @(mfc ? mfc->spacerPosition : 0), @"spacerPosition",
 	                         @(mfc ? mfc->spacerEnabled : NO), @"spacerEnabled",
 	                         @(mfc ? mfc->taskbarHidePosition : 1), @"taskbarHidePosition",
+	                         @([self taskbarHideZOrderForPID:[self localStatusSessionPID]]),
+	                         @"taskbarHideZOrder",
 	                         @(mfc ? mfc->taskbarHide : NO), @"taskbarHide",
 	                         nil];
 }
@@ -2596,6 +2647,39 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	}
 
 	[taskbarHideMenu addItem:[NSMenuItem separatorItem]];
+
+	const BOOL showTaskbarZOrderControls = ([[self taskbarHideSessionPIDs] count] > 1);
+	if (showTaskbarZOrderControls && taskbarHide)
+	{
+		NSMenuItem *increaseZOrderItem =
+		    [[[NSMenuItem alloc] initWithTitle:@"Increase Z-Order"
+		                                action:(localSession ? @selector(adjustTaskbarZOrderFromMenuItem:)
+		                                                      : @selector(remoteStatusCommandFromMenuItem:))
+		                         keyEquivalent:@""] autorelease];
+		[increaseZOrderItem setTarget:self];
+		[increaseZOrderItem setTag:-1];
+		[increaseZOrderItem setEnabled:[self canMoveTaskbarHideSession:session byDelta:-1]];
+		if (!localSession)
+			[increaseZOrderItem setRepresentedObject:[NSDictionary dictionaryWithObjectsAndKeys:
+			                                                  session, @"session", @"taskbarZOrder",
+			                                                  @"command", @(-1), @"value", nil]];
+		[taskbarHideMenu addItem:increaseZOrderItem];
+
+		NSMenuItem *decreaseZOrderItem =
+		    [[[NSMenuItem alloc] initWithTitle:@"Decrease Z-Order"
+		                                action:(localSession ? @selector(adjustTaskbarZOrderFromMenuItem:)
+		                                                      : @selector(remoteStatusCommandFromMenuItem:))
+		                         keyEquivalent:@""] autorelease];
+		[decreaseZOrderItem setTarget:self];
+		[decreaseZOrderItem setTag:1];
+		[decreaseZOrderItem setEnabled:[self canMoveTaskbarHideSession:session byDelta:1]];
+		if (!localSession)
+			[decreaseZOrderItem setRepresentedObject:[NSDictionary dictionaryWithObjectsAndKeys:
+			                                                  session, @"session", @"taskbarZOrder",
+			                                                  @"command", @(1), @"value", nil]];
+		[taskbarHideMenu addItem:decreaseZOrderItem];
+		[taskbarHideMenu addItem:[NSMenuItem separatorItem]];
+	}
 
 	NSMenuItem *taskbarSettingsItem =
 	    [[[NSMenuItem alloc] initWithTitle:@"Settings"
@@ -3112,6 +3196,11 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	[self broadcastStatusSessionUpdate];
 }
 
+- (void)adjustTaskbarZOrderFromMenuItem:(NSMenuItem *)menuItem
+{
+	[self moveTaskbarHideSession:[self statusSessionInfo] byDelta:[menuItem tag]];
+}
+
 - (void)showTaskbarSettingsFromMenuItem:(id)sender
 {
 	(void)sender;
@@ -3388,6 +3477,121 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	}
 
 	return applications;
+}
+
+- (NSArray *)taskbarHideSessionPIDs
+{
+	NSMutableArray *pids = [NSMutableArray array];
+	NSArray *sessions = statusSessions ? [statusSessions allValues] : [NSArray array];
+
+	for (NSDictionary *session in sessions)
+	{
+		if (![[session objectForKey:@"taskbarHide"] boolValue])
+			continue;
+
+		NSNumber *pid = [session objectForKey:@"pid"];
+		if (pid && ![pids containsObject:pid])
+			[pids addObject:pid];
+	}
+
+	return [pids sortedArrayUsingSelector:@selector(compare:)];
+}
+
+- (NSArray *)normalizedTaskbarHideZOrderPIDs
+{
+	NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+	NSArray *stored = [defaults arrayForKey:MRDPTaskbarHideZOrderPIDsKey];
+	NSMutableArray *ordered = [NSMutableArray array];
+	NSMutableSet *runningPIDs = [NSMutableSet set];
+
+	for (NSRunningApplication *application in [self runningMacFreeRDPApplications])
+		[runningPIDs addObject:[NSNumber numberWithInt:[application processIdentifier]]];
+	[runningPIDs addObject:[self localStatusSessionPID]];
+
+	for (NSNumber *pid in stored)
+	{
+		if (![pid isKindOfClass:[NSNumber class]])
+			continue;
+		if (![runningPIDs containsObject:pid])
+			continue;
+		if (![ordered containsObject:pid])
+			[ordered addObject:pid];
+	}
+
+	for (NSNumber *pid in [self taskbarHideSessionPIDs])
+	{
+		if (![ordered containsObject:pid])
+			[ordered addObject:pid];
+	}
+
+	if (![stored isEqualToArray:ordered])
+		[self saveTaskbarHideZOrderPIDs:ordered];
+
+	return ordered;
+}
+
+- (NSInteger)taskbarHideZOrderForPID:(NSNumber *)pid
+{
+	if (!pid)
+		return 0;
+
+	NSArray *ordered = [self normalizedTaskbarHideZOrderPIDs];
+	NSUInteger index = [ordered indexOfObject:pid];
+	if (index == NSNotFound)
+		return 0;
+
+	return (NSInteger)index;
+}
+
+- (void)saveTaskbarHideZOrderPIDs:(NSArray *)orderedPIDs
+{
+	NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+	[defaults setObject:orderedPIDs forKey:MRDPTaskbarHideZOrderPIDsKey];
+	[defaults synchronize];
+}
+
+- (void)moveTaskbarHideSession:(NSDictionary *)session byDelta:(NSInteger)delta
+{
+	NSNumber *pid = [session objectForKey:@"pid"];
+	if (!pid || delta == 0)
+		return;
+
+	NSMutableArray *ordered = [[self normalizedTaskbarHideZOrderPIDs] mutableCopy];
+	NSUInteger index = [ordered indexOfObject:pid];
+	if (index == NSNotFound)
+	{
+		[ordered release];
+		return;
+	}
+
+	const NSInteger targetIndex = (NSInteger)index + delta;
+	if (targetIndex < 0 || targetIndex >= (NSInteger)[ordered count])
+	{
+		[ordered release];
+		return;
+	}
+
+	[ordered exchangeObjectAtIndex:index withObjectAtIndex:(NSUInteger)targetIndex];
+	[self saveTaskbarHideZOrderPIDs:ordered];
+	[ordered release];
+
+	[self syncTaskbarHideWindows];
+	[self broadcastStatusSessionUpdate];
+}
+
+- (BOOL)canMoveTaskbarHideSession:(NSDictionary *)session byDelta:(NSInteger)delta
+{
+	NSNumber *pid = [session objectForKey:@"pid"];
+	if (!pid)
+		return NO;
+
+	NSArray *ordered = [self normalizedTaskbarHideZOrderPIDs];
+	NSUInteger index = [ordered indexOfObject:pid];
+	if (index == NSNotFound)
+		return NO;
+
+	const NSInteger targetIndex = (NSInteger)index + delta;
+	return targetIndex >= 0 && targetIndex < (NSInteger)[ordered count];
 }
 
 - (void)loadPreferredScreenFromDefaults
