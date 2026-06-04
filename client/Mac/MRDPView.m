@@ -72,6 +72,7 @@ static BOOL mac_desktop_resize(rdpContext *context);
 static void input_activity_cb(freerdp *instance);
 
 static DWORD WINAPI mac_client_thread(void *param);
+static BOOL mac_scroll_flags_from_deltas(CGFloat dx, CGFloat dy, UINT16 *outFlags);
 static void windows_to_apple_cords(MRDPView *view, NSRect *r);
 static CGContextRef mac_create_bitmap_context(rdpContext *context);
 static BOOL mac_is_chroma_key_pixel(const mfContext *mfc, uint32_t pixel);
@@ -1902,51 +1903,19 @@ DWORD WINAPI mac_client_thread(void *param)
 
 - (void)scrollWheel:(NSEvent *)event
 {
-	UINT16 flags;
 	[super scrollWheel:event];
 
 	if (!self.is_connected)
 		return;
 
-	float dx = [event deltaX];
-	float dy = [event deltaY];
-	/* 1 event = 120 units */
-	UINT16 units = 0;
-
-	if (fabsf(dy) > FLT_EPSILON)
-	{
-		flags = PTR_FLAGS_WHEEL;
-		units = fabsf(dy) * 120;
-
-		if (dy < 0)
-			flags |= PTR_FLAGS_WHEEL_NEGATIVE;
-	}
-	else if (fabsf(dx) > FLT_EPSILON)
-	{
-		flags = PTR_FLAGS_HWHEEL;
-		units = fabsf(dx) * 120;
-
-		if (dx > 0)
-			flags |= PTR_FLAGS_WHEEL_NEGATIVE;
-	}
-	else
+	const CGFloat dx = [event hasPreciseScrollingDeltas] ? [event scrollingDeltaX] : [event deltaX];
+	const CGFloat dy = [event hasPreciseScrollingDeltas] ? [event scrollingDeltaY] : [event deltaY];
+	UINT16 flags = 0;
+	if (!mac_scroll_flags_from_deltas(dx, dy, &flags))
 		return;
 
-	/* Wheel rotation steps:
-	 *
-	 * positive: 0 ... 0xFF  -> slow ... fast
-	 * negative: 0 ... 0xFF  -> fast ... slow
-	 */
-	UINT16 step = units;
-	if (step > 0xFF)
-		step = 0xFF;
-
-	/* Negative rotation, so count down steps from top
-	 * 9bit twos complement */
-	if (flags & PTR_FLAGS_WHEEL_NEGATIVE)
-		step = 0x100 - step;
-
-	mf_scale_mouse_event(context, flags | step, 0, 0);
+	NSPoint windowLoc = [event locationInWindow];
+	mf_scale_mouse_event(context, flags, (UINT16)windowLoc.x, (UINT16)windowLoc.y);
 }
 
 - (void)mouseDragged:(NSEvent *)event
@@ -3056,6 +3025,15 @@ static BOOL mac_has_chroma_key_margin(const mfContext *mfc, const rdpGdi *gdi, i
 	freerdp_client_send_button_event(&mfc->common, FALSE, flags, x, y);
 }
 
+- (void)sendRemoteScrollWithDeltaX:(CGFloat)dx deltaY:(CGFloat)dy x:(UINT16)x y:(UINT16)y
+{
+	UINT16 flags = 0;
+	if (!mac_scroll_flags_from_deltas(dx, dy, &flags))
+		return;
+
+	[self sendRemoteMouseEventWithFlags:flags x:x y:y];
+}
+
 - (void)sendRemoteMouseButton:(int)button x:(UINT16)x y:(UINT16)y down:(BOOL)down
 {
 	UINT16 flags = down ? PTR_FLAGS_DOWN : 0;
@@ -4031,6 +4009,42 @@ BOOL mac_desktop_resize(rdpContext *context)
 	e.height = freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
 	if (PubSub_OnResizeWindow(context->pubSub, context, &e) < 0)
 		return FALSE;
+	return TRUE;
+}
+
+static BOOL mac_scroll_flags_from_deltas(CGFloat dx, CGFloat dy, UINT16 *outFlags)
+{
+	UINT16 flags = 0;
+	CGFloat units = 0.0;
+
+	if (fabs(dy) > FLT_EPSILON)
+	{
+		flags = PTR_FLAGS_WHEEL;
+		units = fabs(dy) * 120.0;
+
+		if (dy < 0)
+			flags |= PTR_FLAGS_WHEEL_NEGATIVE;
+	}
+	else if (fabs(dx) > FLT_EPSILON)
+	{
+		flags = PTR_FLAGS_HWHEEL;
+		units = fabs(dx) * 120.0;
+
+		if (dx > 0)
+			flags |= PTR_FLAGS_WHEEL_NEGATIVE;
+	}
+	else
+		return FALSE;
+
+	UINT16 step = (UINT16)MIN(units, 0xFF);
+	if (step == 0)
+		step = 1;
+
+	if (flags & PTR_FLAGS_WHEEL_NEGATIVE)
+		step = 0x100 - step;
+
+	if (outFlags)
+		*outFlags = flags | step;
 	return TRUE;
 }
 

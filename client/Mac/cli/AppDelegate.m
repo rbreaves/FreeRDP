@@ -447,6 +447,17 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 	[self sendButton:(int)[event buttonNumber] event:event down:NO];
 }
 
+- (void)scrollWheel:(NSEvent *)event
+{
+	NSPoint point = [self remotePointForEvent:event];
+	const CGFloat dx = [event hasPreciseScrollingDeltas] ? [event scrollingDeltaX] : [event deltaX];
+	const CGFloat dy = [event hasPreciseScrollingDeltas] ? [event scrollingDeltaY] : [event deltaY];
+	[primaryView sendRemoteScrollWithDeltaX:dx
+	                                 deltaY:dy
+	                                      x:(UINT16)point.x
+	                                      y:(UINT16)point.y];
+}
+
 - (void)keyDown:(NSEvent *)event
 {
 	[primaryView keyDown:event];

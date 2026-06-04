@@ -103,6 +103,7 @@
 - (BOOL)isRemotePixelTransparentAtX:(int)x y:(int)y;
 - (void)sendRemoteMouseEventWithFlags:(UINT16)flags x:(UINT16)x y:(UINT16)y;
 - (void)sendRemoteMouseButton:(int)button x:(UINT16)x y:(UINT16)y down:(BOOL)down;
+- (void)sendRemoteScrollWithDeltaX:(CGFloat)dx deltaY:(CGFloat)dy x:(UINT16)x y:(UINT16)y;
 
 @property(assign) int is_connected;
 
