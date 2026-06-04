@@ -980,7 +980,6 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
                          includeQuit:(BOOL)includeQuit;
 - (void)remoteStatusCommandFromMenuItem:(NSMenuItem *)menuItem;
 - (void)focusSessionFromMenuItem:(id)sender;
-- (void)refreshBitmapFromMenuItem:(id)sender;
 - (void)quitSessionFromMenuItem:(id)sender;
 - (void)quitAllFromMenuItem:(id)sender;
 - (void)setSpacerPositionFromMenuItem:(NSMenuItem *)menuItem;
@@ -2107,8 +2106,6 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 
 	if ([command isEqualToString:@"focus"])
 		[self focusClientWindow];
-	else if ([command isEqualToString:@"refresh"])
-		[self refreshBitmapFromMenuItem:nil];
 	else if ([command isEqualToString:@"screen"])
 	{
 		NSNumber *screenIndex = [info objectForKey:@"value"];
@@ -2405,17 +2402,6 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	if ([screens count] > 0)
 		[menu addItem:[NSMenuItem separatorItem]];
 
-	NSMenuItem *refreshItem =
-	    [[[NSMenuItem alloc] initWithTitle:@"Refresh Bitmap"
-	                                 action:(localSession ? @selector(refreshBitmapFromMenuItem:)
-	                                                       : @selector(remoteStatusCommandFromMenuItem:))
-	                          keyEquivalent:@""] autorelease];
-	[refreshItem setTarget:self];
-	if (!localSession)
-		[refreshItem setRepresentedObject:[NSDictionary dictionaryWithObjectsAndKeys:
-		                                                session, @"session", @"refresh", @"command", nil]];
-	[menu addItem:refreshItem];
-
 	mfContext *mfc = (mfContext *)context;
 	NSInteger spacerPosition = localSession ? (mfc ? (NSInteger)mfc->spacerPosition : 0)
 	                                       : [[session objectForKey:@"spacerPosition"] integerValue];
@@ -2565,13 +2551,6 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 {
 	(void)sender;
 	[self focusClientWindow];
-}
-
-- (void)refreshBitmapFromMenuItem:(id)sender
-{
-	(void)sender;
-	if (mrdpView)
-		[mrdpView refreshBitmap];
 }
 
 - (void)quitSessionFromMenuItem:(id)sender
