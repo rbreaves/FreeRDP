@@ -111,7 +111,7 @@
 BOOL mac_pre_connect(freerdp *instance);
 BOOL mac_post_connect(freerdp *instance);
 void mac_post_disconnect(freerdp *instance);
-FREERDP_API BOOL mac_apply_display_properties(rdpSettings *settings, BOOL useVisibleFrame);
+FREERDP_API BOOL mac_apply_display_properties(mfContext *mfc, BOOL useVisibleFrame);
 BOOL mac_authenticate_ex(freerdp *instance, char **username, char **password, char **domain,
                          rdp_auth_reason reason);
 

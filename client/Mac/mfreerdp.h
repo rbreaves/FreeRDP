@@ -139,6 +139,7 @@ typedef struct
 	UINT32 spacerSize;     // width for left/right, height for top/bottom (in pixels)
 	BOOL taskbarHide;
 	UINT32 taskbarHideHeight;
+	UINT32 taskbarHidePosition; // 0=top, 1=bottom, 2=left, 3=right (default: 1=bottom)
 } mfContext;
 
 #endif /* FREERDP_CLIENT_MAC_FREERDP_H */

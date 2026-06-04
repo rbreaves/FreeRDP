@@ -33,8 +33,16 @@ static void mac_position_window_top_left(NSWindow *window);
 static BOOL mac_screen_is_selected_for_settings(rdpSettings *settings, UINT32 screenIndex);
 static BOOL mac_multimon_content_rect(rdpSettings *settings, NSRect *rect);
 static BOOL mac_multimon_enabled(rdpSettings *settings);
-static NSArray *mac_multimon_slices(rdpSettings *settings);
+static NSArray *mac_multimon_slices(rdpSettings *settings, mfContext *mfc);
+static NSArray *mac_taskbar_single_monitor_slices(rdpSettings *settings, mfContext *mfc,
+                                                  NSWindow *window);
 static BOOL mac_taskbar_hide_enabled(mfContext *mfc);
+static BOOL mac_taskbar_uses_extended_canvas(mfContext *mfc);
+static CGFloat mac_taskbar_hide_size(mfContext *mfc, NSRect source);
+static NSRect mac_remote_frame_with_taskbar(NSRect frame, mfContext *mfc);
+static NSRect mac_taskbar_visible_frame(NSRect frame, UINT32 position, CGFloat size);
+static NSRect mac_taskbar_visible_source(NSRect source, UINT32 position, CGFloat size);
+static NSRect mac_taskbar_full_frame(NSRect frame, UINT32 position, CGFloat size);
 static BOOL mac_taskbar_mouse_should_reveal(NSPoint mouse, NSRect taskbarFrame);
 static NSRect mac_safe_multimon_window_frame(NSScreen *screen, BOOL decorated);
 static NSRect mac_constrain_window_frame_to_screen(NSRect frame, NSScreen *screen, BOOL decorated);
@@ -47,6 +55,7 @@ static NSImage *mac_render_image_for_size(NSImage *source, CGFloat pointSize, BO
 static NSImage *mac_create_freerdp_vector_icon(CGFloat pointSize, BOOL monochrome, BOOL templateImage);
 static BOOL mac_parse_smart_sizing_alignment(const char *value, MF_SMART_SIZING_ALIGN *alignment);
 static BOOL mac_parse_smart_sizing_options(const char *value, mfContext *mfc);
+static BOOL mac_parse_taskbar_hide_options(const char *value, mfContext *mfc);
 static NSInteger mac_screen_index_for_screen(NSScreen *screen);
 static NSScreen *mac_screen_for_index(NSInteger screenIndex);
 static NSString *mac_screen_identifier(NSScreen *screen);
@@ -55,7 +64,7 @@ static NSScreen *mac_preferred_screen(NSWindow *window);
 static NSString *mac_display_title(NSScreen *screen, NSInteger screenIndex);
 static DISPLAY_CONTROL_MONITOR_LAYOUT mac_display_layout_for_screen(NSScreen *screen,
 	                                                               BOOL useVisibleFrame,
-	                                                               rdpSettings *settings);
+	                                                               mfContext *mfc);
 static CGRect mac_ax_rect_for_screen_rect(NSScreen *screen, NSRect rect);
 static CGRect mac_spacer_rect_for_screen(NSScreen *screen, UINT32 position, UINT32 size);
 static CGRect mac_available_rect_for_spacer(NSScreen *screen, UINT32 position, UINT32 size);
@@ -791,6 +800,8 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 - (void)showModifierKeyswapFilterFromButton:(NSButton *)sender;
 - (void)updateWindowDragTitlebarHeightPreviewFromSlider:(id)sender;
 - (void)showSpacerSettingsFromMenuItem:(id)sender;
+- (void)setTaskbarPositionFromMenuItem:(NSMenuItem *)menuItem;
+- (void)showTaskbarSettingsFromMenuItem:(id)sender;
 - (void)updateSpacerWindow;
 - (void)showSpacerWindow;
 - (void)hideSpacerWindow;
@@ -812,6 +823,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 - (void)loadPreferredScreenFromDefaults;
 - (void)savePreferredScreenToDefaults;
 - (void)loadChromaKeySettingsFromDefaults;
+- (void)loadTaskbarSettingsFromDefaults;
 - (NSString *)sessionMenuTitle;
 - (NSArray *)runningMacFreeRDPApplications;
 @end
@@ -1010,6 +1022,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	[self CreateContext];
 	[self loadChromaKeySettingsFromDefaults];
 	[self loadSpacerSettingsFromDefaults];
+	[self loadTaskbarSettingsFromDefaults];
 	[self ensureClientWindow];
 	[self configureMainMenu];
 	[self configureApplicationIcon];
@@ -1053,7 +1066,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 
 		WINPR_ASSERT(settings);
 
-		if (!mac_apply_display_properties(settings, mfc->fullscreen_mode == 2))
+		if (!mac_apply_display_properties(mfc, mfc->fullscreen_mode == 2))
 		{
 			[NSApp terminate:self];
 			return;
@@ -1061,6 +1074,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 
 		if (!freerdp_settings_get_bool(settings, FreeRDP_UseMultimon) &&
 		    freerdp_settings_get_bool(settings, FreeRDP_Fullscreen) &&
+		    mfc->fullscreen_mode != 2 &&
 		    !freerdp_settings_get_bool(settings, FreeRDP_SmartSizing))
 		{
 			(void)freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth,
@@ -1274,7 +1288,9 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		return;
 	}
 
-	NSArray *slices = mac_multimon_enabled(context->settings) ? mac_multimon_slices(context->settings) : nil;
+	NSArray *slices = mac_multimon_enabled(context->settings)
+	                      ? mac_multimon_slices(context->settings, mfc)
+	                      : mac_taskbar_single_monitor_slices(context->settings, mfc, window);
 	if ([slices count] == 0)
 	{
 		const UINT32 desktopWidth =
@@ -1284,10 +1300,9 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		NSRect frame = [window frame];
 		if (taskbarHide && primaryMonitorSliceView)
 		{
-			const CGFloat taskbarHeight =
-			    MIN((CGFloat)mfc->taskbarHideHeight, (CGFloat)desktopHeight - 1.0);
-			frame.origin.y -= taskbarHeight;
-			frame.size.height += taskbarHeight;
+			NSRect source = NSMakeRect(0, 0, desktopWidth, desktopHeight);
+			const CGFloat taskbarSize = mac_taskbar_hide_size(mfc, source);
+			frame = mac_taskbar_full_frame(frame, mfc->taskbarHidePosition, taskbarSize);
 		}
 		NSScreen *screen = mac_preferred_screen(window);
 		if (!screen)
@@ -1319,13 +1334,14 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	NSDictionary *primarySlice = [slices objectAtIndex:0];
 	NSRect primarySource = [[primarySlice objectForKey:@"source"] rectValue];
 	NSRect primaryFrame = [[primarySlice objectForKey:@"frame"] rectValue];
-	const CGFloat taskbarHeight =
-	    taskbarHide ? MIN((CGFloat)mfc->taskbarHideHeight, NSHeight(primarySource) - 1.0) : 0.0;
-	if (taskbarHeight > 0.0)
+	const UINT32 taskbarPosition = taskbarHide ? mfc->taskbarHidePosition : UINT32_MAX;
+	const CGFloat taskbarSize = taskbarHide ? mac_taskbar_hide_size(mfc, primarySource) : 0.0;
+	const BOOL extendedCanvas = mac_taskbar_uses_extended_canvas(mfc);
+	if (taskbarSize > 0.0)
 	{
-		primarySource.size.height -= taskbarHeight;
-		primaryFrame.origin.y += taskbarHeight;
-		primaryFrame.size.height = MAX(1.0, primaryFrame.size.height - taskbarHeight);
+		primarySource = mac_taskbar_visible_source(primarySource, taskbarPosition, taskbarSize);
+		if (!extendedCanvas)
+			primaryFrame = mac_taskbar_visible_frame(primaryFrame, taskbarPosition, taskbarSize);
 		[window setFrame:primaryFrame display:YES];
 	}
 
@@ -1362,16 +1378,21 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	    decorated ? (NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
 	                 NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable)
 	              : NSWindowStyleMaskBorderless;
+	const CGFloat taskbarSizeSecondary = taskbarSize;
+	const UINT32 taskbarPositionSecondary = taskbarPosition;
+	const BOOL extendedCanvasSecondary = extendedCanvas;
 	for (NSUInteger i = 1; i < [slices count]; i++)
 	{
 		NSDictionary *slice = [slices objectAtIndex:i];
 		NSRect frame = [[slice objectForKey:@"frame"] rectValue];
 		NSRect source = [[slice objectForKey:@"source"] rectValue];
-		if (taskbarHeight > 0.0)
+		if (taskbarSizeSecondary > 0.0)
 		{
-			source.size.height -= taskbarHeight;
-			frame.origin.y += taskbarHeight;
-			frame.size.height = MAX(1.0, frame.size.height - taskbarHeight);
+			source = mac_taskbar_visible_source(source, taskbarPositionSecondary,
+			                                    taskbarSizeSecondary);
+			if (!extendedCanvasSecondary)
+				frame = mac_taskbar_visible_frame(frame, taskbarPositionSecondary,
+				                                  taskbarSizeSecondary);
 		}
 		NSUInteger sliceIndex = i - 1;
 		NSWindow *monitorWindow = nil;
@@ -1432,7 +1453,9 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		return;
 	}
 
-	NSArray *slices = mac_multimon_enabled(context->settings) ? mac_multimon_slices(context->settings) : nil;
+	NSArray *slices = mac_multimon_enabled(context->settings)
+	                      ? mac_multimon_slices(context->settings, mfc)
+	                      : mac_taskbar_single_monitor_slices(context->settings, mfc, window);
 	if ([slices count] == 0)
 	{
 		const UINT32 desktopWidth =
@@ -1440,16 +1463,17 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		const UINT32 desktopHeight =
 		    freerdp_settings_get_uint32(context->settings, FreeRDP_DesktopHeight);
 		NSRect mainFrame = [window frame];
-		NSRect originalFrame = NSMakeRect(NSMinX(mainFrame), NSMinY(mainFrame) - mfc->taskbarHideHeight,
-		                                  NSWidth(mainFrame),
-		                                  NSHeight(mainFrame) + mfc->taskbarHideHeight);
+		NSRect source = NSMakeRect(0, 0, desktopWidth, desktopHeight);
+		const CGFloat taskbarSize = mac_taskbar_hide_size(mfc, source);
+		NSRect originalFrame =
+		    mac_taskbar_full_frame(mainFrame, mfc->taskbarHidePosition, taskbarSize);
 		NSScreen *screen = mac_preferred_screen(window);
 		if (!screen)
 			screen = [NSScreen mainScreen];
 		NSDictionary *slice = @{
 			@"screen" : screen,
 			@"frame" : [NSValue valueWithRect:originalFrame],
-			@"source" : [NSValue valueWithRect:NSMakeRect(0, 0, desktopWidth, desktopHeight)]
+			@"source" : [NSValue valueWithRect:source]
 		};
 		slices = [NSArray arrayWithObject:slice];
 	}
@@ -1470,19 +1494,38 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 
 	NSString *baseTitle = [window title] ?: @"MacFreeRDP";
 	NSPoint mouse = [NSEvent mouseLocation];
+	const UINT32 taskbarPosition = mfc->taskbarHidePosition;
 	for (NSUInteger i = 0; i < [slices count]; i++)
 	{
 		NSDictionary *slice = [slices objectAtIndex:i];
 		NSRect frame = [[slice objectForKey:@"frame"] rectValue];
 		NSRect source = [[slice objectForKey:@"source"] rectValue];
-		const CGFloat taskbarHeight = MIN((CGFloat)mfc->taskbarHideHeight, NSHeight(source) - 1.0);
+		const CGFloat taskbarSize = mac_taskbar_hide_size(mfc, source);
 
-		if (taskbarHeight <= 0.0)
+		if (taskbarSize <= 0.0)
 			continue;
 
-		NSRect taskbarFrame = NSMakeRect(NSMinX(frame), NSMinY(frame), NSWidth(frame), taskbarHeight);
-		NSRect taskbarSource = NSMakeRect(NSMinX(source), NSMaxY(source) - taskbarHeight,
-		                                  NSWidth(source), taskbarHeight);
+		NSRect taskbarFrame, taskbarSource;
+		if (taskbarPosition == 0) // top
+		{
+			taskbarFrame = NSMakeRect(NSMinX(frame), NSMaxY(frame) - taskbarSize, NSWidth(frame), taskbarSize);
+			taskbarSource = NSMakeRect(NSMinX(source), NSMinY(source), NSWidth(source), taskbarSize);
+		}
+		else if (taskbarPosition == 1) // bottom
+		{
+			taskbarFrame = NSMakeRect(NSMinX(frame), NSMinY(frame), NSWidth(frame), taskbarSize);
+			taskbarSource = NSMakeRect(NSMinX(source), NSMaxY(source) - taskbarSize, NSWidth(source), taskbarSize);
+		}
+		else if (taskbarPosition == 2) // left
+		{
+			taskbarFrame = NSMakeRect(NSMinX(frame), NSMinY(frame), taskbarSize, NSHeight(frame));
+			taskbarSource = NSMakeRect(NSMinX(source), NSMinY(source), taskbarSize, NSHeight(source));
+		}
+		else // right (taskbarPosition == 3)
+		{
+			taskbarFrame = NSMakeRect(NSMaxX(frame) - taskbarSize, NSMinY(frame), taskbarSize, NSHeight(frame));
+			taskbarSource = NSMakeRect(NSMaxX(source) - taskbarSize, NSMinY(source), taskbarSize, NSHeight(source));
+		}
 		NSWindow *taskbarWindow = nil;
 		MRDPMonitorSliceView *sliceView = nil;
 
@@ -1989,6 +2032,8 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	                         @([self currentScreenIndex]), @"currentScreen",
 	                         @(mfc ? mfc->spacerPosition : 0), @"spacerPosition",
 	                         @(mfc ? mfc->spacerEnabled : NO), @"spacerEnabled",
+	                         @(mfc ? mfc->taskbarHidePosition : 1), @"taskbarHidePosition",
+	                         @(mfc ? mfc->taskbarHide : NO), @"taskbarHide",
 	                         nil];
 }
 
@@ -2090,24 +2135,29 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		    return [leftPID compare:rightPID];
 	    }];
 
-	if ([sessions count] > 1)
+	for (NSDictionary *session in sessions)
 	{
-		for (NSDictionary *session in sessions)
-		{
-			NSString *sessionTitle = [session objectForKey:@"title"] ?: @"Current Session";
-			NSMenuItem *sessionItem = [[[NSMenuItem alloc] initWithTitle:sessionTitle
-			                                                      action:nil
-			                                               keyEquivalent:@""] autorelease];
-			NSMenu *sessionMenu = [[[NSMenu alloc] initWithTitle:sessionTitle] autorelease];
-			[self appendSessionMenuItemsToMenu:sessionMenu forSession:session includeQuit:YES];
-			[sessionItem setSubmenu:sessionMenu];
-			[statusMenu addItem:sessionItem];
-		}
+		NSString *sessionTitle = [session objectForKey:@"title"] ?: @"Current Session";
+		NSMenuItem *sessionItem = [[[NSMenuItem alloc] initWithTitle:sessionTitle
+		                                                      action:nil
+		                                               keyEquivalent:@""] autorelease];
+		NSMenu *sessionMenu = [[[NSMenu alloc] initWithTitle:sessionTitle] autorelease];
+		[self appendSessionMenuItemsToMenu:sessionMenu forSession:session includeQuit:YES];
+		[sessionItem setSubmenu:sessionMenu];
+		[statusMenu addItem:sessionItem];
 	}
-	else
+
+	if ([sessions count] == 0)
 	{
-		NSDictionary *session = ([sessions count] > 0) ? [sessions objectAtIndex:0] : [self statusSessionInfo];
-		[self appendSessionMenuItemsToMenu:statusMenu forSession:session includeQuit:NO];
+		NSDictionary *session = [self statusSessionInfo];
+		NSString *sessionTitle = [session objectForKey:@"title"] ?: @"Current Session";
+		NSMenuItem *sessionItem = [[[NSMenuItem alloc] initWithTitle:sessionTitle
+		                                                      action:nil
+		                                               keyEquivalent:@""] autorelease];
+		NSMenu *sessionMenu = [[[NSMenu alloc] initWithTitle:sessionTitle] autorelease];
+		[self appendSessionMenuItemsToMenu:sessionMenu forSession:session includeQuit:NO];
+		[sessionItem setSubmenu:sessionMenu];
+		[statusMenu addItem:sessionItem];
 	}
 
 	[statusMenu addItem:[NSMenuItem separatorItem]];
@@ -2222,6 +2272,59 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 
 	[spacerPositionItem setSubmenu:spacerPositionMenu];
 	[menu addItem:spacerPositionItem];
+
+	NSInteger taskbarPosition = localSession ? (mfc ? (NSInteger)mfc->taskbarHidePosition : 1)
+	                                        : [[session objectForKey:@"taskbarHidePosition"] integerValue];
+	BOOL taskbarHide = localSession ? (mfc && mfc->taskbarHide)
+	                              : [[session objectForKey:@"taskbarHide"] boolValue];
+	NSMenuItem *taskbarHideItem = [[[NSMenuItem alloc] initWithTitle:@"Taskbar Position"
+	                                                           action:nil
+	                                                    keyEquivalent:@""] autorelease];
+	NSMenu *taskbarHideMenu = [[[NSMenu alloc] initWithTitle:@"Taskbar Position"] autorelease];
+	NSArray *taskbarPositionEntries = [NSArray arrayWithObjects:
+	    [NSDictionary dictionaryWithObjectsAndKeys:@"Top", @"title", @(0), @"tag", nil],
+	    [NSDictionary dictionaryWithObjectsAndKeys:@"Bottom", @"title", @(1), @"tag", nil],
+	    [NSDictionary dictionaryWithObjectsAndKeys:@"Left", @"title", @(2), @"tag", nil],
+	    [NSDictionary dictionaryWithObjectsAndKeys:@"Right", @"title", @(3), @"tag", nil],
+	    nil];
+
+	for (id entry in taskbarPositionEntries)
+	{
+		NSDictionary *definition = (NSDictionary *)entry;
+		NSString *title = [definition objectForKey:@"title"];
+		NSInteger tag = [[definition objectForKey:@"tag"] integerValue];
+		NSMenuItem *posItem = [[[NSMenuItem alloc] initWithTitle:title
+		                                                   action:(localSession ? @selector(setTaskbarPositionFromMenuItem:)
+		                                                                        : @selector(remoteStatusCommandFromMenuItem:))
+		                                            keyEquivalent:@""] autorelease];
+		[posItem setTarget:self];
+		[posItem setTag:tag];
+		if (!localSession)
+			[posItem setRepresentedObject:[NSDictionary dictionaryWithObjectsAndKeys:
+			                                          session, @"session", @"taskbarHidePosition", @"command",
+			                                          @(tag), @"value", nil]];
+		[posItem setState:(tag == taskbarPosition && taskbarHide)
+		                     ? NSControlStateValueOn
+		                     : NSControlStateValueOff];
+		[taskbarHideMenu addItem:posItem];
+	}
+
+	[taskbarHideMenu addItem:[NSMenuItem separatorItem]];
+
+	NSMenuItem *taskbarSettingsItem =
+	    [[[NSMenuItem alloc] initWithTitle:@"Settings"
+	                                action:(localSession ? @selector(showTaskbarSettingsFromMenuItem:)
+	                                                      : @selector(remoteStatusCommandFromMenuItem:))
+	                         keyEquivalent:@""] autorelease];
+	[taskbarSettingsItem setTarget:self];
+	if (!localSession)
+		[taskbarSettingsItem setRepresentedObject:[NSDictionary dictionaryWithObjectsAndKeys:
+		                                                   session, @"session", @"taskbarSettings",
+		                                                   @"command", nil]];
+	[taskbarHideMenu addItem:taskbarSettingsItem];
+
+	[taskbarHideItem setSubmenu:taskbarHideMenu];
+	[menu addItem:taskbarHideItem];
 
 	NSMenuItem *focusItem =
 	    [[[NSMenuItem alloc] initWithTitle:@"Focus Session"
@@ -2714,6 +2817,88 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	[alert release];
 }
 
+- (void)setTaskbarPositionFromMenuItem:(NSMenuItem *)menuItem
+{
+	if (!context)
+		return;
+
+	mfContext *mfc = (mfContext *)context;
+	mfc->taskbarHidePosition = (UINT32)[menuItem tag];
+
+	NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+	[defaults setInteger:(NSInteger)mfc->taskbarHidePosition forKey:@"MRDPTaskbarHidePosition"];
+	[defaults synchronize];
+
+	[self syncTaskbarHideWindows];
+	[self broadcastStatusSessionUpdate];
+}
+
+- (void)showTaskbarSettingsFromMenuItem:(id)sender
+{
+	(void)sender;
+	if (!context)
+		return;
+
+	mfContext *mfc = (mfContext *)context;
+
+	NSAlert *alert = [[NSAlert alloc] init];
+	[alert setMessageText:@"Taskbar Settings"];
+	[alert setInformativeText:@"Configure the taskbar area that is hidden when not interacting with it."];
+	[alert addButtonWithTitle:@"OK"];
+	[alert addButtonWithTitle:@"Cancel"];
+
+	NSView *accessoryView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 300, 80)];
+
+	NSTextField *sizeLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 50, 120, 20)];
+	[sizeLabel setStringValue:@"Height/Width (px):"];
+	[sizeLabel setEditable:NO];
+	[sizeLabel setBezeled:NO];
+	[sizeLabel setDrawsBackground:NO];
+	[accessoryView addSubview:sizeLabel];
+
+	NSTextField *sizeInput = [[NSTextField alloc] initWithFrame:NSMakeRect(125, 50, 60, 20)];
+	[sizeInput setStringValue:[NSString stringWithFormat:@"%u", mfc->taskbarHideHeight]];
+	[accessoryView addSubview:sizeInput];
+
+	NSTextField *posLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 25, 120, 20)];
+	[posLabel setStringValue:@"Position:"];
+	[posLabel setEditable:NO];
+	[posLabel setBezeled:NO];
+	[posLabel setDrawsBackground:NO];
+	[accessoryView addSubview:posLabel];
+
+	NSPopUpButton *posDropdown = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(125, 20, 100, 25)];
+	[posDropdown addItemsWithTitles:@[@"Top", @"Bottom", @"Left", @"Right"]];
+	[posDropdown selectItemAtIndex:mfc->taskbarHidePosition];
+	[accessoryView addSubview:posDropdown];
+
+	[alert setAccessoryView:accessoryView];
+
+	NSInteger result = [alert runModal];
+
+	if (result == NSAlertFirstButtonReturn)
+	{
+		NSInteger sizeVal = [sizeInput integerValue];
+		mfc->taskbarHideHeight = (sizeVal > 0 && sizeVal < 2048) ? (UINT32)sizeVal : 48;
+		mfc->taskbarHidePosition = (UINT32)[posDropdown indexOfSelectedItem];
+
+		NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+		[defaults setInteger:(NSInteger)mfc->taskbarHideHeight forKey:@"MRDPTaskbarHideHeight"];
+		[defaults setInteger:(NSInteger)mfc->taskbarHidePosition forKey:@"MRDPTaskbarHidePosition"];
+		[defaults synchronize];
+
+		[self syncTaskbarHideWindows];
+		[self broadcastStatusSessionUpdate];
+	}
+
+	[posDropdown release];
+	[posLabel release];
+	[sizeInput release];
+	[sizeLabel release];
+	[accessoryView release];
+	[alert release];
+}
+
 - (void)sendPasswordFromMenuItem:(id)sender
 {
 	(void)sender;
@@ -2804,6 +2989,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		frame.origin.x = NSMinX(visibleFrame);
 		frame.origin.y = NSMaxY(visibleFrame) - NSHeight(frame);
 		[window setFrame:frame display:YES];
+		[self syncMultimonWindows];
 		[self focusClientWindow];
 		[self broadcastStatusSessionUpdate];
 		return;
@@ -2822,6 +3008,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	if (fullscreen && mrdpView)
 		[mrdpView enterFullScreenMode:screen withOptions:nil];
 
+	[self syncMultimonWindows];
 	[self focusClientWindow];
 	[self broadcastStatusSessionUpdate];
 }
@@ -2851,7 +3038,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		return NO;
 
 	DISPLAY_CONTROL_MONITOR_LAYOUT layout =
-	    mac_display_layout_for_screen(screen, pseudoFullscreen, settings);
+	    mac_display_layout_for_screen(screen, pseudoFullscreen, mfc);
 
 	if (!freerdp_settings_set_uint32(settings, FreeRDP_DesktopWidth, layout.Width))
 		return NO;
@@ -2997,6 +3184,20 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	mfc->spacerSize = (spacerSizeVal > 0) ? (UINT32)spacerSizeVal : 50;
 
 	[self updateSpacerWindow];
+}
+
+- (void)loadTaskbarSettingsFromDefaults
+{
+	if (!context)
+		return;
+
+	mfContext *mfc = (mfContext *)context;
+	NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+
+	NSInteger taskbarHeightVal = [defaults integerForKey:@"MRDPTaskbarHideHeight"];
+	mfc->taskbarHideHeight = (taskbarHeightVal > 0 && taskbarHeightVal < 2048) ? (UINT32)taskbarHeightVal : 48;
+	NSInteger taskbarPos = [defaults integerForKey:@"MRDPTaskbarHidePosition"];
+	mfc->taskbarHidePosition = (taskbarPos >= 0 && taskbarPos <= 3) ? (UINT32)taskbarPos : 1;
 }
 
 - (void)updateSpacerWindow
@@ -3291,22 +3492,39 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		         strcmp(context->argv[j], "--taskbar-hide") == 0)
 		{
 			mfc->taskbarHide = TRUE;
+			mfc->taskbarHidePosition = 1; // default: bottom
 		}
 		else
 		{
 			char *value = NULL;
 
-			if (strncmp(context->argv[j], "/smart-sizing:", 14) == 0)
+			if (strncmp(context->argv[j], "/taskbar-hide:", 14) == 0)
 				value = context->argv[j] + 14;
-			else if (strncmp(context->argv[j], "-smart-sizing:", 14) == 0)
+			else if (strncmp(context->argv[j], "-taskbar-hide:", 14) == 0)
 				value = context->argv[j] + 14;
-			else if (strncmp(context->argv[j], "--smart-sizing:", 15) == 0)
+			else if (strncmp(context->argv[j], "--taskbar-hide:", 15) == 0)
 				value = context->argv[j] + 15;
 
-			if (value && mac_parse_smart_sizing_options(value, mfc))
+			if (value && mac_parse_taskbar_hide_options(value, mfc))
+			{
 				*(value - 1) = '\0';
+			}
+			else
+			{
+				if (strncmp(context->argv[j], "/smart-sizing:", 14) == 0)
+					value = context->argv[j] + 14;
+				else if (strncmp(context->argv[j], "-smart-sizing:", 14) == 0)
+					value = context->argv[j] + 14;
+				else if (strncmp(context->argv[j], "--smart-sizing:", 15) == 0)
+					value = context->argv[j] + 15;
+				else
+					value = NULL;
 
-			context->argv[filtered_argc++] = context->argv[j];
+				if (value && mac_parse_smart_sizing_options(value, mfc))
+					*(value - 1) = '\0';
+
+				context->argv[filtered_argc++] = context->argv[j];
+			}
 		}
 	}
 
@@ -3380,6 +3598,80 @@ static BOOL mac_parse_smart_sizing_options(const char *value, mfContext *mfc)
 
 		parsed = TRUE;
 	}
+
+	free(copy);
+	return parsed;
+}
+
+static BOOL mac_parse_taskbar_hide_options(const char *value, mfContext *mfc)
+{
+	if (!value || !mfc)
+		return FALSE;
+
+	char *copy = _strdup(value);
+	if (!copy)
+		return FALSE;
+
+	BOOL parsed = FALSE;
+	BOOL hasHeight = FALSE;
+	BOOL hasPosition = FALSE;
+	UINT32 height = 48;
+	UINT32 position = 1; // default: bottom
+
+	for (char *token = strtok(copy, ":"); token; token = strtok(NULL, ":"))
+	{
+		NSString *tokenStr = [NSString stringWithUTF8String:token];
+		NSString *lowerToken = [tokenStr lowercaseString];
+
+		if ([lowerToken isEqualToString:@"top"])
+		{
+			position = 0;
+			hasPosition = TRUE;
+			parsed = TRUE;
+		}
+		else if ([lowerToken isEqualToString:@"bottom"])
+		{
+			position = 1;
+			hasPosition = TRUE;
+			parsed = TRUE;
+		}
+		else if ([lowerToken isEqualToString:@"left"])
+		{
+			position = 2;
+			hasPosition = TRUE;
+			parsed = TRUE;
+		}
+		else if ([lowerToken isEqualToString:@"right"])
+		{
+			position = 3;
+			hasPosition = TRUE;
+			parsed = TRUE;
+		}
+		else if (!hasHeight && !hasPosition)
+		{
+			int val = atoi(token);
+			if (val > 0 && val < 2048)
+			{
+				height = (UINT32)val;
+				hasHeight = TRUE;
+				parsed = TRUE;
+			}
+			else
+			{
+				free(copy);
+				return FALSE;
+			}
+		}
+		else
+		{
+			free(copy);
+			return FALSE;
+		}
+	}
+
+	mfc->taskbarHide = TRUE;
+	mfc->taskbarHideHeight = height;
+	mfc->taskbarHidePosition = position;
 
 	free(copy);
 	return parsed;
@@ -3464,6 +3756,7 @@ void AppDelegate_ConnectionResultEventHandler(void *ctx, const ConnectionResultE
 					mac_set_view_size(context, mfc->view);
 					if (!mac_multimon_enabled(context->settings))
 						[_singleDelegate moveSessionToScreen:screen screenIndex:screenIndex];
+					[_singleDelegate syncMultimonWindows];
 					[_singleDelegate focusClientWindow];
 				}
 			});
@@ -3587,7 +3880,7 @@ void mac_set_view_size(rdpContext *context, MRDPView *view)
 	}
 
 	NSRect viewRect = innerRect;
-	NSArray *slices = multimon ? mac_multimon_slices(context->settings) : nil;
+	NSArray *slices = multimon ? mac_multimon_slices(context->settings, mfc) : nil;
 	NSDictionary *primarySlice = ([slices count] > 0) ? [slices objectAtIndex:0] : nil;
 	if (primarySlice && !smartSizing)
 	{
@@ -3680,6 +3973,35 @@ static BOOL mac_multimon_enabled(rdpSettings *settings)
 	return settings && freerdp_settings_get_bool(settings, FreeRDP_UseMultimon);
 }
 
+static NSArray *mac_taskbar_single_monitor_slices(rdpSettings *settings, mfContext *mfc,
+                                                  NSWindow *window)
+{
+	if (!settings || !mfc || !mac_taskbar_hide_enabled(mfc))
+		return nil;
+
+	const UINT32 desktopWidth = freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth);
+	const UINT32 desktopHeight = freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
+	if ((desktopWidth == 0) || (desktopHeight == 0))
+		return nil;
+
+	NSScreen *screen = mac_preferred_screen(window);
+	if (!screen)
+		screen = [NSScreen mainScreen];
+	if (!screen)
+		return nil;
+
+	NSRect frame = [window frame];
+	if (mfc->fullscreen_mode == 2)
+		frame = mac_safe_multimon_window_frame(
+		    screen, freerdp_settings_get_bool(settings, FreeRDP_Decorations));
+
+	return [NSArray arrayWithObject:@{
+		@"screen" : screen,
+		@"frame" : [NSValue valueWithRect:frame],
+		@"source" : [NSValue valueWithRect:NSMakeRect(0, 0, desktopWidth, desktopHeight)]
+	}];
+}
+
 static BOOL mac_taskbar_hide_enabled(mfContext *mfc)
 {
 	if (!mfc || !mfc->common.context.settings || !mfc->taskbarHide)
@@ -3687,9 +4009,122 @@ static BOOL mac_taskbar_hide_enabled(mfContext *mfc)
 
 	rdpSettings *settings = mfc->common.context.settings;
 	const BOOL multimon = freerdp_settings_get_bool(settings, FreeRDP_UseMultimon);
+	const BOOL fullscreen = freerdp_settings_get_bool(settings, FreeRDP_Fullscreen);
+	const BOOL pseudoFullscreen = (mfc->fullscreen_mode == 2);
 	return !freerdp_settings_get_bool(settings, FreeRDP_Decorations) &&
-	       (multimon || !freerdp_settings_get_bool(settings, FreeRDP_Fullscreen)) &&
+	       (multimon || !fullscreen || pseudoFullscreen) &&
 	       (mfc->taskbarHideHeight > 0);
+}
+
+static BOOL mac_taskbar_uses_extended_canvas(mfContext *mfc)
+{
+	return mfc && mfc->taskbarHide && (mfc->fullscreen_mode == 2);
+}
+
+static CGFloat mac_taskbar_hide_size(mfContext *mfc, NSRect source)
+{
+	if (!mfc)
+		return 0.0;
+
+	const UINT32 position = mfc->taskbarHidePosition;
+	const CGFloat limit = (position == 0 || position == 1) ? NSHeight(source) : NSWidth(source);
+	return MIN((CGFloat)mfc->taskbarHideHeight, MAX(0.0, limit - 1.0));
+}
+
+static NSRect mac_remote_frame_with_taskbar(NSRect frame, mfContext *mfc)
+{
+	if (!mfc || !mfc->taskbarHide || (mfc->fullscreen_mode != 2))
+		return frame;
+
+	const CGFloat size = mac_taskbar_hide_size(mfc, frame);
+	if (size <= 0.0)
+		return frame;
+
+	if (mfc->taskbarHidePosition == 0)
+	{
+		frame.origin.y -= size;
+		frame.size.height += size;
+	}
+	else if (mfc->taskbarHidePosition == 1)
+		frame.size.height += size;
+	else if (mfc->taskbarHidePosition == 2)
+	{
+		frame.origin.x -= size;
+		frame.size.width += size;
+	}
+	else if (mfc->taskbarHidePosition == 3)
+		frame.size.width += size;
+
+	return frame;
+}
+
+static NSRect mac_taskbar_visible_frame(NSRect frame, UINT32 position, CGFloat size)
+{
+	if (size <= 0.0)
+		return frame;
+
+	if (position == 0)
+		frame.size.height = MAX(1.0, frame.size.height - size);
+	else if (position == 1)
+	{
+		frame.origin.y += size;
+		frame.size.height = MAX(1.0, frame.size.height - size);
+	}
+	else if (position == 2)
+	{
+		frame.origin.x += size;
+		frame.size.width = MAX(1.0, frame.size.width - size);
+	}
+	else if (position == 3)
+		frame.size.width = MAX(1.0, frame.size.width - size);
+
+	return frame;
+}
+
+static NSRect mac_taskbar_visible_source(NSRect source, UINT32 position, CGFloat size)
+{
+	if (size <= 0.0)
+		return source;
+
+	if (position == 0)
+	{
+		source.origin.y += size;
+		source.size.height = MAX(1.0, source.size.height - size);
+	}
+	else if (position == 1)
+		source.size.height = MAX(1.0, source.size.height - size);
+	else if (position == 2)
+	{
+		source.origin.x += size;
+		source.size.width = MAX(1.0, source.size.width - size);
+	}
+	else if (position == 3)
+		source.size.width = MAX(1.0, source.size.width - size);
+
+	return source;
+}
+
+static NSRect mac_taskbar_full_frame(NSRect frame, UINT32 position, CGFloat size)
+{
+	if (size <= 0.0)
+		return frame;
+
+	if (position == 0)
+		frame.size.height += size;
+	else if (position == 1)
+	{
+		frame.origin.y -= size;
+		frame.size.height += size;
+	}
+	else if (position == 2)
+	{
+		frame.origin.x -= size;
+		frame.size.width += size;
+	}
+	else if (position == 3)
+		frame.size.width += size;
+
+	return frame;
 }
 
 static BOOL mac_taskbar_mouse_should_reveal(NSPoint mouse, NSRect taskbarFrame)
@@ -3699,13 +4134,19 @@ static BOOL mac_taskbar_mouse_should_reveal(NSPoint mouse, NSRect taskbarFrame)
 
 	const CGFloat edgeTolerance = 2.0;
 	const CGFloat horizontalPadding = 8.0;
-	const BOOL onBottomEdge =
-	    (mouse.y >= NSMinY(taskbarFrame)) && (mouse.y <= NSMinY(taskbarFrame) + edgeTolerance);
-	const BOOL withinSessionWidth =
-	    (mouse.x >= NSMinX(taskbarFrame) - horizontalPadding) &&
-	    (mouse.x <= NSMaxX(taskbarFrame) + horizontalPadding);
+	const CGFloat verticalPadding = 8.0;
+	const BOOL onHorizontalEdge =
+	    ((mouse.y >= NSMinY(taskbarFrame)) && (mouse.y <= NSMinY(taskbarFrame) + edgeTolerance)) ||
+	    ((mouse.y <= NSMaxY(taskbarFrame)) && (mouse.y >= NSMaxY(taskbarFrame) - edgeTolerance));
+	const BOOL onVerticalEdge =
+	    ((mouse.x >= NSMinX(taskbarFrame)) && (mouse.x <= NSMinX(taskbarFrame) + edgeTolerance)) ||
+	    ((mouse.x <= NSMaxX(taskbarFrame)) && (mouse.x >= NSMaxX(taskbarFrame) - edgeTolerance));
+	const BOOL withinSessionWidth = (mouse.x >= NSMinX(taskbarFrame) - horizontalPadding) &&
+	                                (mouse.x <= NSMaxX(taskbarFrame) + horizontalPadding);
+	const BOOL withinSessionHeight = (mouse.y >= NSMinY(taskbarFrame) - verticalPadding) &&
+	                                 (mouse.y <= NSMaxY(taskbarFrame) + verticalPadding);
 
-	return onBottomEdge && withinSessionWidth;
+	return (onHorizontalEdge && withinSessionWidth) || (onVerticalEdge && withinSessionHeight);
 }
 
 static NSRect mac_safe_multimon_window_frame(NSScreen *screen, BOOL decorated)
@@ -3763,7 +4204,7 @@ static NSRect mac_constrain_window_frame_to_screen(NSRect frame, NSScreen *scree
 	return frame;
 }
 
-static NSArray *mac_multimon_slices(rdpSettings *settings)
+static NSArray *mac_multimon_slices(rdpSettings *settings, mfContext *mfc)
 {
 	if (!mac_multimon_enabled(settings))
 		return nil;
@@ -3785,8 +4226,9 @@ static NSArray *mac_multimon_slices(rdpSettings *settings)
 
 		NSScreen *screen = [screens objectAtIndex:i];
 		NSRect visibleFrame = mac_safe_multimon_window_frame(screen, decorated);
-		NSRect remoteRect = NSMakeRect(NSMinX(visibleFrame), -NSMaxY(visibleFrame),
-		                               NSWidth(visibleFrame), NSHeight(visibleFrame));
+		NSRect remoteFrame = mac_remote_frame_with_taskbar(visibleFrame, mfc);
+		NSRect remoteRect = NSMakeRect(NSMinX(remoteFrame), -NSMaxY(remoteFrame),
+		                               NSWidth(remoteFrame), NSHeight(remoteFrame));
 		if (!found)
 		{
 			minX = NSMinX(remoteRect);
@@ -4343,13 +4785,15 @@ static void mac_ax_set_window_frame(AXUIElementRef windowElement, CGRect frame)
 
 static DISPLAY_CONTROL_MONITOR_LAYOUT mac_display_layout_for_screen(NSScreen *screen,
 	                                                               BOOL useVisibleFrame,
-	                                                               rdpSettings *settings)
+	                                                               mfContext *mfc)
 {
 	DISPLAY_CONTROL_MONITOR_LAYOUT layout = { 0 };
 	NSRect frame = useVisibleFrame ? [screen visibleFrame] : [screen frame];
+	frame = mac_remote_frame_with_taskbar(frame, mfc);
 	NSNumber *screenNumber = [[screen deviceDescription] objectForKey:@"NSScreenNumber"];
 	const CGDirectDisplayID displayId = screenNumber ? [screenNumber unsignedIntValue] : 0;
 	CGSize physicalSize = displayId ? CGDisplayScreenSize(displayId) : CGSizeZero;
+	rdpSettings *settings = mfc ? mfc->common.context.settings : NULL;
 
 	layout.Flags = DISPLAY_CONTROL_MONITOR_PRIMARY;
 	layout.Left = 0;
@@ -4361,8 +4805,8 @@ static DISPLAY_CONTROL_MONITOR_LAYOUT mac_display_layout_for_screen(NSScreen *sc
 	layout.PhysicalWidth = (UINT32)physicalSize.width;
 	layout.PhysicalHeight = (UINT32)physicalSize.height;
 	layout.DesktopScaleFactor =
-	    freerdp_settings_get_uint32(settings, FreeRDP_DesktopScaleFactor);
-	layout.DeviceScaleFactor = freerdp_settings_get_uint32(settings, FreeRDP_DeviceScaleFactor);
+	    settings ? freerdp_settings_get_uint32(settings, FreeRDP_DesktopScaleFactor) : 100;
+	layout.DeviceScaleFactor = settings ? freerdp_settings_get_uint32(settings, FreeRDP_DeviceScaleFactor) : 100;
 
 	if (layout.DesktopScaleFactor == 0)
 		layout.DesktopScaleFactor = 100;
