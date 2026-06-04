@@ -1238,7 +1238,6 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	[self applyWindowDecorationsFromSettings];
 	if (mac_taskbar_hide_enabled(mfc))
 		[self startTaskbarHideMonitor];
-	[self startLeftEdgeFocusMonitor];
 	[[NSNotificationCenter defaultCenter] addObserver:self
 	                                         selector:@selector(multimonFramebufferDidUpdate:)
 	                                             name:@"MRDPMultimonFramebufferDidUpdate"
