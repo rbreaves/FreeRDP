@@ -135,11 +135,13 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 	BOOL ignoreTransparentMouseEvents;
 	BOOL acceptFirstMouseEvent;
 	BOOL applySmartSizing;
+	BOOL allowSmartSizingOverscan;
 }
 
 - (id)initWithPrimaryView:(MRDPView *)view sourceRect:(NSRect)rect context:(mfContext *)mfc;
 - (void)setSourceRect:(NSRect)rect;
 - (void)setAppliesSmartSizing:(BOOL)apply;
+- (void)setAllowsSmartSizingOverscan:(BOOL)allow;
 - (void)setAllowsMousePassThrough:(BOOL)allow;
 - (void)setActivatesOnOpaqueMouseDown:(BOOL)activate;
 - (void)setIgnoresTransparentMouseEvents:(BOOL)ignore;
@@ -167,6 +169,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 	ignoreTransparentMouseEvents = NO;
 	acceptFirstMouseEvent = NO;
 	applySmartSizing = NO;
+	allowSmartSizingOverscan = YES;
 	[self setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
 	cursorTrackingArea =
 	    [[NSTrackingArea alloc] initWithRect:NSZeroRect
@@ -210,6 +213,12 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 - (void)setAppliesSmartSizing:(BOOL)apply
 {
 	applySmartSizing = apply;
+	[self setNeedsDisplay:YES];
+}
+
+- (void)setAllowsSmartSizingOverscan:(BOOL)allow
+{
+	allowSmartSizingOverscan = allow;
 	[self setNeedsDisplay:YES];
 }
 
@@ -301,7 +310,8 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 
 	const CGFloat sx = bounds.size.width / sourceRect.size.width;
 	const CGFloat sy = bounds.size.height / sourceRect.size.height;
-	const CGFloat scale = context->smart_sizing_overscan ? MAX(sx, sy) : MIN(sx, sy);
+	const BOOL useOverscan = allowSmartSizingOverscan && context->smart_sizing_overscan;
+	const CGFloat scale = useOverscan ? MAX(sx, sy) : MIN(sx, sy);
 	if (scale <= 0.0)
 		return bounds;
 
@@ -329,7 +339,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 			break;
 	}
 
-	if (context->smart_sizing_overscan)
+	if (useOverscan)
 	{
 		switch (context->smart_sizing_overscan_align)
 		{
@@ -366,8 +376,11 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 	NSRect displayRect = [self displayRectForBounds:bounds];
 	const CGFloat sx = (NSWidth(displayRect) > 0) ? sourceRect.size.width / NSWidth(displayRect) : 1.0;
 	const CGFloat sy = (NSHeight(displayRect) > 0) ? sourceRect.size.height / NSHeight(displayRect) : 1.0;
+	const BOOL useOverscan = allowSmartSizingOverscan && context && context->smart_sizing_overscan;
+	const CGFloat displayTop = useOverscan ? (NSHeight(bounds) - NSMaxY(displayRect))
+	                                       : NSMinY(displayRect);
 	point.x = sourceRect.origin.x + (point.x - NSMinX(displayRect)) * sx;
-	point.y = sourceRect.origin.y + (point.y - NSMinY(displayRect)) * sy;
+	point.y = sourceRect.origin.y + (point.y - displayTop) * sy;
 	point.x = MIN(MAX(point.x, NSMinX(sourceRect)), NSMaxX(sourceRect) - 1.0);
 	point.y = MIN(MAX(point.y, NSMinY(sourceRect)), NSMaxY(sourceRect) - 1.0);
 	point.x = MIN(MAX(point.x, 0), UINT16_MAX);
@@ -402,11 +415,14 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 	    (NSWidth(displayRect) > 0) ? sourceRect.size.width / NSWidth(displayRect) : sx;
 	const CGFloat smartSy =
 	    (NSHeight(displayRect) > 0) ? sourceRect.size.height / NSHeight(displayRect) : sy;
+	const BOOL useOverscan = allowSmartSizingOverscan && context && context->smart_sizing_overscan;
+	const CGFloat displayTop = useOverscan ? (NSHeight(bounds) - NSMaxY(displayRect))
+	                                       : NSMinY(displayRect);
 	if (valid)
 		*valid = YES;
 	NSPoint remotePoint =
 	    NSMakePoint(sourceRect.origin.x + (point.x - NSMinX(displayRect)) * smartSx,
-	                sourceRect.origin.y + (point.y - NSMinY(displayRect)) * smartSy);
+	                sourceRect.origin.y + (point.y - displayTop) * smartSy);
 	remotePoint.x = MIN(MAX(remotePoint.x, NSMinX(sourceRect)), NSMaxX(sourceRect) - 1.0);
 	remotePoint.y = MIN(MAX(remotePoint.y, NSMinY(sourceRect)), NSMaxY(sourceRect) - 1.0);
 	return remotePoint;
@@ -1665,6 +1681,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		[primaryMonitorSliceView setSourceRect:primarySource];
 	}
 	[primaryMonitorSliceView setAppliesSmartSizing:taskbarHide];
+	[primaryMonitorSliceView setAllowsSmartSizingOverscan:YES];
 	NSRect primarySliceFrame = [[window contentView] bounds];
 	if (taskbarSize > 0.0 && extendedCanvas)
 		primarySliceFrame = mac_taskbar_visible_frame(primarySliceFrame, taskbarPosition,
@@ -1737,6 +1754,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		}
 
 		[sliceView setAppliesSmartSizing:taskbarHide];
+		[sliceView setAllowsSmartSizingOverscan:YES];
 		[monitorWindow setStyleMask:styleMask];
 		[monitorWindow setMovable:decorated];
 		[monitorWindow setTitleVisibility:decorated ? NSWindowTitleVisible : NSWindowTitleHidden];
@@ -1883,7 +1901,8 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		[taskbarWindow setTitle:[NSString stringWithFormat:@"%@ Taskbar [%lu]", baseTitle,
 		                                                    (unsigned long)(i + 1)]];
 		[taskbarWindow setFrame:taskbarFrame display:YES];
-		[sliceView setAppliesSmartSizing:NO];
+		[sliceView setAppliesSmartSizing:YES];
+		[sliceView setAllowsSmartSizingOverscan:NO];
 		[sliceView setAllowsMousePassThrough:NO];
 		[sliceView setActivatesOnOpaqueMouseDown:YES];
 		[sliceView setIgnoresTransparentMouseEvents:YES];
