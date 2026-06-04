@@ -43,7 +43,7 @@ static NSRect mac_remote_frame_with_taskbar(NSRect frame, mfContext *mfc);
 static NSRect mac_taskbar_visible_frame(NSRect frame, UINT32 position, CGFloat size);
 static NSRect mac_taskbar_visible_source(NSRect source, UINT32 position, CGFloat size);
 static NSRect mac_taskbar_full_frame(NSRect frame, UINT32 position, CGFloat size);
-static BOOL mac_taskbar_mouse_should_reveal(NSPoint mouse, NSRect taskbarFrame);
+static BOOL mac_taskbar_mouse_should_reveal(NSPoint mouse, NSRect taskbarFrame, UINT32 position);
 static NSRect mac_safe_multimon_window_frame(NSScreen *screen, BOOL decorated);
 static NSRect mac_constrain_window_frame_to_screen(NSRect frame, NSScreen *screen, BOOL decorated);
 static void mac_maximize_window_minus_menubar(rdpContext *context, NSWindow *window, MRDPView *view);
@@ -128,10 +128,18 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 	id mousePassThroughMonitor;
 	NSTrackingArea *cursorTrackingArea;
 	BOOL mousePassThroughArmed;
+	BOOL allowMousePassThrough;
+	BOOL activateOnOpaqueMouseDown;
+	BOOL ignoreTransparentMouseEvents;
+	BOOL acceptFirstMouseEvent;
 }
 
 - (id)initWithPrimaryView:(MRDPView *)view sourceRect:(NSRect)rect;
 - (void)setSourceRect:(NSRect)rect;
+- (void)setAllowsMousePassThrough:(BOOL)allow;
+- (void)setActivatesOnOpaqueMouseDown:(BOOL)activate;
+- (void)setIgnoresTransparentMouseEvents:(BOOL)ignore;
+- (void)setAcceptsFirstMouseEvent:(BOOL)accept;
 - (NSPoint)remotePointForScreenPoint:(NSPoint)screenPoint valid:(BOOL *)valid;
 - (BOOL)isRemotePointTransparent:(NSPoint)remotePoint;
 - (NSCursor *)remoteCursor;
@@ -149,6 +157,10 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 
 	primaryView = view;
 	sourceRect = rect;
+	allowMousePassThrough = YES;
+	activateOnOpaqueMouseDown = NO;
+	ignoreTransparentMouseEvents = NO;
+	acceptFirstMouseEvent = NO;
 	[self setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
 	cursorTrackingArea =
 	    [[NSTrackingArea alloc] initWithRect:NSZeroRect
@@ -176,11 +188,42 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 	return YES;
 }
 
+- (BOOL)acceptsFirstMouse:(NSEvent *)event
+{
+	(void)event;
+	return acceptFirstMouseEvent;
+}
+
 - (void)setSourceRect:(NSRect)rect
 {
 	sourceRect = rect;
 	[self setFrameSize:rect.size];
 	[self setNeedsDisplay:YES];
+}
+
+- (void)setAllowsMousePassThrough:(BOOL)allow
+{
+	allowMousePassThrough = allow;
+	if (!allowMousePassThrough && mousePassThroughArmed)
+	{
+		mousePassThroughArmed = NO;
+		[[self window] setIgnoresMouseEvents:NO];
+	}
+}
+
+- (void)setActivatesOnOpaqueMouseDown:(BOOL)activate
+{
+	activateOnOpaqueMouseDown = activate;
+}
+
+- (void)setIgnoresTransparentMouseEvents:(BOOL)ignore
+{
+	ignoreTransparentMouseEvents = ignore;
+}
+
+- (void)setAcceptsFirstMouseEvent:(BOOL)accept
+{
+	acceptFirstMouseEvent = accept;
 }
 
 - (void)dealloc
@@ -312,6 +355,16 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 - (void)syncMousePassThroughStateForScreenPoint:(NSPoint)screenPoint
 {
 	NSWindow *window = [self window];
+	if (!allowMousePassThrough)
+	{
+		if (mousePassThroughArmed)
+		{
+			mousePassThroughArmed = NO;
+			[window setIgnoresMouseEvents:NO];
+		}
+		return;
+	}
+
 	BOOL valid = NO;
 	NSPoint remotePoint = [self remotePointForScreenPoint:screenPoint valid:&valid];
 	BOOL shouldIgnore = valid && [self isRemotePointTransparent:remotePoint];
@@ -325,6 +378,9 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 
 - (BOOL)shouldPassMouseEventThrough:(NSEvent *)event
 {
+	if (!allowMousePassThrough)
+		return NO;
+
 	CGEventRef cgEvent = [event CGEvent];
 	if (cgEvent &&
 	    (CGEventGetIntegerValueField(cgEvent, kCGEventSourceUserData) == 0x4D52445050544852LL))
@@ -334,6 +390,31 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 	BOOL transparent = [self isRemotePointTransparent:remotePoint];
 	[self syncMousePassThroughStateForScreenPoint:[NSEvent mouseLocation]];
 	return transparent;
+}
+
+- (BOOL)isMouseEventTransparent:(NSEvent *)event
+{
+	NSPoint remotePoint = [self remotePointForEvent:event];
+	return [self isRemotePointTransparent:remotePoint];
+}
+
+- (BOOL)shouldIgnoreMouseButtonEvent:(NSEvent *)event
+{
+	return ignoreTransparentMouseEvents && [self isMouseEventTransparent:event];
+}
+
+- (void)activateWindowForMouseButtonEvent:(NSEvent *)event
+{
+	if (!activateOnOpaqueMouseDown || [self isMouseEventTransparent:event])
+		return;
+
+	NSWindow *window = [self window];
+	[NSApp activateIgnoringOtherApps:YES];
+	if (_singleDelegate &&
+	    [_singleDelegate respondsToSelector:@selector(raiseSessionWindowsForTaskbarClick)])
+		[_singleDelegate performSelector:@selector(raiseSessionWindowsForTaskbarClick)];
+	[window makeKeyAndOrderFront:self];
+	[window makeFirstResponder:self];
 }
 
 - (void)viewDidMoveToWindow
@@ -474,6 +555,9 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 		[self passMouseEventThrough:event];
 		return;
 	}
+	if ([self shouldIgnoreMouseButtonEvent:event])
+		return;
+	[self activateWindowForMouseButtonEvent:event];
 	[self sendButton:0 event:event down:YES];
 }
 
@@ -484,6 +568,8 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 		[self passMouseEventThrough:event];
 		return;
 	}
+	if ([self shouldIgnoreMouseButtonEvent:event])
+		return;
 	[self sendButton:0 event:event down:NO];
 }
 
@@ -494,6 +580,9 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 		[self passMouseEventThrough:event];
 		return;
 	}
+	if ([self shouldIgnoreMouseButtonEvent:event])
+		return;
+	[self activateWindowForMouseButtonEvent:event];
 	[self sendButton:1 event:event down:YES];
 }
 
@@ -504,6 +593,8 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 		[self passMouseEventThrough:event];
 		return;
 	}
+	if ([self shouldIgnoreMouseButtonEvent:event])
+		return;
 	[self sendButton:1 event:event down:NO];
 }
 
@@ -514,6 +605,9 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 		[self passMouseEventThrough:event];
 		return;
 	}
+	if ([self shouldIgnoreMouseButtonEvent:event])
+		return;
+	[self activateWindowForMouseButtonEvent:event];
 	[self sendButton:(int)[event buttonNumber] event:event down:YES];
 }
 
@@ -524,6 +618,8 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 		[self passMouseEventThrough:event];
 		return;
 	}
+	if ([self shouldIgnoreMouseButtonEvent:event])
+		return;
 	[self sendButton:(int)[event buttonNumber] event:event down:NO];
 }
 
@@ -849,6 +945,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 - (void)scheduleLeftEdgeFocusTimer;
 - (void)leftEdgeFocusTimerFired:(NSTimer *)timer;
 - (void)focusClientWindow;
+- (void)raiseSessionWindowsForTaskbarClick;
 - (void)syncMultimonWindows;
 - (void)closeMultimonWindows;
 - (void)syncTaskbarHideWindows;
@@ -1321,6 +1418,21 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	[[window contentView] setNeedsDisplay:YES];
 }
 
+- (void)raiseSessionWindowsForTaskbarClick
+{
+	if (window && [window isVisible])
+		[window orderFront:self];
+
+	if (monitorWindows)
+	{
+		for (NSWindow *monitorWindow in monitorWindows)
+		{
+			if ([monitorWindow isVisible])
+				[monitorWindow orderFront:self];
+		}
+	}
+}
+
 - (void)closeMultimonWindows
 {
 	if (primaryMonitorSliceView)
@@ -1655,25 +1767,20 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		[taskbarWindow setTitle:[NSString stringWithFormat:@"%@ Taskbar [%lu]", baseTitle,
 		                                                    (unsigned long)(i + 1)]];
 		[taskbarWindow setFrame:taskbarFrame display:YES];
+		[sliceView setAllowsMousePassThrough:NO];
+		[sliceView setActivatesOnOpaqueMouseDown:YES];
+		[sliceView setIgnoresTransparentMouseEvents:YES];
+		[sliceView setAcceptsFirstMouseEvent:YES];
 
 		const BOOL mouseInsideTaskbar = NSPointInRect(mouse, taskbarFrame);
+		const BOOL taskbarWasVisible = [taskbarWindow isVisible];
 		const BOOL shouldReveal =
-		    mouseInsideTaskbar || (![taskbarWindow isVisible] &&
-		                           mac_taskbar_mouse_should_reveal(mouse, taskbarFrame));
+		    taskbarWasVisible
+		        ? mouseInsideTaskbar
+		        : mac_taskbar_mouse_should_reveal(mouse, taskbarFrame, taskbarPosition);
 		if (shouldReveal)
 		{
-			[taskbarWindow orderFront:self];
-			if (mouseInsideTaskbar)
-			{
-				BOOL valid = NO;
-				NSPoint remotePoint = [sliceView remotePointForScreenPoint:mouse valid:&valid];
-				if (valid && ![sliceView isRemotePointTransparent:remotePoint])
-				{
-					[NSApp activateIgnoringOtherApps:YES];
-					[taskbarWindow makeKeyAndOrderFront:self];
-					[taskbarWindow makeFirstResponder:sliceView];
-				}
-			}
+			[taskbarWindow orderFrontRegardless];
 		}
 		else
 		{
@@ -4218,26 +4325,31 @@ static NSRect mac_taskbar_full_frame(NSRect frame, UINT32 position, CGFloat size
 	return frame;
 }
 
-static BOOL mac_taskbar_mouse_should_reveal(NSPoint mouse, NSRect taskbarFrame)
+static BOOL mac_taskbar_mouse_should_reveal(NSPoint mouse, NSRect taskbarFrame, UINT32 position)
 {
 	if (NSIsEmptyRect(taskbarFrame))
 		return FALSE;
 
-	const CGFloat edgeTolerance = 2.0;
-	const CGFloat horizontalPadding = 8.0;
-	const CGFloat verticalPadding = 8.0;
-	const BOOL onHorizontalEdge =
-	    ((mouse.y >= NSMinY(taskbarFrame)) && (mouse.y <= NSMinY(taskbarFrame) + edgeTolerance)) ||
-	    ((mouse.y <= NSMaxY(taskbarFrame)) && (mouse.y >= NSMaxY(taskbarFrame) - edgeTolerance));
-	const BOOL onVerticalEdge =
-	    ((mouse.x >= NSMinX(taskbarFrame)) && (mouse.x <= NSMinX(taskbarFrame) + edgeTolerance)) ||
-	    ((mouse.x <= NSMaxX(taskbarFrame)) && (mouse.x >= NSMaxX(taskbarFrame) - edgeTolerance));
-	const BOOL withinSessionWidth = (mouse.x >= NSMinX(taskbarFrame) - horizontalPadding) &&
-	                                (mouse.x <= NSMaxX(taskbarFrame) + horizontalPadding);
-	const BOOL withinSessionHeight = (mouse.y >= NSMinY(taskbarFrame) - verticalPadding) &&
-	                                 (mouse.y <= NSMaxY(taskbarFrame) + verticalPadding);
+	const CGFloat edgeTolerance = 1.0;
+	const BOOL withinWidth =
+	    (mouse.x >= NSMinX(taskbarFrame)) && (mouse.x <= NSMaxX(taskbarFrame));
+	const BOOL withinHeight =
+	    (mouse.y >= NSMinY(taskbarFrame)) && (mouse.y <= NSMaxY(taskbarFrame));
 
-	return (onHorizontalEdge && withinSessionWidth) || (onVerticalEdge && withinSessionHeight);
+	if (position == 0) // top
+		return withinWidth && (mouse.y >= NSMaxY(taskbarFrame) - edgeTolerance) &&
+		       (mouse.y <= NSMaxY(taskbarFrame));
+	if (position == 1) // bottom
+		return withinWidth && (mouse.y >= NSMinY(taskbarFrame)) &&
+		       (mouse.y <= NSMinY(taskbarFrame) + edgeTolerance);
+	if (position == 2) // left
+		return withinHeight && (mouse.x >= NSMinX(taskbarFrame)) &&
+		       (mouse.x <= NSMinX(taskbarFrame) + edgeTolerance);
+	if (position == 3) // right
+		return withinHeight && (mouse.x >= NSMaxX(taskbarFrame) - edgeTolerance) &&
+		       (mouse.x <= NSMaxX(taskbarFrame));
+
+	return FALSE;
 }
 
 static NSRect mac_safe_multimon_window_frame(NSScreen *screen, BOOL decorated)
