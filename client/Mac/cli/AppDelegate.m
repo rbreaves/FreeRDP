@@ -126,6 +126,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 	MRDPView *primaryView;
 	NSRect sourceRect;
 	id mousePassThroughMonitor;
+	NSTrackingArea *cursorTrackingArea;
 	BOOL mousePassThroughArmed;
 }
 
@@ -133,6 +134,8 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 - (void)setSourceRect:(NSRect)rect;
 - (NSPoint)remotePointForScreenPoint:(NSPoint)screenPoint valid:(BOOL *)valid;
 - (BOOL)isRemotePointTransparent:(NSPoint)remotePoint;
+- (NSCursor *)remoteCursor;
+- (void)syncRemoteCursorForCurrentMouseLocation;
 
 @end
 
@@ -147,6 +150,19 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 	primaryView = view;
 	sourceRect = rect;
 	[self setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+	cursorTrackingArea =
+	    [[NSTrackingArea alloc] initWithRect:NSZeroRect
+	                                options:NSTrackingMouseEnteredAndExited |
+	                                        NSTrackingMouseMoved | NSTrackingCursorUpdate |
+	                                        NSTrackingEnabledDuringMouseDrag |
+	                                        NSTrackingActiveAlways | NSTrackingInVisibleRect
+	                                  owner:self
+	                               userInfo:nil];
+	[self addTrackingArea:cursorTrackingArea];
+	[[NSNotificationCenter defaultCenter] addObserver:self
+	                                         selector:@selector(remoteCursorDidUpdate:)
+	                                             name:@"MRDPRemoteCursorDidUpdate"
+	                                           object:primaryView];
 	return self;
 }
 
@@ -169,9 +185,59 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 
 - (void)dealloc
 {
+	[[NSNotificationCenter defaultCenter] removeObserver:self];
 	if (mousePassThroughMonitor)
 		[NSEvent removeMonitor:mousePassThroughMonitor];
+	if (cursorTrackingArea)
+	{
+		[self removeTrackingArea:cursorTrackingArea];
+		[cursorTrackingArea release];
+	}
 	[super dealloc];
+}
+
+- (NSCursor *)remoteCursor
+{
+	return primaryView ? [primaryView currentRemoteCursor] : [NSCursor arrowCursor];
+}
+
+- (BOOL)containsCurrentMouseLocation
+{
+	NSWindow *window = [self window];
+	if (!window)
+		return NO;
+
+	NSPoint screenPoint = [NSEvent mouseLocation];
+	if (!NSPointInRect(screenPoint, [window frame]))
+		return NO;
+
+	NSPoint windowPoint = [window convertPointFromScreen:screenPoint];
+	NSPoint viewPoint = [self convertPoint:windowPoint fromView:nil];
+	return NSPointInRect(viewPoint, [self bounds]);
+}
+
+- (void)syncRemoteCursorForCurrentMouseLocation
+{
+	[[self window] invalidateCursorRectsForView:self];
+	if ([self containsCurrentMouseLocation])
+		[[self remoteCursor] set];
+}
+
+- (void)remoteCursorDidUpdate:(NSNotification *)notification
+{
+	(void)notification;
+	[self syncRemoteCursorForCurrentMouseLocation];
+}
+
+- (void)resetCursorRects
+{
+	[self addCursorRect:[self visibleRect] cursor:[self remoteCursor]];
+}
+
+- (void)cursorUpdate:(NSEvent *)event
+{
+	(void)event;
+	[[self remoteCursor] set];
 }
 
 - (NSPoint)remotePointForEvent:(NSEvent *)event
@@ -351,9 +417,23 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter);
 	CGImageRelease(slice);
 }
 
+- (void)mouseEntered:(NSEvent *)event
+{
+	[self syncMousePassThroughStateForScreenPoint:[NSEvent mouseLocation]];
+	[[self remoteCursor] set];
+	[self sendMoveForEvent:event];
+}
+
+- (void)mouseExited:(NSEvent *)event
+{
+	(void)event;
+	[self syncMousePassThroughStateForScreenPoint:[NSEvent mouseLocation]];
+}
+
 - (void)mouseMoved:(NSEvent *)event
 {
 	[self syncMousePassThroughStateForScreenPoint:[NSEvent mouseLocation]];
+	[[self remoteCursor] set];
 	[self sendMoveForEvent:event];
 }
 

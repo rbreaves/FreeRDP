@@ -1042,12 +1042,19 @@ DWORD WINAPI mac_client_thread(void *param)
 	self->currentCursor = cursor;
 	dispatch_async(dispatch_get_main_queue(), ^{
 		[[self window] invalidateCursorRectsForView:self];
+		[[NSNotificationCenter defaultCenter] postNotificationName:@"MRDPRemoteCursorDidUpdate"
+		                                                    object:self];
 	});
+}
+
+- (NSCursor *)currentRemoteCursor
+{
+	return currentCursor ?: [NSCursor arrowCursor];
 }
 
 - (void)resetCursorRects
 {
-	[self addCursorRect:[self visibleRect] cursor:currentCursor];
+	[self addCursorRect:[self visibleRect] cursor:[self currentRemoteCursor]];
 }
 
 - (BOOL)acceptsFirstResponder
