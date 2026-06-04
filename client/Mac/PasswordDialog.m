@@ -71,6 +71,7 @@ static NSScreen *mac_password_dialog_preferred_screen(void)
 @synthesize domainText;
 @synthesize messageLabel;
 @synthesize rememberPasswordButton;
+@synthesize okButton;
 @synthesize serverHostname;
 @synthesize username;
 @synthesize password;
@@ -211,16 +212,18 @@ static NSScreen *mac_password_dialog_preferred_screen(void)
 	[contentView addSubview:cancelButton];
 
 	// OK button
-	NSButton *okButton = [[[NSButton alloc]
+	self.okButton = [[[NSButton alloc]
 	    initWithFrame:NSMakeRect(windowFrame.size.width - padding - 210, currentY - buttonHeight,
 	                             100, buttonHeight)]
 	    autorelease];
-	[okButton setTitle:@"OK"];
-	[okButton setBezelStyle:NSBezelStyleRounded];
-	[okButton setTarget:self];
-	[okButton setAction:@selector(onOK:)];
-	[okButton setKeyEquivalent:@"\r"];
-	[contentView addSubview:okButton];
+	[self.okButton setTitle:@"OK"];
+	[self.okButton setBezelStyle:NSBezelStyleRounded];
+	[self.okButton setTarget:self];
+	[self.okButton setAction:@selector(onOK:)];
+	[self.okButton setKeyEquivalent:@"\r"];
+	[contentView addSubview:self.okButton];
+	[self.window setDefaultButtonCell:[self.okButton cell]];
+	[self.window setInitialFirstResponder:self.okButton];
 
 	[self.window center];
 }
@@ -258,12 +261,12 @@ static NSScreen *mac_password_dialog_preferred_screen(void)
 	if (self.username != nil)
 	{
 		[self.usernameText setStringValue:self.username];
-		[self.window makeFirstResponder:self.passwordText];
 	}
 
 	[self.passwordText setStringValue:self.password ?: @""];
 	[self.rememberPasswordButton setState:self.rememberPassword ? NSControlStateValueOn
 	                                                       : NSControlStateValueOff];
+	[self.window makeFirstResponder:self.okButton];
 }
 
 - (void)onOK:(NSObject *)sender
@@ -300,6 +303,7 @@ static NSScreen *mac_password_dialog_preferred_screen(void)
 	[domainText release];
 	[messageLabel release];
 	[rememberPasswordButton release];
+	[okButton release];
 	[serverHostname release];
 	[username release];
 	[password release];

@@ -1116,6 +1116,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 - (void)moveSessionToScreen:(NSScreen *)screen screenIndex:(NSInteger)screenIndex;
 - (BOOL)requestRemoteResizeForScreen:(NSScreen *)screen;
 - (NSString *)credentialTarget;
+- (NSString *)preferredScreenDefaultsKey;
 - (NSScreen *)preferredScreen;
 - (NSInteger)currentScreenIndex;
 - (void)loadPreferredScreenFromDefaults;
@@ -1351,6 +1352,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	status = [self ParseCommandLineArguments];
 	mfc = (mfContext *)context;
 	WINPR_ASSERT(mfc);
+	[self loadPreferredScreenFromDefaults];
 	[self applyWindowDecorationsFromSettings];
 	if (mac_taskbar_hide_enabled(mfc))
 		[self startTaskbarHideMonitor];
@@ -3450,6 +3452,16 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	                                  port];
 }
 
+- (NSString *)preferredScreenDefaultsKey
+{
+	NSString *target = [self credentialTarget];
+
+	if ([target length] == 0)
+		return MRDPPreferredScreenIdentifierKey;
+
+	return [NSString stringWithFormat:@"%@.%@", MRDPPreferredScreenIdentifierKey, target];
+}
+
 - (NSScreen *)preferredScreen
 {
 	return mac_screen_for_index(preferredScreenIndex);
@@ -3616,7 +3628,9 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 - (void)loadPreferredScreenFromDefaults
 {
 	NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-	NSString *identifier = [defaults stringForKey:MRDPPreferredScreenIdentifierKey];
+	NSString *identifier = [defaults stringForKey:[self preferredScreenDefaultsKey]];
+	if (!identifier)
+		identifier = [defaults stringForKey:MRDPPreferredScreenIdentifierKey];
 	NSScreen *screen = mac_screen_for_identifier(identifier);
 
 	if (!screen)
@@ -3936,7 +3950,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		return;
 
 	NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-	[defaults setObject:identifier forKey:MRDPPreferredScreenIdentifierKey];
+	[defaults setObject:identifier forKey:[self preferredScreenDefaultsKey]];
 	[defaults synchronize];
 }
 

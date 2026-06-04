@@ -27,6 +27,7 @@
 	NSTextField *domainText;
 	NSTextField *messageLabel;
 	NSButton *rememberPasswordButton;
+	NSButton *okButton;
 	NSString *serverHostname;
 	NSString *username;
 	NSString *password;
@@ -39,6 +40,7 @@
 @property(retain) NSTextField *domainText;
 @property(retain) NSTextField *messageLabel;
 @property(retain) NSButton *rememberPasswordButton;
+@property(retain) NSButton *okButton;
 
 - (void)onOK:(NSObject *)sender;
 - (void)onCancel:(NSObject *)sender;
