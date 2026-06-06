@@ -4003,6 +4003,11 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		{
 			mfc->fullscreen_mode = 2;
 		}
+		else if (strcmp(context->argv[j], "-no-dock") == 0 ||
+		         strcmp(context->argv[j], "--no-dock") == 0)
+		{
+			/* Already handled before NSApplication starts; keep FreeRDP parser from seeing it. */
+		}
 		else if (strcmp(context->argv[j], "/taskbar-hide") == 0 ||
 		         strcmp(context->argv[j], "-taskbar-hide") == 0 ||
 		         strcmp(context->argv[j], "--taskbar-hide") == 0)
