@@ -92,9 +92,10 @@ static NSRect mac_smart_sizing_display_rect(MRDPView *view, rdpContext *context)
 static BOOL mac_send_rdp_scancode(rdpInput *input, UINT32 rdpScancode);
 static NSScreen *mac_startup_preferred_screen(void);
 static BOOL mac_screen_is_selected(rdpSettings *settings, UINT32 screenIndex);
+static NSRect mac_pseudo_fullscreen_frame(NSScreen *screen);
 static NSRect mac_safe_screen_frame(NSScreen *screen);
 static BOOL mac_monitor_from_screen(NSScreen *screen, UINT32 screenIndex, mfContext *mfc,
-                                    rdpMonitor *monitor);
+                                    BOOL useVisibleFrame, rdpMonitor *monitor);
 static UINT32 mac_taskbar_hide_size_for_context(mfContext *mfc, NSRect frame);
 static NSRect mac_remote_frame_with_taskbar(NSRect frame, mfContext *mfc);
 static NSString *mac_dialog_string_from_utf8(const char *value);
@@ -409,7 +410,7 @@ static BOOL mrdp_reconstruct_window_drag_rect(const uint8_t *mask, const UINT32 
 
 	NSScreen *screen = mac_startup_preferred_screen();
 	NSRect screenFrame = [screen frame];
-	NSRect visibleFrame = [screen visibleFrame];
+	NSRect visibleFrame = mac_pseudo_fullscreen_frame(screen);
 
 	if (!mac_apply_display_properties(mfc, mfc->fullscreen_mode == 2))
 		return -1;
@@ -497,6 +498,25 @@ static BOOL mac_screen_is_selected(rdpSettings *settings, UINT32 screenIndex)
 	return FALSE;
 }
 
+static NSRect mac_pseudo_fullscreen_frame(NSScreen *screen)
+{
+	if (!screen)
+		return NSZeroRect;
+
+	NSRect frame = [screen frame];
+	NSRect visibleFrame = [screen visibleFrame];
+	CGFloat menuBarHeight = NSMaxY(frame) - NSMaxY(visibleFrame);
+	if (menuBarHeight < 1.0)
+	{
+		NSStatusBar *statusBar = [NSStatusBar systemStatusBar];
+		menuBarHeight = statusBar ? [statusBar thickness] : 24.0;
+	}
+	menuBarHeight = ceil(MAX(menuBarHeight, 24.0));
+
+	frame.size.height = MAX(1.0, NSHeight(frame) - menuBarHeight);
+	return frame;
+}
+
 static NSRect mac_safe_screen_frame(NSScreen *screen)
 {
 	if (!screen)
@@ -558,14 +578,16 @@ static NSRect mac_remote_frame_with_taskbar(NSRect frame, mfContext *mfc)
 }
 
 static BOOL mac_monitor_from_screen(NSScreen *screen, UINT32 screenIndex, mfContext *mfc,
-                                    rdpMonitor *monitor)
+                                    BOOL useVisibleFrame, rdpMonitor *monitor)
 {
 	if (!screen || !mfc || !mfc->common.context.settings || !monitor)
 		return FALSE;
 
 	rdpSettings *settings = mfc->common.context.settings;
 	NSRect screenFrame = [screen frame];
-	NSRect frame = mac_remote_frame_with_taskbar(mac_safe_screen_frame(screen), mfc);
+	NSRect frame = mac_remote_frame_with_taskbar(useVisibleFrame ? mac_pseudo_fullscreen_frame(screen)
+	                                                             : mac_safe_screen_frame(screen),
+	                                            mfc);
 	NSNumber *screenNumber = [[screen deviceDescription] objectForKey:@"NSScreenNumber"];
 	const CGDirectDisplayID displayId = screenNumber ? [screenNumber unsignedIntValue] : 0;
 	CGSize physicalSize = displayId ? CGDisplayScreenSize(displayId) : CGSizeZero;
@@ -624,7 +646,8 @@ BOOL mac_apply_display_properties(mfContext *mfc, BOOL useVisibleFrame)
 			continue;
 
 		rdpMonitor monitor = { 0 };
-		if (!mac_monitor_from_screen([screens objectAtIndex:i], (UINT32)i, mfc, &monitor))
+		if (!mac_monitor_from_screen([screens objectAtIndex:i], (UINT32)i, mfc,
+		                             useVisibleFrame, &monitor))
 		{
 			free(monitors);
 			return FALSE;

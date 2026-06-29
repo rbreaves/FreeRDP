@@ -44,6 +44,7 @@ static NSRect mac_taskbar_visible_frame(NSRect frame, UINT32 position, CGFloat s
 static NSRect mac_taskbar_visible_source(NSRect source, UINT32 position, CGFloat size);
 static NSRect mac_taskbar_full_frame(NSRect frame, UINT32 position, CGFloat size);
 static BOOL mac_taskbar_mouse_should_reveal(NSPoint mouse, NSRect taskbarFrame, UINT32 position);
+static NSRect mac_pseudo_fullscreen_frame(NSScreen *screen);
 static NSRect mac_safe_multimon_window_frame(NSScreen *screen, BOOL decorated);
 static NSRect mac_constrain_window_frame_to_screen(NSRect frame, NSScreen *screen, BOOL decorated);
 static void mac_maximize_window_minus_menubar(rdpContext *context, NSWindow *window, MRDPView *view);
@@ -3361,8 +3362,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	                        mfc && (mfc->fullscreen_mode != 2);
 	const BOOL pseudoFullscreen = mfc && (mfc->fullscreen_mode == 2);
 	const BOOL multimon = settings && freerdp_settings_get_bool(settings, FreeRDP_UseMultimon);
-	const BOOL useVisibleFrame = pseudoFullscreen;
-	NSRect targetRect = useVisibleFrame ? [screen visibleFrame] : [screen frame];
+	NSRect targetRect = pseudoFullscreen ? mac_pseudo_fullscreen_frame(screen) : [screen frame];
 
 	if (multimon)
 		return;
@@ -4513,8 +4513,7 @@ static NSArray *mac_taskbar_single_monitor_slices(rdpSettings *settings, mfConte
 
 	NSRect frame = [window frame];
 	if (mfc->fullscreen_mode == 2)
-		frame = mac_safe_multimon_window_frame(
-		    screen, freerdp_settings_get_bool(settings, FreeRDP_Decorations));
+		frame = mac_pseudo_fullscreen_frame(screen);
 
 	return [NSArray arrayWithObject:@{
 		@"screen" : screen,
@@ -4675,6 +4674,25 @@ static BOOL mac_taskbar_mouse_should_reveal(NSPoint mouse, NSRect taskbarFrame, 
 	return FALSE;
 }
 
+static NSRect mac_pseudo_fullscreen_frame(NSScreen *screen)
+{
+	if (!screen)
+		return NSZeroRect;
+
+	NSRect frame = [screen frame];
+	NSRect visibleFrame = [screen visibleFrame];
+	CGFloat menuBarHeight = NSMaxY(frame) - NSMaxY(visibleFrame);
+	if (menuBarHeight < 1.0)
+	{
+		NSStatusBar *statusBar = [NSStatusBar systemStatusBar];
+		menuBarHeight = statusBar ? [statusBar thickness] : 24.0;
+	}
+	menuBarHeight = ceil(MAX(menuBarHeight, 24.0));
+
+	frame.size.height = MAX(1.0, NSHeight(frame) - menuBarHeight);
+	return frame;
+}
+
 static NSRect mac_safe_multimon_window_frame(NSScreen *screen, BOOL decorated)
 {
 	(void)decorated;
@@ -4751,7 +4769,9 @@ static NSArray *mac_multimon_slices(rdpSettings *settings, mfContext *mfc)
 			continue;
 
 		NSScreen *screen = [screens objectAtIndex:i];
-		NSRect visibleFrame = mac_safe_multimon_window_frame(screen, decorated);
+		NSRect visibleFrame = (mfc && (mfc->fullscreen_mode == 2))
+		                          ? mac_pseudo_fullscreen_frame(screen)
+		                          : mac_safe_multimon_window_frame(screen, decorated);
 		NSRect remoteFrame = mac_remote_frame_with_taskbar(visibleFrame, mfc);
 		NSRect remoteRect = NSMakeRect(NSMinX(remoteFrame), -NSMaxY(remoteFrame),
 		                               NSWidth(remoteFrame), NSHeight(remoteFrame));
@@ -4872,7 +4892,7 @@ static void mac_maximize_window_minus_menubar(rdpContext *context, NSWindow *win
 	if (!screen)
 		return;
 
-	NSRect visibleFrame = [screen visibleFrame];
+	NSRect visibleFrame = mac_pseudo_fullscreen_frame(screen);
 
 	NSRect frame = NSMakeRect(
 		NSMinX(visibleFrame),
@@ -5314,7 +5334,7 @@ static DISPLAY_CONTROL_MONITOR_LAYOUT mac_display_layout_for_screen(NSScreen *sc
 	                                                               mfContext *mfc)
 {
 	DISPLAY_CONTROL_MONITOR_LAYOUT layout = { 0 };
-	NSRect frame = useVisibleFrame ? [screen visibleFrame] : [screen frame];
+	NSRect frame = useVisibleFrame ? mac_pseudo_fullscreen_frame(screen) : [screen frame];
 	frame = mac_remote_frame_with_taskbar(frame, mfc);
 	NSNumber *screenNumber = [[screen deviceDescription] objectForKey:@"NSScreenNumber"];
 	const CGDirectDisplayID displayId = screenNumber ? [screenNumber unsignedIntValue] : 0;
