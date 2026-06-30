@@ -3,9 +3,13 @@
 
 #import <Cocoa/Cocoa.h>
 
-NSString *mac_keychain_copy_password(NSString *serverName, NSString *username, NSString *domain);
-BOOL mac_keychain_store_password(NSString *serverName, NSString *username, NSString *domain,
-                                 NSString *password);
-BOOL mac_keychain_delete_password(NSString *serverName, NSString *username, NSString *domain);
+#import <freerdp/api.h>
+
+FREERDP_API NSString *mac_keychain_copy_password(NSString *serverName, NSString *username,
+                                                 NSString *domain);
+FREERDP_API BOOL mac_keychain_store_password(NSString *serverName, NSString *username,
+                                             NSString *domain, NSString *password);
+FREERDP_API BOOL mac_keychain_delete_password(NSString *serverName, NSString *username,
+                                              NSString *domain);
 
 #endif /* FREERDP_CLIENT_MAC_KEYCHAIN_H */

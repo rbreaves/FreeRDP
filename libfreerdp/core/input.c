@@ -1063,6 +1063,17 @@ BOOL freerdp_input_send_unicode_keyboard_event(rdpInput* input, UINT16 flags, UI
 
 	input_update_last_event(input, FALSE, 0, 0);
 
+	const BOOL unicodeInput =
+	    freerdp_settings_get_bool(input->context->settings, FreeRDP_UnicodeInput);
+	WLog_INFO(TAG, "UNICODE_INPUT_TRACE code=U+%04X flags=0x%04X unicodeInput=%d path=%s",
+	          (unsigned int)code, (unsigned int)flags, unicodeInput,
+	          unicodeInput ? "slow" : "callback");
+
+	/* Some servers mishandle fast-path Unicode input after punctuation; slow-path preserves
+	 * the literal Unicode code points while still using Unicode keyboard events. */
+	if (unicodeInput)
+		return input_send_unicode_keyboard_event(input, flags, code);
+
 	return IFCALLRESULT(TRUE, input->UnicodeKeyboardEvent, input, flags, code);
 }
 

@@ -756,16 +756,31 @@ static UINT32 mac_char_to_scancode(unichar character, BOOL *outNeedsShift)
 {
 	*outNeedsShift = FALSE;
 
+	static const UINT32 letterScancodes[26] = {
+	    RDP_SCANCODE_KEY_A, RDP_SCANCODE_KEY_B, RDP_SCANCODE_KEY_C, RDP_SCANCODE_KEY_D,
+	    RDP_SCANCODE_KEY_E, RDP_SCANCODE_KEY_F, RDP_SCANCODE_KEY_G, RDP_SCANCODE_KEY_H,
+	    RDP_SCANCODE_KEY_I, RDP_SCANCODE_KEY_J, RDP_SCANCODE_KEY_K, RDP_SCANCODE_KEY_L,
+	    RDP_SCANCODE_KEY_M, RDP_SCANCODE_KEY_N, RDP_SCANCODE_KEY_O, RDP_SCANCODE_KEY_P,
+	    RDP_SCANCODE_KEY_Q, RDP_SCANCODE_KEY_R, RDP_SCANCODE_KEY_S, RDP_SCANCODE_KEY_T,
+	    RDP_SCANCODE_KEY_U, RDP_SCANCODE_KEY_V, RDP_SCANCODE_KEY_W, RDP_SCANCODE_KEY_X,
+	    RDP_SCANCODE_KEY_Y, RDP_SCANCODE_KEY_Z
+	};
+	static const UINT32 digitScancodes[10] = {
+	    RDP_SCANCODE_KEY_0, RDP_SCANCODE_KEY_1, RDP_SCANCODE_KEY_2, RDP_SCANCODE_KEY_3,
+	    RDP_SCANCODE_KEY_4, RDP_SCANCODE_KEY_5, RDP_SCANCODE_KEY_6, RDP_SCANCODE_KEY_7,
+	    RDP_SCANCODE_KEY_8, RDP_SCANCODE_KEY_9
+	};
+
 	if (character >= 'a' && character <= 'z')
-		return RDP_SCANCODE_KEY_A + (character - 'a');
+		return letterScancodes[character - 'a'];
 
 	if (character >= 'A' && character <= 'Z') {
 		*outNeedsShift = TRUE;
-		return RDP_SCANCODE_KEY_A + (character - 'A');
+		return letterScancodes[character - 'A'];
 	}
 
 	if (character >= '0' && character <= '9')
-		return RDP_SCANCODE_KEY_0 + (character - '0');
+		return digitScancodes[character - '0'];
 
 	switch (character) {
 		case ' ': return RDP_SCANCODE_SPACE;
@@ -2372,12 +2387,23 @@ static BOOL mac_send_rdp_scancode(rdpInput *input, UINT32 rdpScancode)
 	rdpInput *input = instance->context->input;
 	NSUInteger length = [string length];
 
+	WLog_INFO(TAG, "MAC_SEND_PASSWORD_TRACE begin length=%zu", (size_t)length);
+
 	for (NSUInteger index = 0; index < length; index++)
 	{
 		const unichar character = [string characterAtIndex:index];
-		(void)freerdp_input_send_unicode_keyboard_event(input, 0, character);
-		(void)freerdp_input_send_unicode_keyboard_event(input, KBD_FLAGS_RELEASE, character);
+		WLog_INFO(TAG, "MAC_SEND_PASSWORD_TRACE index=%zu code=U+%04X",
+		          (size_t)index, (unsigned int)character);
+		const BOOL downSent = freerdp_input_send_unicode_keyboard_event(input, 0, character);
+		Sleep(10);
+		const BOOL upSent =
+		    freerdp_input_send_unicode_keyboard_event(input, KBD_FLAGS_RELEASE, character);
+		Sleep(10);
+		WLog_INFO(TAG, "MAC_SEND_PASSWORD_TRACE index=%zu sent down=%d up=%d",
+		          (size_t)index, downSent, upSent);
 	}
+
+	WLog_INFO(TAG, "MAC_SEND_PASSWORD_TRACE end length=%zu", (size_t)length);
 }
 
 - (BOOL)sendRemoteClipboardString:(NSString *)string
@@ -2391,11 +2417,27 @@ static BOOL mac_send_rdp_scancode(rdpInput *input, UINT32 rdpScancode)
 	if (!data || (dataLen == 0))
 		return NO;
 
-	const UINT32 formatId = ClipboardRegisterFormat(mfc->clipboard, "text/plain");
-	if (!ClipboardSetData(mfc->clipboard, formatId, data, dataLen + 1))
+	BOOL storedFormat = FALSE;
+	const UINT32 plainTextFormatId = ClipboardRegisterFormat(mfc->clipboard, "text/plain");
+	storedFormat |= ClipboardSetData(mfc->clipboard, plainTextFormatId, data, dataLen + 1);
+
+	storedFormat |= ClipboardSetData(mfc->clipboard, CF_TEXT, data, dataLen + 1);
+
+	NSData *unicodeData = [string dataUsingEncoding:NSUTF16LittleEndianStringEncoding];
+	if (unicodeData && ([unicodeData length] > 0))
+	{
+		NSMutableData *unicodeClipboardData = [[unicodeData mutableCopy] autorelease];
+		const WCHAR nullTerminator = 0;
+		[unicodeClipboardData appendBytes:&nullTerminator length:sizeof(nullTerminator)];
+		storedFormat |= ClipboardSetData(mfc->clipboard, CF_UNICODETEXT,
+		                                  [unicodeClipboardData bytes],
+		                                  [unicodeClipboardData length]);
+	}
+
+	if (!storedFormat)
 		return NO;
 
-	return (mac_cliprdr_send_client_format_list(mfc->cliprdr) == CHANNEL_RC_OK);
+	return (mac_cliprdr_send_client_format_list(mfc->cliprdr) != 0);
 }
 
 - (void)sendRemoteStringViaKeyboard:(NSString *)string
@@ -2481,36 +2523,12 @@ static BOOL mac_send_rdp_scancode(rdpInput *input, UINT32 rdpScancode)
 	if (!instance || !instance->context || !instance->context->settings ||
 	    !freerdp_settings_get_bool(instance->context->settings, FreeRDP_UnicodeInput))
 	{
-		WLog_INFO(TAG, "Unicode input unavailable, trying clipboard...");
-		if (![self sendRemoteClipboardString:password])
-		{
-			WLog_INFO(TAG, "Clipboard failed, falling back to keyboard");
-			dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
-			               dispatch_get_main_queue(), ^{
-				               if (![self canSendRemoteInput])
-					               return;
-				               [self sendRemoteStringViaKeyboard:password];
-			               });
-			return;
-		}
-
-		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
-		               dispatch_get_main_queue(), ^{
-			               if (![self canSendRemoteInput])
-				               return;
-			               rdpInput *input = self->instance->context->input;
-			               (void)freerdp_input_send_keyboard_event_ex(input, TRUE, FALSE,
-			                                                    RDP_SCANCODE_LCONTROL);
-			               (void)freerdp_input_send_keyboard_event_ex(input, TRUE, FALSE,
-			                                                    RDP_SCANCODE_KEY_V);
-			               (void)freerdp_input_send_keyboard_event_ex(input, FALSE, FALSE,
-			                                                    RDP_SCANCODE_KEY_V);
-			               (void)freerdp_input_send_keyboard_event_ex(input, FALSE, FALSE,
-			                                                    RDP_SCANCODE_LCONTROL);
-		               });
+		WLog_INFO(TAG, "Unicode input unavailable; not sending password without modifier keys");
+		NSBeep();
 		return;
 	}
 
+	WLog_INFO(TAG, "Sending password via Unicode character input");
 	[self sendRemoteUnicodeString:password];
 }
 

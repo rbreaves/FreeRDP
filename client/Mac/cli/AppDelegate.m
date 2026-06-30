@@ -11,6 +11,7 @@
 #import <mfreerdp.h>
 #import <mf_client.h>
 #import <MRDPView.h>
+#import <MacKeychain.h>
 
 #import <winpr/assert.h>
 #import <winpr/string.h>
@@ -86,6 +87,7 @@ static NSString *const MRDPWindowDragTitlebarHeightKey = @"MRDPWindowDragTitleba
 static NSString *const MRDPModifierKeyswapModeKey = @"MRDPModifierKeyswapMode";
 static NSString *const MRDPModifierKeyswapFilterKey = @"MRDPModifierKeyswapFilter";
 static NSString *const MRDPTaskbarHideZOrderPIDsKey = @"MRDPTaskbarHideZOrderPIDs";
+static NSString *const MRDPAdditionalKeychainAccountsKey = @"MRDPAdditionalKeychainAccounts";
 static NSString *const MRDPStatusSessionDidUpdateNotification = @"org.freerdp.mac.statusSessionDidUpdate";
 static NSString *const MRDPStatusSessionWillTerminateNotification = @"org.freerdp.mac.statusSessionWillTerminate";
 static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusCommand";
@@ -1047,6 +1049,13 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	NSSlider *windowDragTitlebarHeightSlider;
 	NSTextField *windowDragTitlebarHeightValueLabel;
 	NSTextField *modifierKeyswapFilterField;
+	NSString *passwordAccountsEditorTarget;
+	NSTextField *passwordAccountsAccountField;
+	NSTextField *passwordAccountsPasswordField;
+	NSSecureTextField *passwordAccountsSecurePasswordField;
+	NSTextField *passwordAccountsPlainPasswordField;
+	NSTextField *passwordAccountsHelpLabel;
+	NSDictionary *passwordAccountsSelectedAccount;
 }
 - (void)ensureClientWindow;
 - (void)startLeftEdgeFocusMonitor;
@@ -1101,6 +1110,10 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 - (void)setTaskbarPositionFromMenuItem:(NSMenuItem *)menuItem;
 - (void)adjustTaskbarZOrderFromMenuItem:(NSMenuItem *)menuItem;
 - (void)showTaskbarSettingsFromMenuItem:(id)sender;
+- (void)showPasswordAccountsFromMenuItem:(id)sender;
+- (void)passwordAccountSelectionChanged:(NSPopUpButton *)sender;
+- (void)passwordAccountsShowPasswordChanged:(NSButton *)sender;
+- (NSString *)passwordAccountsCurrentPassword;
 - (void)updateSpacerWindow;
 - (void)showSpacerWindow;
 - (void)hideSpacerWindow;
@@ -1109,6 +1122,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 - (void)spacerEnforcementTimerFired:(NSTimer *)timer;
 - (void)enforceSpacerForWindows;
 - (void)sendPasswordFromMenuItem:(id)sender;
+- (void)sendPasswordAccountFromMenuItem:(NSMenuItem *)menuItem;
 - (void)sendCtrlAltDelFromMenuItem:(id)sender;
 - (void)sendRemoteKeyFromMenuItem:(NSMenuItem *)menuItem;
 - (void)sendRemoteBreakFromMenuItem:(id)sender;
@@ -1117,6 +1131,13 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 - (void)moveSessionToScreen:(NSScreen *)screen screenIndex:(NSInteger)screenIndex;
 - (BOOL)requestRemoteResizeForScreen:(NSScreen *)screen;
 - (NSString *)credentialTarget;
+- (NSString *)passwordAccountsDefaultsKey;
+- (NSDictionary *)defaultPasswordAccount;
+- (NSArray *)additionalPasswordAccounts;
+- (void)saveAdditionalPasswordAccounts:(NSArray *)accounts;
+- (NSDictionary *)passwordAccountFromText:(NSString *)text;
+- (NSString *)passwordAccountTitle:(NSDictionary *)account;
+- (BOOL)passwordAccount:(NSDictionary *)left matchesAccount:(NSDictionary *)right;
 - (NSString *)preferredScreenDefaultsKey;
 - (NSScreen *)preferredScreen;
 - (NSInteger)currentScreenIndex;
@@ -1154,6 +1175,8 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	[monitorSliceViews release];
 	[taskbarWindows release];
 	[taskbarSliceViews release];
+	[passwordAccountsEditorTarget release];
+	[passwordAccountsSelectedAccount release];
 	[super dealloc];
 }
 
@@ -1351,6 +1374,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	}
 
 	status = [self ParseCommandLineArguments];
+	[self configureMainMenu];
 	mfc = (mfContext *)context;
 	WINPR_ASSERT(mfc);
 	[self loadPreferredScreenFromDefaults];
@@ -2034,6 +2058,56 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		[appMenuItem setSubmenu:appMenu];
 	}
 
+	if (![mainMenu itemWithTitle:@"Edit"])
+	{
+		NSMenuItem *editMenuItem = [[[NSMenuItem alloc] initWithTitle:@"Edit"
+		                                                       action:nil
+		                                                keyEquivalent:@""] autorelease];
+		NSMenu *editMenu = [[[NSMenu alloc] initWithTitle:@"Edit"] autorelease];
+
+		NSMenuItem *undoItem = [[[NSMenuItem alloc] initWithTitle:@"Undo"
+		                                                   action:@selector(undo:)
+		                                            keyEquivalent:@"z"] autorelease];
+		[editMenu addItem:undoItem];
+
+		NSMenuItem *redoItem = [[[NSMenuItem alloc] initWithTitle:@"Redo"
+		                                                   action:@selector(redo:)
+		                                            keyEquivalent:@"Z"] autorelease];
+		[redoItem setKeyEquivalentModifierMask:(NSEventModifierFlagCommand |
+		                                      NSEventModifierFlagShift)];
+		[editMenu addItem:redoItem];
+		[editMenu addItem:[NSMenuItem separatorItem]];
+
+		NSMenuItem *cutItem = [[[NSMenuItem alloc] initWithTitle:@"Cut"
+		                                                  action:@selector(cut:)
+		                                           keyEquivalent:@"x"] autorelease];
+		[editMenu addItem:cutItem];
+
+		NSMenuItem *copyItem = [[[NSMenuItem alloc] initWithTitle:@"Copy"
+		                                                   action:@selector(copy:)
+		                                            keyEquivalent:@"c"] autorelease];
+		[editMenu addItem:copyItem];
+
+		NSMenuItem *pasteItem = [[[NSMenuItem alloc] initWithTitle:@"Paste"
+		                                                    action:@selector(paste:)
+		                                             keyEquivalent:@"v"] autorelease];
+		[editMenu addItem:pasteItem];
+
+		NSMenuItem *deleteItem = [[[NSMenuItem alloc] initWithTitle:@"Delete"
+		                                                     action:@selector(delete:)
+		                                              keyEquivalent:@""] autorelease];
+		[editMenu addItem:deleteItem];
+		[editMenu addItem:[NSMenuItem separatorItem]];
+
+		NSMenuItem *selectAllItem = [[[NSMenuItem alloc] initWithTitle:@"Select All"
+		                                                        action:@selector(selectAll:)
+		                                                 keyEquivalent:@"a"] autorelease];
+		[editMenu addItem:selectAllItem];
+
+		[editMenuItem setSubmenu:editMenu];
+		[mainMenu insertItem:editMenuItem atIndex:MIN(1, [mainMenu numberOfItems])];
+	}
+
 	NSMenuItem *existingRemote = [mainMenu itemWithTitle:@"Remote"];
 	if (existingRemote)
 		[mainMenu removeItem:existingRemote];
@@ -2044,9 +2118,43 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	NSMenu *remoteMenu = [[[NSMenu alloc] initWithTitle:@"Remote"] autorelease];
 
 	NSMenuItem *sendPasswordItem = [[[NSMenuItem alloc] initWithTitle:@"Send Password"
-	                                                        action:@selector(sendPasswordFromMenuItem:)
+	                                                        action:nil
 	                                                 keyEquivalent:@""] autorelease];
-	[sendPasswordItem setTarget:self];
+	NSMenu *sendPasswordMenu = [[[NSMenu alloc] initWithTitle:@"Send Password"] autorelease];
+	NSDictionary *defaultAccount = [self defaultPasswordAccount];
+	NSMenuItem *defaultPasswordItem =
+	    [[[NSMenuItem alloc] initWithTitle:[NSString stringWithFormat:@"Default - %@",
+	                                                                  [self passwordAccountTitle:defaultAccount]]
+	                                action:@selector(sendPasswordAccountFromMenuItem:)
+	                         keyEquivalent:@""] autorelease];
+	[defaultPasswordItem setTarget:self];
+	[defaultPasswordItem setRepresentedObject:defaultAccount ?: [NSDictionary dictionary]];
+	[sendPasswordMenu addItem:defaultPasswordItem];
+
+	NSArray *additionalAccounts = [self additionalPasswordAccounts];
+	if ([additionalAccounts count] > 0)
+	{
+		[sendPasswordMenu addItem:[NSMenuItem separatorItem]];
+		for (NSDictionary *account in additionalAccounts)
+		{
+			NSMenuItem *accountItem =
+			    [[[NSMenuItem alloc] initWithTitle:[self passwordAccountTitle:account]
+			                                action:@selector(sendPasswordAccountFromMenuItem:)
+			                         keyEquivalent:@""] autorelease];
+			[accountItem setTarget:self];
+			[accountItem setRepresentedObject:account];
+			[sendPasswordMenu addItem:accountItem];
+		}
+	}
+
+	[sendPasswordMenu addItem:[NSMenuItem separatorItem]];
+	NSMenuItem *configurePasswordsItem =
+	    [[[NSMenuItem alloc] initWithTitle:@"Configure Accounts..."
+	                                action:@selector(showPasswordAccountsFromMenuItem:)
+	                         keyEquivalent:@""] autorelease];
+	[configurePasswordsItem setTarget:self];
+	[sendPasswordMenu addItem:configurePasswordsItem];
+	[sendPasswordItem setSubmenu:sendPasswordMenu];
 	[remoteMenu addItem:sendPasswordItem];
 
 	NSMenuItem *cadItem = [[[NSMenuItem alloc] initWithTitle:@"Ctrl+Alt+Del"
@@ -2296,6 +2404,10 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	else if ([command isEqualToString:@"taskbarSettings"])
 	{
 		[self showTaskbarSettingsFromMenuItem:nil];
+	}
+	else if ([command isEqualToString:@"passwordAccounts"])
+	{
+		[self showPasswordAccountsFromMenuItem:nil];
 	}
 	else if ([command isEqualToString:@"taskbarZOrder"])
 	{
@@ -2583,6 +2695,18 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	                                       : [[session objectForKey:@"spacerPosition"] integerValue];
 	BOOL spacerEnabled = localSession ? (mfc && mfc->spacerEnabled)
 	                                 : [[session objectForKey:@"spacerEnabled"] boolValue];
+	NSMenuItem *configurePasswordsItem =
+	    [[[NSMenuItem alloc] initWithTitle:@"Configure"
+	                                action:(localSession ? @selector(showPasswordAccountsFromMenuItem:)
+	                                                      : @selector(remoteStatusCommandFromMenuItem:))
+	                         keyEquivalent:@""] autorelease];
+	[configurePasswordsItem setTarget:self];
+	if (!localSession)
+		[configurePasswordsItem setRepresentedObject:[NSDictionary dictionaryWithObjectsAndKeys:
+		                                                       session, @"session", @"passwordAccounts",
+		                                                       @"command", nil]];
+	[menu addItem:configurePasswordsItem];
+
 	NSMenuItem *spacerPositionItem = [[[NSMenuItem alloc] initWithTitle:@"Spacer Position"
 	                                                               action:nil
 	                                                        keyEquivalent:@""] autorelease];
@@ -3289,10 +3413,371 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	[alert release];
 }
 
-- (void)sendPasswordFromMenuItem:(id)sender
+- (NSString *)passwordAccountsDefaultsKey
+{
+	NSString *target = [self credentialTarget];
+
+	if ([target length] == 0)
+		return MRDPAdditionalKeychainAccountsKey;
+
+	return [NSString stringWithFormat:@"%@.%@", MRDPAdditionalKeychainAccountsKey, target];
+}
+
+- (NSDictionary *)defaultPasswordAccount
+{
+	NSString *username = nil;
+	NSString *domain = nil;
+
+	if (context && context->settings)
+	{
+		const char *user = freerdp_settings_get_string(context->settings, FreeRDP_Username);
+		const char *dom = freerdp_settings_get_string(context->settings, FreeRDP_Domain);
+		if (user && user[0])
+			username = [NSString stringWithCString:user encoding:NSUTF8StringEncoding];
+		if (dom && dom[0])
+			domain = [NSString stringWithCString:dom encoding:NSUTF8StringEncoding];
+	}
+
+	NSMutableDictionary *account = [NSMutableDictionary dictionary];
+	if ([username length] > 0)
+		[account setObject:username forKey:@"username"];
+	if ([domain length] > 0)
+		[account setObject:domain forKey:@"domain"];
+
+	return account;
+}
+
+- (BOOL)passwordAccount:(NSDictionary *)left matchesAccount:(NSDictionary *)right
+{
+	NSString *leftUsername = [left objectForKey:@"username"] ?: @"";
+	NSString *leftDomain = [left objectForKey:@"domain"] ?: @"";
+	NSString *rightUsername = [right objectForKey:@"username"] ?: @"";
+	NSString *rightDomain = [right objectForKey:@"domain"] ?: @"";
+
+	return ([leftUsername caseInsensitiveCompare:rightUsername] == NSOrderedSame) &&
+	       ([leftDomain caseInsensitiveCompare:rightDomain] == NSOrderedSame);
+}
+
+- (NSArray *)additionalPasswordAccounts
+{
+	NSArray *stored = [[NSUserDefaults standardUserDefaults] arrayForKey:[self passwordAccountsDefaultsKey]];
+	NSMutableArray *accounts = [NSMutableArray array];
+	NSDictionary *defaultAccount = [self defaultPasswordAccount];
+
+	for (NSDictionary *account in stored)
+	{
+		if (![account isKindOfClass:[NSDictionary class]])
+			continue;
+
+		NSString *username = [account objectForKey:@"username"];
+		if (![username isKindOfClass:[NSString class]] || ([username length] == 0))
+			continue;
+
+		NSMutableDictionary *cleanAccount = [NSMutableDictionary dictionaryWithObject:username
+		                                                                       forKey:@"username"];
+		NSString *domain = [account objectForKey:@"domain"];
+		if ([domain isKindOfClass:[NSString class]] && ([domain length] > 0))
+			[cleanAccount setObject:domain forKey:@"domain"];
+
+		if ([self passwordAccount:cleanAccount matchesAccount:defaultAccount])
+			continue;
+		if (![accounts containsObject:cleanAccount])
+			[accounts addObject:cleanAccount];
+	}
+
+	return accounts;
+}
+
+- (void)saveAdditionalPasswordAccounts:(NSArray *)accounts
+{
+	NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+	[defaults setObject:accounts ?: [NSArray array] forKey:[self passwordAccountsDefaultsKey]];
+	[defaults synchronize];
+}
+
+- (NSDictionary *)passwordAccountFromText:(NSString *)text
+{
+	NSString *trimmed = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+	if ([trimmed length] == 0)
+		return nil;
+
+	NSRange slash = [trimmed rangeOfString:@"\\"];
+	if (slash.location != NSNotFound && slash.location > 0 && (slash.location + 1) < [trimmed length])
+	{
+		NSString *domain = [trimmed substringToIndex:slash.location];
+		NSString *username = [trimmed substringFromIndex:(slash.location + 1)];
+		return [NSDictionary dictionaryWithObjectsAndKeys:username, @"username", domain, @"domain", nil];
+	}
+
+	return [NSDictionary dictionaryWithObject:trimmed forKey:@"username"];
+}
+
+- (NSString *)passwordAccountTitle:(NSDictionary *)account
+{
+	NSString *username = [account objectForKey:@"username"];
+	NSString *domain = [account objectForKey:@"domain"];
+
+	if ([username length] == 0)
+		return @"Current Login Account";
+	if ([domain length] > 0)
+		return [NSString stringWithFormat:@"%@\\%@", domain, username];
+
+	return username;
+}
+
+- (NSString *)passwordAccountsCurrentPassword
+{
+	if (!passwordAccountsPasswordField)
+		return @"";
+
+	NSWindow *fieldWindow = [passwordAccountsPasswordField window];
+	id firstResponder = [fieldWindow firstResponder];
+	if ([firstResponder isKindOfClass:[NSTextView class]] &&
+	    (id)[(NSTextView *)firstResponder delegate] == (id)passwordAccountsPasswordField)
+		return [(NSTextView *)firstResponder string] ?: @"";
+
+	return [passwordAccountsPasswordField stringValue] ?: @"";
+}
+
+- (void)passwordAccountsShowPasswordChanged:(NSButton *)sender
+{
+	NSString *password = [self passwordAccountsCurrentPassword];
+	BOOL showPassword = ([sender state] == NSControlStateValueOn);
+
+	[passwordAccountsSecurePasswordField setStringValue:password ?: @""];
+	[passwordAccountsPlainPasswordField setStringValue:password ?: @""];
+	[passwordAccountsSecurePasswordField setHidden:showPassword];
+	[passwordAccountsPlainPasswordField setHidden:!showPassword];
+	passwordAccountsPasswordField =
+	    showPassword ? (NSTextField *)passwordAccountsPlainPasswordField
+	                 : (NSTextField *)passwordAccountsSecurePasswordField;
+	[[sender window] makeFirstResponder:passwordAccountsPasswordField];
+}
+
+- (void)passwordAccountSelectionChanged:(NSPopUpButton *)sender
+{
+	NSDictionary *account = [[sender selectedItem] representedObject];
+	[passwordAccountsSelectedAccount release];
+	passwordAccountsSelectedAccount = [account retain];
+	if (!account)
+	{
+		[passwordAccountsAccountField setStringValue:@""];
+		[passwordAccountsPasswordField setStringValue:@""];
+		[passwordAccountsSecurePasswordField setStringValue:@""];
+		[passwordAccountsPlainPasswordField setStringValue:@""];
+		[passwordAccountsHelpLabel
+		    setStringValue:@"Choose an account to edit it, or type a new account below."];
+		return;
+	}
+
+	NSString *accountText = [self passwordAccountTitle:account];
+	NSString *password = mac_keychain_copy_password(passwordAccountsEditorTarget,
+	                                                [account objectForKey:@"username"],
+	                                                [account objectForKey:@"domain"]);
+
+	[passwordAccountsAccountField setStringValue:accountText ?: @""];
+	[passwordAccountsPasswordField setStringValue:password ?: @""];
+	[passwordAccountsSecurePasswordField setStringValue:password ?: @""];
+	[passwordAccountsPlainPasswordField setStringValue:password ?: @""];
+	[passwordAccountsHelpLabel
+	    setStringValue:@"Selected account loaded. Change fields, then Save Account."];
+	[[passwordAccountsAccountField window] makeFirstResponder:passwordAccountsPasswordField];
+}
+
+- (void)showPasswordAccountsFromMenuItem:(id)sender
 {
 	(void)sender;
 
+	NSString *target = [self credentialTarget];
+	if ([target length] == 0)
+	{
+		NSBeep();
+		return;
+	}
+
+	BOOL done = NO;
+	while (!done)
+	{
+		NSArray *accounts = [self additionalPasswordAccounts];
+		NSAlert *alert = [[NSAlert alloc] init];
+		[alert setMessageText:@"Password Accounts"];
+		[alert setInformativeText:
+		           @"Choose an existing account to edit it, or type a new account. Passwords are stored in macOS Keychain."];
+		[alert addButtonWithTitle:@"Save Account"];
+		[alert addButtonWithTitle:@"Remove Selected"];
+		[alert addButtonWithTitle:@"Done"];
+
+		NSView *accessoryView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 420, 202)];
+		NSTextField *defaultLabel = [[[NSTextField alloc] initWithFrame:NSMakeRect(0, 174, 420, 20)]
+		    autorelease];
+		[defaultLabel setStringValue:[NSString stringWithFormat:@"Default: %@",
+		                                                        [self passwordAccountTitle:[self defaultPasswordAccount]]]];
+		[defaultLabel setEditable:NO];
+		[defaultLabel setBezeled:NO];
+		[defaultLabel setDrawsBackground:NO];
+		[accessoryView addSubview:defaultLabel];
+
+		NSTextField *existingLabel = [[[NSTextField alloc] initWithFrame:NSMakeRect(0, 144, 120, 20)]
+		    autorelease];
+		[existingLabel setStringValue:@"Existing:"];
+		[existingLabel setEditable:NO];
+		[existingLabel setBezeled:NO];
+		[existingLabel setDrawsBackground:NO];
+		[accessoryView addSubview:existingLabel];
+
+		NSPopUpButton *existingPopup =
+		    [[[NSPopUpButton alloc] initWithFrame:NSMakeRect(125, 140, 295, 26) pullsDown:NO] autorelease];
+		[existingPopup addItemWithTitle:@"Choose account to edit"];
+		[[existingPopup itemAtIndex:0] setRepresentedObject:nil];
+		for (NSDictionary *account in accounts)
+		{
+			[existingPopup addItemWithTitle:[self passwordAccountTitle:account]];
+			[[existingPopup lastItem] setRepresentedObject:account];
+		}
+		[existingPopup setTarget:self];
+		[existingPopup setAction:@selector(passwordAccountSelectionChanged:)];
+		[accessoryView addSubview:existingPopup];
+
+		NSTextField *helpLabel = [[[NSTextField alloc] initWithFrame:NSMakeRect(125, 114, 295, 18)]
+		    autorelease];
+		[helpLabel setStringValue:@"Choose an account to edit it, or type a new account below."];
+		[helpLabel setEditable:NO];
+		[helpLabel setBezeled:NO];
+		[helpLabel setDrawsBackground:NO];
+		[helpLabel setFont:[NSFont systemFontOfSize:[NSFont smallSystemFontSize]]];
+		[helpLabel setTextColor:[NSColor disabledControlTextColor]];
+		[accessoryView addSubview:helpLabel];
+
+		NSTextField *accountLabel = [[[NSTextField alloc] initWithFrame:NSMakeRect(0, 86, 120, 20)]
+		    autorelease];
+		[accountLabel setStringValue:@"Account:"];
+		[accountLabel setEditable:NO];
+		[accountLabel setBezeled:NO];
+		[accountLabel setDrawsBackground:NO];
+		[accessoryView addSubview:accountLabel];
+
+		NSTextField *accountField = [[[NSTextField alloc] initWithFrame:NSMakeRect(125, 82, 295, 24)]
+		    autorelease];
+		[accountField setPlaceholderString:@"DOMAIN\\user or user@example.com"];
+		[accessoryView addSubview:accountField];
+
+		NSTextField *passwordLabel = [[[NSTextField alloc] initWithFrame:NSMakeRect(0, 50, 120, 20)]
+		    autorelease];
+		[passwordLabel setStringValue:@"Password:"];
+		[passwordLabel setEditable:NO];
+		[passwordLabel setBezeled:NO];
+		[passwordLabel setDrawsBackground:NO];
+		[accessoryView addSubview:passwordLabel];
+
+		NSSecureTextField *passwordField =
+		    [[[NSSecureTextField alloc] initWithFrame:NSMakeRect(125, 46, 295, 24)] autorelease];
+		[accessoryView addSubview:passwordField];
+
+		NSTextField *plainPasswordField =
+		    [[[NSTextField alloc] initWithFrame:NSMakeRect(125, 46, 295, 24)] autorelease];
+		[plainPasswordField setHidden:YES];
+		[accessoryView addSubview:plainPasswordField];
+
+		NSButton *showPasswordButton =
+		    [[[NSButton alloc] initWithFrame:NSMakeRect(125, 14, 160, 22)] autorelease];
+		[showPasswordButton setButtonType:NSButtonTypeSwitch];
+		[showPasswordButton setTitle:@"Show password"];
+		[showPasswordButton setTarget:self];
+		[showPasswordButton setAction:@selector(passwordAccountsShowPasswordChanged:)];
+		[accessoryView addSubview:showPasswordButton];
+
+		[passwordAccountsEditorTarget release];
+		passwordAccountsEditorTarget = [target retain];
+		passwordAccountsAccountField = accountField;
+		passwordAccountsPasswordField = passwordField;
+		passwordAccountsSecurePasswordField = passwordField;
+		passwordAccountsPlainPasswordField = plainPasswordField;
+		passwordAccountsHelpLabel = helpLabel;
+
+		[alert setAccessoryView:accessoryView];
+		[[alert window] setInitialFirstResponder:accountField];
+		NSModalResponse response = [alert runModal];
+
+		if (response == NSAlertFirstButtonReturn)
+		{
+			NSDictionary *account = [self passwordAccountFromText:[accountField stringValue]];
+			NSString *password = [self passwordAccountsCurrentPassword];
+			if (!account || ([password length] == 0))
+			{
+				NSBeep();
+			}
+			else if ([self passwordAccount:account matchesAccount:[self defaultPasswordAccount]])
+			{
+				(void)mac_keychain_store_password(target, [account objectForKey:@"username"],
+				                                  [account objectForKey:@"domain"], password);
+			}
+			else
+			{
+				NSMutableArray *updatedAccounts = [[accounts mutableCopy] autorelease];
+				for (NSInteger index = (NSInteger)[updatedAccounts count] - 1; index >= 0; index--)
+				{
+					if ([self passwordAccount:[updatedAccounts objectAtIndex:(NSUInteger)index]
+					           matchesAccount:account] ||
+					    [self passwordAccount:[updatedAccounts objectAtIndex:(NSUInteger)index]
+					           matchesAccount:passwordAccountsSelectedAccount])
+						[updatedAccounts removeObjectAtIndex:(NSUInteger)index];
+				}
+				[updatedAccounts addObject:account];
+				[self saveAdditionalPasswordAccounts:updatedAccounts];
+				(void)mac_keychain_store_password(target, [account objectForKey:@"username"],
+				                                  [account objectForKey:@"domain"], password);
+				[self configureMainMenu];
+			}
+		}
+		else if (response == NSAlertSecondButtonReturn)
+		{
+			NSDictionary *account = [[existingPopup selectedItem] representedObject];
+			if (!account)
+			{
+				NSBeep();
+			}
+			else
+			{
+				NSMutableArray *updatedAccounts = [[accounts mutableCopy] autorelease];
+				for (NSInteger index = (NSInteger)[updatedAccounts count] - 1; index >= 0; index--)
+				{
+					if ([self passwordAccount:[updatedAccounts objectAtIndex:(NSUInteger)index]
+					           matchesAccount:account])
+						[updatedAccounts removeObjectAtIndex:(NSUInteger)index];
+				}
+				[self saveAdditionalPasswordAccounts:updatedAccounts];
+				(void)mac_keychain_delete_password(target, [account objectForKey:@"username"],
+				                                   [account objectForKey:@"domain"]);
+				[self configureMainMenu];
+			}
+		}
+		else
+		{
+			done = YES;
+		}
+
+		[accessoryView release];
+		[alert release];
+		passwordAccountsAccountField = nil;
+		passwordAccountsPasswordField = nil;
+		passwordAccountsSecurePasswordField = nil;
+		passwordAccountsPlainPasswordField = nil;
+		passwordAccountsHelpLabel = nil;
+		[passwordAccountsEditorTarget release];
+		passwordAccountsEditorTarget = nil;
+		[passwordAccountsSelectedAccount release];
+		passwordAccountsSelectedAccount = nil;
+	}
+}
+
+- (void)sendPasswordFromMenuItem:(id)sender
+{
+	(void)sender;
+	[self sendPasswordAccountFromMenuItem:nil];
+}
+
+- (void)sendPasswordAccountFromMenuItem:(NSMenuItem *)menuItem
+{
 	if (!mrdpView || ![mrdpView canSendRemoteInput])
 	{
 		NSBeep();
@@ -3302,8 +3787,14 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	NSString *target = [self credentialTarget];
 	NSString *username = nil;
 	NSString *domain = nil;
+	NSDictionary *account = [menuItem representedObject];
 
-	if (context && context->settings)
+	if ([account isKindOfClass:[NSDictionary class]] && ([[account objectForKey:@"username"] length] > 0))
+	{
+		username = [account objectForKey:@"username"];
+		domain = [account objectForKey:@"domain"];
+	}
+	else if (context && context->settings)
 	{
 		const char *user = freerdp_settings_get_string(context->settings, FreeRDP_Username);
 		const char *dom = freerdp_settings_get_string(context->settings, FreeRDP_Domain);
