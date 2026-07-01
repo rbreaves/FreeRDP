@@ -69,6 +69,9 @@
 	NSRect deferredWindowDragBaseRect;
 	NSRect deferredWindowDragOutlineRect;
 	BOOL windowDragTitlebarPreviewVisible;
+	BOOL dynamicTitlebarTintApplied;
+	UINT32 dynamicTitlebarTintRGB;
+	NSView *dynamicTitlebarTintView;
   @public
 	NSPasteboard *pasteboard_rd;
 	NSPasteboard *pasteboard_wr;

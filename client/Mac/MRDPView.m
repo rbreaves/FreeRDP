@@ -380,6 +380,19 @@ static BOOL mrdp_reconstruct_window_drag_rect(const uint8_t *mask, const UINT32 
 	return TRUE;
 }
 
+@interface MRDPTitlebarTintView : NSView
+@end
+
+@implementation MRDPTitlebarTintView
+
+- (NSView *)hitTest:(NSPoint)point
+{
+	(void)point;
+	return nil;
+}
+
+@end
+
 @implementation MRDPView
 
 @synthesize is_connected;
@@ -945,6 +958,169 @@ DWORD WINAPI mac_client_thread(void *param)
 		[self setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
 		[self setOpaque:NO];
 		initialized = YES;
+	}
+}
+
+- (BOOL)sampleRemoteTitlebarTintRGB:(UINT32 *)outRGB
+{
+	if (!context || !context->gdi || !context->gdi->primary_buffer || !outRGB)
+		return NO;
+
+	rdpGdi *gdi = context->gdi;
+	const size_t width = gdi->width;
+	const size_t height = gdi->height;
+	if ((width == 0) || (height == 0))
+		return NO;
+
+	uint32_t *buffer = (uint32_t *)gdi->primary_buffer;
+	const size_t rows = MIN((size_t)3, height);
+	const size_t sampleStep = MAX((size_t)1, width / 512);
+	uint64_t red = 0;
+	uint64_t green = 0;
+	uint64_t blue = 0;
+	uint64_t count = 0;
+
+	for (size_t y = 0; y < rows; y++)
+	{
+		for (size_t x = 0; x < width; x += sampleStep)
+		{
+			const uint32_t pixel = buffer[(y * width) + x];
+			if (mac_is_chroma_key_pixel(mfc, pixel))
+				continue;
+
+			blue += (pixel >> 0) & 0xFF;
+			green += (pixel >> 8) & 0xFF;
+			red += (pixel >> 16) & 0xFF;
+			count++;
+		}
+	}
+
+	if (count == 0)
+		return NO;
+
+	const UINT32 avgR = (UINT32)(red / count);
+	const UINT32 avgG = (UINT32)(green / count);
+	const UINT32 avgB = (UINT32)(blue / count);
+	*outRGB = ((avgR & 0xFF) << 16) | ((avgG & 0xFF) << 8) | (avgB & 0xFF);
+	return YES;
+}
+
+- (BOOL)shouldUseDynamicTitlebarTintForWindow:(NSWindow *)targetWindow
+{
+	if (!targetWindow || !context || !context->settings)
+		return NO;
+
+	if (!freerdp_settings_get_bool(context->settings, FreeRDP_Decorations))
+		return NO;
+
+	return ([targetWindow styleMask] & NSWindowStyleMaskTitled) != 0;
+}
+
+- (NSRect)dynamicTitlebarTintFrameForWindow:(NSWindow *)targetWindow
+{
+	NSView *contentView = [targetWindow contentView];
+	NSView *frameView = [contentView superview];
+	if (!frameView)
+		return NSZeroRect;
+
+	NSRect frameBounds = [frameView bounds];
+	NSRect contentFrame = [contentView frame];
+	CGFloat titlebarHeight = NSHeight(frameBounds) - NSMaxY(contentFrame);
+	if (titlebarHeight <= 0.0)
+	{
+		NSRect windowFrame = [targetWindow frame];
+		NSRect contentRect = [targetWindow contentRectForFrameRect:windowFrame];
+		titlebarHeight = NSHeight(windowFrame) - NSHeight(contentRect);
+	}
+
+	titlebarHeight = MAX(1.0, titlebarHeight);
+	return NSMakeRect(NSMinX(frameBounds), NSMaxY(frameBounds) - titlebarHeight,
+	                  NSWidth(frameBounds), titlebarHeight);
+}
+
+- (void)resetDynamicTitlebarTint
+{
+	NSWindow *targetWindow = [self window];
+	if (dynamicTitlebarTintView)
+	{
+		[dynamicTitlebarTintView removeFromSuperview];
+		[dynamicTitlebarTintView release];
+		dynamicTitlebarTintView = nil;
+	}
+
+	dynamicTitlebarTintApplied = NO;
+	dynamicTitlebarTintRGB = 0;
+
+	if (!targetWindow)
+		return;
+
+	if ([self shouldUseDynamicTitlebarTintForWindow:targetWindow])
+		[targetWindow setTitlebarAppearsTransparent:NO];
+	else
+		[targetWindow setTitlebarAppearsTransparent:YES];
+	[targetWindow setBackgroundColor:[NSColor clearColor]];
+}
+
+- (void)updateDynamicTitlebarTintFromFramebuffer
+{
+	NSWindow *targetWindow = [self window];
+	UINT32 rgb = 0;
+	if (![self shouldUseDynamicTitlebarTintForWindow:targetWindow] ||
+	    ![self sampleRemoteTitlebarTintRGB:&rgb])
+	{
+		if (dynamicTitlebarTintApplied || dynamicTitlebarTintView)
+			[self resetDynamicTitlebarTint];
+		return;
+	}
+
+	const int oldR = (int)((dynamicTitlebarTintRGB >> 16) & 0xFF);
+	const int oldG = (int)((dynamicTitlebarTintRGB >> 8) & 0xFF);
+	const int oldB = (int)(dynamicTitlebarTintRGB & 0xFF);
+	const int newR = (int)((rgb >> 16) & 0xFF);
+	const int newG = (int)((rgb >> 8) & 0xFF);
+	const int newB = (int)(rgb & 0xFF);
+	const BOOL sameColor = dynamicTitlebarTintApplied &&
+	                       (abs(oldR - newR) <= 2) &&
+	                       (abs(oldG - newG) <= 2) &&
+	                       (abs(oldB - newB) <= 2);
+
+	NSView *contentView = [targetWindow contentView];
+	NSView *frameView = [contentView superview];
+	if (!frameView)
+		return;
+
+	if (!dynamicTitlebarTintView)
+	{
+		dynamicTitlebarTintView =
+		    [[MRDPTitlebarTintView alloc] initWithFrame:[self dynamicTitlebarTintFrameForWindow:targetWindow]];
+		[dynamicTitlebarTintView setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
+		[dynamicTitlebarTintView setWantsLayer:YES];
+		[frameView addSubview:dynamicTitlebarTintView
+		           positioned:NSWindowBelow
+		           relativeTo:contentView];
+	}
+	else if ([dynamicTitlebarTintView superview] != frameView)
+	{
+		[dynamicTitlebarTintView removeFromSuperview];
+		[frameView addSubview:dynamicTitlebarTintView
+		           positioned:NSWindowBelow
+		           relativeTo:contentView];
+	}
+
+	[dynamicTitlebarTintView setFrame:[self dynamicTitlebarTintFrameForWindow:targetWindow]];
+	[targetWindow setTitlebarAppearsTransparent:YES];
+	[targetWindow setBackgroundColor:[NSColor clearColor]];
+
+	if (!sameColor)
+	{
+		NSColor *color =
+		    [NSColor colorWithCalibratedRed:(CGFloat)newR / 255.0
+		                              green:(CGFloat)newG / 255.0
+		                               blue:(CGFloat)newB / 255.0
+		                              alpha:1.0];
+		[[dynamicTitlebarTintView layer] setBackgroundColor:[color CGColor]];
+		dynamicTitlebarTintRGB = rgb;
+		dynamicTitlebarTintApplied = YES;
 	}
 }
 
@@ -2848,6 +3024,7 @@ static BOOL mac_has_chroma_key_margin(const mfContext *mfc, const rdpGdi *gdi, i
 - (void)releaseResources
 {
 	[self endDeferredWindowDrag];
+	[self resetDynamicTitlebarTint];
 	[self stopMousePassThroughMonitor];
 	[[self window] setIgnoresMouseEvents:NO];
 	mousePassThroughArmed = NO;
@@ -3031,6 +3208,7 @@ static BOOL mac_has_chroma_key_margin(const mfContext *mfc, const rdpGdi *gdi, i
 	if (windowDragTitlebarPreviewVisible)
 		[self drawWindowDragTitlebarPreview];
 
+	[self updateDynamicTitlebarTintFromFramebuffer];
 	[self scheduleMousePassThroughSync];
 	[[NSNotificationCenter defaultCenter] postNotificationName:@"MRDPMultimonFramebufferDidUpdate"
 	                                                    object:self];
