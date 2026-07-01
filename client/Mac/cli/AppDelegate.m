@@ -84,6 +84,7 @@ static NSString *const MRDPAdditionalTransparencyTolerancesKey = @"MRDPAdditiona
 static NSString *const MRDPAdditionalTransparencyBlurKey = @"MRDPAdditionalTransparencyBlur";
 static NSString *const MRDPWindowShadowsEnabledKey = @"MRDPWindowShadowsEnabled";
 static NSString *const MRDPWindowDragTitlebarHeightKey = @"MRDPWindowDragTitlebarHeight";
+static NSString *const MRDPWindowAliasKey = @"MRDPWindowAlias";
 static NSString *const MRDPModifierKeyswapModeKey = @"MRDPModifierKeyswapMode";
 static NSString *const MRDPModifierKeyswapFilterKey = @"MRDPModifierKeyswapFilter";
 static NSString *const MRDPSpacerEnabledKey = @"MRDPSpacerEnabled";
@@ -1195,6 +1196,9 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 - (BOOL)requestRemoteResizeForScreen:(NSScreen *)screen;
 - (NSString *)credentialTarget;
 - (NSString *)settingsDefaultsKeyForKey:(NSString *)key;
+- (NSString *)windowAliasFromDefaults;
+- (NSString *)effectiveWindowTitle;
+- (void)applyWindowTitleFromSettings;
 - (NSString *)passwordAccountsDefaultsKey;
 - (NSDictionary *)defaultPasswordAccount;
 - (NSArray *)additionalPasswordAccounts;
@@ -1482,27 +1486,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		PubSub_SubscribeEmbedWindow(context->pubSub, AppDelegate_EmbedWindowEventHandler);
 		PubSub_SubscribeResizeWindow(context->pubSub, AppDelegate_ResizeWindowEventHandler);
 		freerdp_client_start(context);
-		NSString *winTitle;
-		const char *WindowTitle = freerdp_settings_get_string(settings, FreeRDP_WindowTitle);
-
-		if (WindowTitle && WindowTitle[0])
-		{
-			winTitle = [[NSString alloc]
-			    initWithFormat:@"%@", [NSString stringWithCString:WindowTitle
-			                                             encoding:NSUTF8StringEncoding]];
-		}
-		else
-		{
-			const char *name = freerdp_settings_get_string(settings, FreeRDP_ServerHostname);
-			const UINT32 port = freerdp_settings_get_uint32(settings, FreeRDP_ServerPort);
-			winTitle = [[NSString alloc]
-			    initWithFormat:@"%@:%u",
-			                   [NSString stringWithCString:name encoding:NSUTF8StringEncoding],
-			                   port];
-		}
-
-		[window setTitle:winTitle];
-		[self broadcastStatusSessionUpdate];
+		[self applyWindowTitleFromSettings];
 	}
 	else
 	{
@@ -3045,12 +3029,23 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	mfContext *mfc = (mfContext *)context;
 	NSAlert *alert = [[NSAlert alloc] init];
 	[alert setMessageText:@"Settings"];
-	[alert setInformativeText:@"Choose modifier keyswap, window display behavior, drag titlebar height, chroma key color, and extra per-color transparency."];
+	[alert setInformativeText:@"Choose title alias, modifier keyswap, window display behavior, chroma key color, and extra per-color transparency."];
 	[alert addButtonWithTitle:@"OK"];
 	[alert addButtonWithTitle:@"Cancel"];
 	[alert addButtonWithTitle:@"Configure Accounts..."];
 
-	NSView *accessoryView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 360, 286)];
+	NSView *accessoryView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 360, 320)];
+
+	NSTextField *aliasLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 290, 120, 20)];
+	[aliasLabel setStringValue:@"Title Alias:"];
+	[aliasLabel setEditable:NO];
+	[aliasLabel setBezeled:NO];
+	[aliasLabel setDrawsBackground:NO];
+	[accessoryView addSubview:aliasLabel];
+
+	NSTextField *aliasInput = [[NSTextField alloc] initWithFrame:NSMakeRect(130, 288, 230, 24)];
+	[aliasInput setStringValue:[self windowAliasFromDefaults] ?: @""];
+	[accessoryView addSubview:aliasInput];
 
 	NSTextField *modifierKeyswapLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(0, 256, 120, 20)];
 	[modifierKeyswapLabel setStringValue:@"Modifier keyswap:"];
@@ -3197,6 +3192,9 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 
 		if (validColor && validAdditionalColors)
 		{
+			NSString *alias =
+			    [[aliasInput stringValue] stringByTrimmingCharactersInSet:
+			                              [NSCharacterSet whitespaceAndNewlineCharacterSet]];
 			mfc->windowShadowsEnabled = [shadowCheckbox state] == NSControlStateValueOn;
 			mfc->windowDragTitlebarHeight =
 			    (UINT32)MIN(MAX([dragHeightSlider integerValue], 1), 200);
@@ -3219,6 +3217,11 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 			       additionalColorCount * sizeof(BOOL));
 
 			NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+			NSString *aliasKey = [self settingsDefaultsKeyForKey:MRDPWindowAliasKey];
+			if ([alias length] > 0)
+				[defaults setObject:alias forKey:aliasKey];
+			else
+				[defaults removeObjectForKey:aliasKey];
 			[defaults setBool:mfc->windowShadowsEnabled
 			        forKey:[self settingsDefaultsKeyForKey:MRDPWindowShadowsEnabledKey]];
 			[defaults setInteger:(NSInteger)mfc->windowDragTitlebarHeight
@@ -3245,6 +3248,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 			             forKey:[self settingsDefaultsKeyForKey:MRDPAdditionalTransparencyBlurKey]];
 			[defaults synchronize];
 
+			[self applyWindowTitleFromSettings];
 			[self applyWindowDecorationsFromSettings];
 
 			if (mrdpView)
@@ -4001,6 +4005,50 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	return [NSString stringWithFormat:@"%@.%@", key, target];
 }
 
+- (NSString *)windowAliasFromDefaults
+{
+	NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+	NSString *alias = [defaults stringForKey:[self settingsDefaultsKeyForKey:MRDPWindowAliasKey]];
+	alias = [alias stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+
+	return ([alias length] > 0) ? alias : nil;
+}
+
+- (NSString *)effectiveWindowTitle
+{
+	if (context && context->settings)
+	{
+		const char *WindowTitle = freerdp_settings_get_string(context->settings, FreeRDP_WindowTitle);
+		if (WindowTitle && WindowTitle[0])
+			return [NSString stringWithCString:WindowTitle encoding:NSUTF8StringEncoding];
+	}
+
+	NSString *alias = [self windowAliasFromDefaults];
+	if ([alias length] > 0)
+		return alias;
+
+	NSString *target = [self credentialTarget];
+	if ([target length] > 0)
+		return target;
+
+	if ([window title] && [[window title] length] > 0)
+		return [window title];
+
+	return @"Current Session";
+}
+
+- (void)applyWindowTitleFromSettings
+{
+	NSString *title = [self effectiveWindowTitle];
+	if ([title length] == 0)
+		return;
+
+	[window setTitle:title];
+	[self syncMultimonWindows];
+	[self syncTaskbarHideWindows];
+	[self broadcastStatusSessionUpdate];
+}
+
 - (NSString *)preferredScreenDefaultsKey
 {
 	NSString *target = [self credentialTarget];
@@ -4028,15 +4076,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 
 - (NSString *)sessionMenuTitle
 {
-	NSString *target = [self credentialTarget];
-
-	if ([target length] > 0)
-		return target;
-
-	if ([window title] && [[window title] length] > 0)
-		return [window title];
-
-	return @"Current Session";
+	return [self effectiveWindowTitle];
 }
 
 - (NSArray *)runningMacFreeRDPApplications
