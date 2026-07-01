@@ -58,6 +58,63 @@
 
 #define TAG CLIENT_TAG("mac")
 
+static BOOL mac_view_system_uses_dark_appearance(void)
+{
+	NSString *interfaceStyle =
+	    [[NSUserDefaults standardUserDefaults] stringForKey:@"AppleInterfaceStyle"];
+	if ([interfaceStyle caseInsensitiveCompare:@"Dark"] == NSOrderedSame)
+		return YES;
+
+	if (@available(macOS 10.14, *))
+	{
+		NSAppearance *appearance = [NSApp effectiveAppearance];
+		if (!appearance)
+		{
+			if (@available(macOS 12.0, *))
+				appearance = [NSAppearance currentDrawingAppearance];
+		}
+		if (!appearance)
+			return NO;
+		NSString *bestMatch =
+		    [appearance bestMatchFromAppearancesWithNames:@[ NSAppearanceNameAqua,
+		                                                     NSAppearanceNameDarkAqua ]];
+		return [bestMatch isEqualToString:NSAppearanceNameDarkAqua];
+	}
+
+	return NO;
+}
+
+static NSColor *mac_view_startup_background_color(void)
+{
+	if (mac_view_system_uses_dark_appearance())
+		return [NSColor colorWithCalibratedWhite:0.10 alpha:1.0];
+
+	return [NSColor clearColor];
+}
+
+static void mac_view_apply_startup_background(NSView *view, BOOL connected)
+{
+	if (!view)
+		return;
+
+	NSColor *backgroundColor = connected ? [NSColor clearColor] : mac_view_startup_background_color();
+	if (!connected && mac_view_system_uses_dark_appearance())
+	{
+		[view setWantsLayer:YES];
+		[[view layer] setBackgroundColor:[backgroundColor CGColor]];
+	}
+	else if ([view wantsLayer])
+	{
+		[[view layer] setBackgroundColor:[[NSColor clearColor] CGColor]];
+	}
+}
+
+static void mac_view_fill_startup_background(NSRect rect)
+{
+	[mac_view_startup_background_color() set];
+	NSRectFill(rect);
+}
+
 static BOOL mf_Pointer_New(rdpContext *context, rdpPointer *pointer);
 static void mf_Pointer_Free(rdpContext *context, rdpPointer *pointer);
 static BOOL mf_Pointer_Set(rdpContext *context, rdpPointer *pointer);
@@ -397,6 +454,21 @@ static BOOL mrdp_reconstruct_window_drag_rect(const uint8_t *mask, const UINT32 
 
 @synthesize is_connected;
 
+- (int)is_connected
+{
+	return is_connected;
+}
+
+- (void)setIs_connected:(int)connected
+{
+	is_connected = connected;
+	dispatch_async(dispatch_get_main_queue(), ^{
+		mac_view_apply_startup_background(self,
+		                                  (connected != 0) && self->receivedFirstRemotePaint);
+		[self setNeedsDisplay:YES];
+	});
+}
+
 - (int)rdpStart:(rdpContext *)rdp_context
 {
 	rdpSettings *settings;
@@ -407,6 +479,7 @@ static BOOL mrdp_reconstruct_window_drag_rect(const uint8_t *mask, const UINT32 
 	context = rdp_context;
 	mfc = (mfContext *)rdp_context;
 	chromaKeyRepaintRequested = NO;
+	receivedFirstRemotePaint = NO;
 	[self startMousePassThroughMonitor];
 
 	instance = context->instance;
@@ -957,6 +1030,7 @@ DWORD WINAPI mac_client_thread(void *param)
 		currentCursor = [NSCursor arrowCursor];
 		[self setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
 		[self setOpaque:NO];
+		mac_view_apply_startup_background(self, NO);
 		initialized = YES;
 	}
 }
@@ -3166,8 +3240,11 @@ static BOOL mac_has_chroma_key_margin(const mfContext *mfc, const rdpGdi *gdi, i
 
 - (void)drawRect:(NSRect)rect
 {
-	if (!context)
+	if (!context || !self.is_connected || !receivedFirstRemotePaint)
+	{
+		mac_view_fill_startup_background([self bounds]);
 		return;
+	}
 
 	if (self->bitmap_context)
 	{
@@ -4128,6 +4205,8 @@ BOOL mac_end_paint(rdpContext *context)
 	if (!smartSizing)
 		windows_to_apple_cords(mfc->view, &newDrawRect);
 	dispatch_sync(dispatch_get_main_queue(), ^{
+		view->receivedFirstRemotePaint = YES;
+		mac_view_apply_startup_background(view, [view is_connected]);
 		[view setNeedsDisplayInRect:newDrawRect];
 		[[NSNotificationCenter defaultCenter] postNotificationName:@"MRDPMultimonFramebufferDidUpdate"
 		                                                    object:view];

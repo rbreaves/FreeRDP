@@ -97,6 +97,63 @@ static NSString *const MRDPStatusSessionDidUpdateNotification = @"org.freerdp.ma
 static NSString *const MRDPStatusSessionWillTerminateNotification = @"org.freerdp.mac.statusSessionWillTerminate";
 static NSString *const MRDPStatusCommandNotification = @"org.freerdp.mac.statusCommand";
 
+static BOOL mac_system_uses_dark_appearance(void)
+{
+	NSString *interfaceStyle =
+	    [[NSUserDefaults standardUserDefaults] stringForKey:@"AppleInterfaceStyle"];
+	if ([interfaceStyle caseInsensitiveCompare:@"Dark"] == NSOrderedSame)
+		return YES;
+
+	if (@available(macOS 10.14, *))
+	{
+		NSAppearance *appearance = [NSApp effectiveAppearance];
+		if (!appearance)
+		{
+			if (@available(macOS 12.0, *))
+				appearance = [NSAppearance currentDrawingAppearance];
+		}
+		if (!appearance)
+			return NO;
+		NSString *bestMatch =
+		    [appearance bestMatchFromAppearancesWithNames:@[ NSAppearanceNameAqua,
+		                                                     NSAppearanceNameDarkAqua ]];
+		return [bestMatch isEqualToString:NSAppearanceNameDarkAqua];
+	}
+
+	return NO;
+}
+
+static NSColor *mac_startup_background_color(void)
+{
+	if (mac_system_uses_dark_appearance())
+		return [NSColor colorWithCalibratedWhite:0.10 alpha:1.0];
+
+	return [NSColor clearColor];
+}
+
+static void mac_apply_startup_background(NSWindow *targetWindow, BOOL connected)
+{
+	if (!targetWindow)
+		return;
+
+	NSColor *backgroundColor = connected ? [NSColor clearColor] : mac_startup_background_color();
+	[targetWindow setBackgroundColor:backgroundColor];
+
+	NSView *contentView = [targetWindow contentView];
+	if (!contentView)
+		return;
+
+	if (!connected && mac_system_uses_dark_appearance())
+	{
+		[contentView setWantsLayer:YES];
+		[[contentView layer] setBackgroundColor:[backgroundColor CGColor]];
+	}
+	else if ([contentView wantsLayer])
+	{
+		[[contentView layer] setBackgroundColor:[[NSColor clearColor] CGColor]];
+	}
+}
+
 static BOOL mac_parse_hex_color_text(NSString *text, uint32_t *color);
 static BOOL mac_parse_chroma_key_text(NSString *text, uint32_t *color, float *tolerance);
 static BOOL mac_parse_hex_alpha_list(NSString *text, uint32_t *colors, UINT32 *transparencies,
@@ -1218,7 +1275,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	[newWindow setLevel:NSNormalWindowLevel];
 	[newWindow setDelegate:self];
 	[newWindow setOpaque:NO];
-	[newWindow setBackgroundColor:[NSColor clearColor]];
+	mac_apply_startup_background(newWindow, NO);
 	[newWindow setHasShadow:NO];
 
 	if (!NSIsEmptyRect(frameRect))
@@ -1264,7 +1321,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	[window setMovable:decorated];
 	[window setMovableByWindowBackground:NO];
 	[window setOpaque:NO];
-	[window setBackgroundColor:[NSColor clearColor]];
+	mac_apply_startup_background(window, mrdpView && [mrdpView is_connected]);
 	[window setHasShadow:mfc->windowShadowsEnabled];
 
 	if (!decorated && !fullscreen && mfc->fullscreen_mode != 2)
@@ -1376,7 +1433,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		[window setLevel:NSNormalWindowLevel];
 		[window setDelegate:self];
 		[window setOpaque:NO];
-		[window setBackgroundColor:[NSColor clearColor]];
+		mac_apply_startup_background(window, NO);
 		[window setHasShadow:NO];
 	}
 
@@ -1549,6 +1606,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	const BOOL connected = !mrdpView || [mrdpView is_connected];
 
 	[NSApp activateIgnoringOtherApps:YES];
+	mac_apply_startup_background(window, connected);
 
 	if (!connected && ![window isVisible])
 		return;

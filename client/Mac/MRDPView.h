@@ -70,6 +70,7 @@
 	NSRect deferredWindowDragOutlineRect;
 	BOOL windowDragTitlebarPreviewVisible;
 	BOOL dynamicTitlebarTintApplied;
+	BOOL receivedFirstRemotePaint;
 	UINT32 dynamicTitlebarTintRGB;
 	NSView *dynamicTitlebarTintView;
   @public
