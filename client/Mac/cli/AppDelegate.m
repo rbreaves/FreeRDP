@@ -86,6 +86,11 @@ static NSString *const MRDPWindowShadowsEnabledKey = @"MRDPWindowShadowsEnabled"
 static NSString *const MRDPWindowDragTitlebarHeightKey = @"MRDPWindowDragTitlebarHeight";
 static NSString *const MRDPModifierKeyswapModeKey = @"MRDPModifierKeyswapMode";
 static NSString *const MRDPModifierKeyswapFilterKey = @"MRDPModifierKeyswapFilter";
+static NSString *const MRDPSpacerEnabledKey = @"MRDPSpacerEnabled";
+static NSString *const MRDPSpacerPositionKey = @"MRDPSpacerPosition";
+static NSString *const MRDPSpacerSizeKey = @"MRDPSpacerSize";
+static NSString *const MRDPTaskbarHideHeightKey = @"MRDPTaskbarHideHeight";
+static NSString *const MRDPTaskbarHidePositionKey = @"MRDPTaskbarHidePosition";
 static NSString *const MRDPTaskbarHideZOrderPIDsKey = @"MRDPTaskbarHideZOrderPIDs";
 static NSString *const MRDPAdditionalKeychainAccountsKey = @"MRDPAdditionalKeychainAccounts";
 static NSString *const MRDPStatusSessionDidUpdateNotification = @"org.freerdp.mac.statusSessionDidUpdate";
@@ -1104,6 +1109,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 - (void)quitAllFromMenuItem:(id)sender;
 - (void)setSpacerPositionFromMenuItem:(NSMenuItem *)menuItem;
 - (void)showGeneralSettingsFromMenuItem:(id)sender;
+- (void)showPasswordAccountsFromSettings:(id)sender;
 - (void)showModifierKeyswapFilterFromButton:(NSButton *)sender;
 - (void)updateWindowDragTitlebarHeightPreviewFromSlider:(id)sender;
 - (void)showSpacerSettingsFromMenuItem:(id)sender;
@@ -1131,6 +1137,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 - (void)moveSessionToScreen:(NSScreen *)screen screenIndex:(NSInteger)screenIndex;
 - (BOOL)requestRemoteResizeForScreen:(NSScreen *)screen;
 - (NSString *)credentialTarget;
+- (NSString *)settingsDefaultsKeyForKey:(NSString *)key;
 - (NSString *)passwordAccountsDefaultsKey;
 - (NSDictionary *)defaultPasswordAccount;
 - (NSArray *)additionalPasswordAccounts;
@@ -2376,7 +2383,8 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		mfc->spacerPosition = (UINT32)[position integerValue];
 
 		NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-		[defaults setInteger:(NSInteger)mfc->spacerPosition forKey:@"MRDPSpacerPosition"];
+		[defaults setInteger:(NSInteger)mfc->spacerPosition
+		               forKey:[self settingsDefaultsKeyForKey:MRDPSpacerPositionKey]];
 		[defaults synchronize];
 
 		[self updateSpacerWindow];
@@ -2395,7 +2403,8 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 
 		mfc->taskbarHidePosition = (UINT32)MIN(MAX([position integerValue], 0), 3);
 		NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-		[defaults setInteger:(NSInteger)mfc->taskbarHidePosition forKey:@"MRDPTaskbarHidePosition"];
+		[defaults setInteger:(NSInteger)mfc->taskbarHidePosition
+		               forKey:[self settingsDefaultsKeyForKey:MRDPTaskbarHidePositionKey]];
 		[defaults synchronize];
 
 		[self syncTaskbarHideWindows];
@@ -2404,6 +2413,10 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	else if ([command isEqualToString:@"taskbarSettings"])
 	{
 		[self showTaskbarSettingsFromMenuItem:nil];
+	}
+	else if ([command isEqualToString:@"generalSettings"])
+	{
+		[self showGeneralSettingsFromMenuItem:nil];
 	}
 	else if ([command isEqualToString:@"passwordAccounts"])
 	{
@@ -2471,7 +2484,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 			mfc->windowDragTitlebarHeight = (UINT32)MIN(MAX([height integerValue], 1), 200);
 			NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
 			[defaults setInteger:(NSInteger)mfc->windowDragTitlebarHeight
-			               forKey:MRDPWindowDragTitlebarHeightKey];
+			               forKey:[self settingsDefaultsKeyForKey:MRDPWindowDragTitlebarHeightKey]];
 			[defaults synchronize];
 			if (mrdpView)
 				[mrdpView setNeedsDisplay:YES];
@@ -2491,9 +2504,9 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 
 		NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
 		[defaults setInteger:(NSInteger)mfc->modifierKeyswapMode
-		               forKey:MRDPModifierKeyswapModeKey];
+		               forKey:[self settingsDefaultsKeyForKey:MRDPModifierKeyswapModeKey]];
 		[defaults setObject:mac_modifier_keyswap_filter_string(mfc)
-		         forKey:MRDPModifierKeyswapFilterKey];
+		         forKey:[self settingsDefaultsKeyForKey:MRDPModifierKeyswapFilterKey]];
 		[defaults synchronize];
 	}
 	else if ([command isEqualToString:@"quit"])
@@ -2644,13 +2657,6 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 
 	[statusMenu addItem:[NSMenuItem separatorItem]];
 
-	NSMenuItem *generalSettingsItem =
-	    [[[NSMenuItem alloc] initWithTitle:@"Settings"
-	                                 action:@selector(showGeneralSettingsFromMenuItem:)
-	                          keyEquivalent:@""] autorelease];
-	[generalSettingsItem setTarget:self];
-	[statusMenu addItem:generalSettingsItem];
-
 	NSMenuItem *quitItem =
 	    [[[NSMenuItem alloc] initWithTitle:([sessions count] > 1 ? @"Quit All" : @"Quit MacFreeRDP")
 	                                 action:@selector(quitAllFromMenuItem:)
@@ -2695,17 +2701,18 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	                                       : [[session objectForKey:@"spacerPosition"] integerValue];
 	BOOL spacerEnabled = localSession ? (mfc && mfc->spacerEnabled)
 	                                 : [[session objectForKey:@"spacerEnabled"] boolValue];
-	NSMenuItem *configurePasswordsItem =
-	    [[[NSMenuItem alloc] initWithTitle:@"Configure"
-	                                action:(localSession ? @selector(showPasswordAccountsFromMenuItem:)
-	                                                      : @selector(remoteStatusCommandFromMenuItem:))
-	                         keyEquivalent:@""] autorelease];
-	[configurePasswordsItem setTarget:self];
+	NSMenuItem *generalSettingsItem =
+	    [[[NSMenuItem alloc] initWithTitle:@"Settings"
+	                                 action:(localSession ? @selector(showGeneralSettingsFromMenuItem:)
+	                                                       : @selector(remoteStatusCommandFromMenuItem:))
+	                          keyEquivalent:@""] autorelease];
+	[generalSettingsItem setTarget:self];
 	if (!localSession)
-		[configurePasswordsItem setRepresentedObject:[NSDictionary dictionaryWithObjectsAndKeys:
-		                                                       session, @"session", @"passwordAccounts",
-		                                                       @"command", nil]];
-	[menu addItem:configurePasswordsItem];
+		[generalSettingsItem setRepresentedObject:[NSDictionary dictionaryWithObjectsAndKeys:
+		                                                    session, @"session", @"generalSettings",
+		                                                    @"command", nil]];
+	[menu addItem:generalSettingsItem];
+	[menu addItem:[NSMenuItem separatorItem]];
 
 	NSMenuItem *spacerPositionItem = [[[NSMenuItem alloc] initWithTitle:@"Spacer Position"
 	                                                               action:nil
@@ -2965,6 +2972,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	[alert setInformativeText:@"Choose modifier keyswap, window display behavior, drag titlebar height, chroma key color, and extra per-color transparency."];
 	[alert addButtonWithTitle:@"OK"];
 	[alert addButtonWithTitle:@"Cancel"];
+	[alert addButtonWithTitle:@"Configure Accounts..."];
 
 	NSView *accessoryView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 360, 286)];
 
@@ -3091,6 +3099,8 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	windowDragTitlebarHeightValueLabel = nil;
 	modifierKeyswapFilterField = nil;
 
+	const BOOL openAccounts = (result == NSAlertThirdButtonReturn);
+
 	if (result == NSAlertFirstButtonReturn)
 	{
 		uint32_t colorVal = 0;
@@ -3133,89 +3143,36 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 			       additionalColorCount * sizeof(BOOL));
 
 			NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-			[defaults setBool:mfc->windowShadowsEnabled forKey:MRDPWindowShadowsEnabledKey];
+			[defaults setBool:mfc->windowShadowsEnabled
+			        forKey:[self settingsDefaultsKeyForKey:MRDPWindowShadowsEnabledKey]];
 			[defaults setInteger:(NSInteger)mfc->windowDragTitlebarHeight
-			               forKey:MRDPWindowDragTitlebarHeightKey];
+			               forKey:[self settingsDefaultsKeyForKey:MRDPWindowDragTitlebarHeightKey]];
 			[defaults setInteger:(NSInteger)mfc->modifierKeyswapMode
-			               forKey:MRDPModifierKeyswapModeKey];
+			               forKey:[self settingsDefaultsKeyForKey:MRDPModifierKeyswapModeKey]];
 			[defaults setObject:mac_modifier_keyswap_filter_string(mfc)
-			             forKey:MRDPModifierKeyswapFilterKey];
-			[defaults setBool:mfc->chromaKeyEnabled forKey:MRDPChromaKeyEnabledKey];
+			             forKey:[self settingsDefaultsKeyForKey:MRDPModifierKeyswapFilterKey]];
+			[defaults setBool:mfc->chromaKeyEnabled
+			        forKey:[self settingsDefaultsKeyForKey:MRDPChromaKeyEnabledKey]];
 			[defaults setBool:mfc->chromaKeyFeatheringEnabled
-			           forKey:MRDPChromaKeyFeatheringEnabledKey];
-			[defaults setInteger:(NSInteger)mfc->chromaKeyColor forKey:MRDPChromaKeyColorKey];
-			[defaults setFloat:mfc->chromaKeyTolerance forKey:MRDPChromaKeyToleranceKey];
+			           forKey:[self settingsDefaultsKeyForKey:MRDPChromaKeyFeatheringEnabledKey]];
+			[defaults setInteger:(NSInteger)mfc->chromaKeyColor
+			               forKey:[self settingsDefaultsKeyForKey:MRDPChromaKeyColorKey]];
+			[defaults setFloat:mfc->chromaKeyTolerance
+			            forKey:[self settingsDefaultsKeyForKey:MRDPChromaKeyToleranceKey]];
 			[defaults setObject:mac_hex_color_number_array(mfc)
-			             forKey:MRDPAdditionalTransparencyColorsKey];
+			             forKey:[self settingsDefaultsKeyForKey:MRDPAdditionalTransparencyColorsKey]];
 			[defaults setObject:mac_transparency_number_array(mfc)
-			             forKey:MRDPAdditionalTransparencyLevelsKey];
+			             forKey:[self settingsDefaultsKeyForKey:MRDPAdditionalTransparencyLevelsKey]];
 			[defaults setObject:mac_tolerance_number_array(mfc)
-			             forKey:MRDPAdditionalTransparencyTolerancesKey];
+			             forKey:[self settingsDefaultsKeyForKey:MRDPAdditionalTransparencyTolerancesKey]];
 			[defaults setObject:mac_blur_number_array(mfc)
-			             forKey:MRDPAdditionalTransparencyBlurKey];
+			             forKey:[self settingsDefaultsKeyForKey:MRDPAdditionalTransparencyBlurKey]];
 			[defaults synchronize];
 
 			[self applyWindowDecorationsFromSettings];
 
 			if (mrdpView)
 				[mrdpView refreshBitmap];
-
-			for (NSDictionary *session in [statusSessions allValues])
-			{
-				NSNumber *pid = [session objectForKey:@"pid"];
-				if (!pid)
-					continue;
-
-				NSDictionary *info = [NSDictionary
-				    dictionaryWithObjectsAndKeys:pid, @"pid", @"chroma", @"command",
-				                                 @(mfc->chromaKeyEnabled), @"enabled",
-				                                 @(mfc->chromaKeyFeatheringEnabled),
-				                                 @"featheringEnabled",
-				                                 @((NSInteger)mfc->chromaKeyColor), @"color",
-				                                 @(mfc->chromaKeyTolerance), @"tolerance",
-				                                 mac_hex_color_number_array(mfc),
-				                                 @"additionalColors",
-				                                 mac_transparency_number_array(mfc),
-				                                 @"additionalTransparencies",
-				                                 mac_tolerance_number_array(mfc),
-				                                 @"additionalTolerances",
-				                                 mac_blur_number_array(mfc),
-				                                 @"additionalBlur", nil];
-				[[NSDistributedNotificationCenter defaultCenter]
-				    postNotificationName:MRDPStatusCommandNotification
-				                  object:nil
-				                userInfo:info
-				      deliverImmediately:YES];
-
-				info = [NSDictionary dictionaryWithObjectsAndKeys:pid, @"pid", @"windowShadows",
-				                                                  @"command",
-				                                                  @(mfc->windowShadowsEnabled),
-				                                                  @"enabled", nil];
-				[[NSDistributedNotificationCenter defaultCenter]
-				    postNotificationName:MRDPStatusCommandNotification
-				                  object:nil
-				                userInfo:info
-				      deliverImmediately:YES];
-
-				info = [NSDictionary dictionaryWithObjectsAndKeys:
-				                          pid, @"pid", @"windowDragTitlebarHeight", @"command",
-				                          @(mfc->windowDragTitlebarHeight), @"height", nil];
-				[[NSDistributedNotificationCenter defaultCenter]
-				    postNotificationName:MRDPStatusCommandNotification
-				                  object:nil
-				                userInfo:info
-				      deliverImmediately:YES];
-
-				info = [NSDictionary dictionaryWithObjectsAndKeys:
-				                          pid, @"pid", @"modifierKeyswap", @"command",
-				                          @(mfc->modifierKeyswapMode), @"mode",
-				                          mac_modifier_keyswap_filter_string(mfc), @"filter", nil];
-				[[NSDistributedNotificationCenter defaultCenter]
-				    postNotificationName:MRDPStatusCommandNotification
-				                  object:nil
-				                userInfo:info
-				      deliverImmediately:YES];
-			}
 		}
 		else
 		{
@@ -3249,6 +3206,15 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	[hintLabel release];
 	[accessoryView release];
 	[alert release];
+
+	if (openAccounts)
+		[self showPasswordAccountsFromSettings:nil];
+}
+
+- (void)showPasswordAccountsFromSettings:(id)sender
+{
+	(void)sender;
+	[self showPasswordAccountsFromMenuItem:nil];
 }
 
 - (void)setSpacerPositionFromMenuItem:(NSMenuItem *)menuItem
@@ -3260,7 +3226,8 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	mfc->spacerPosition = (UINT32)[menuItem tag];
 
 	NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-	[defaults setInteger:(NSInteger)mfc->spacerPosition forKey:@"MRDPSpacerPosition"];
+	[defaults setInteger:(NSInteger)mfc->spacerPosition
+	               forKey:[self settingsDefaultsKeyForKey:MRDPSpacerPositionKey]];
 	[defaults synchronize];
 
 	[self updateSpacerWindow];
@@ -3311,8 +3278,10 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		mfc->spacerSize = (sizeVal > 0) ? (UINT32)sizeVal : 50;
 
 		NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-		[defaults setBool:mfc->spacerEnabled forKey:@"MRDPSpacerEnabled"];
-		[defaults setInteger:(NSInteger)mfc->spacerSize forKey:@"MRDPSpacerSize"];
+		[defaults setBool:mfc->spacerEnabled
+		        forKey:[self settingsDefaultsKeyForKey:MRDPSpacerEnabledKey]];
+		[defaults setInteger:(NSInteger)mfc->spacerSize
+		               forKey:[self settingsDefaultsKeyForKey:MRDPSpacerSizeKey]];
 		[defaults synchronize];
 
 		[self updateSpacerWindow];
@@ -3335,7 +3304,8 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	mfc->taskbarHidePosition = (UINT32)[menuItem tag];
 
 	NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-	[defaults setInteger:(NSInteger)mfc->taskbarHidePosition forKey:@"MRDPTaskbarHidePosition"];
+	[defaults setInteger:(NSInteger)mfc->taskbarHidePosition
+	               forKey:[self settingsDefaultsKeyForKey:MRDPTaskbarHidePositionKey]];
 	[defaults synchronize];
 
 	[self syncTaskbarHideWindows];
@@ -3397,8 +3367,10 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		mfc->taskbarHidePosition = (UINT32)[posDropdown indexOfSelectedItem];
 
 		NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-		[defaults setInteger:(NSInteger)mfc->taskbarHideHeight forKey:@"MRDPTaskbarHideHeight"];
-		[defaults setInteger:(NSInteger)mfc->taskbarHidePosition forKey:@"MRDPTaskbarHidePosition"];
+		[defaults setInteger:(NSInteger)mfc->taskbarHideHeight
+		               forKey:[self settingsDefaultsKeyForKey:MRDPTaskbarHideHeightKey]];
+		[defaults setInteger:(NSInteger)mfc->taskbarHidePosition
+		               forKey:[self settingsDefaultsKeyForKey:MRDPTaskbarHidePositionKey]];
 		[defaults synchronize];
 
 		[self syncTaskbarHideWindows];
@@ -3943,6 +3915,16 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	                                  port];
 }
 
+- (NSString *)settingsDefaultsKeyForKey:(NSString *)key
+{
+	NSString *target = [self credentialTarget];
+
+	if ([target length] == 0)
+		return key;
+
+	return [NSString stringWithFormat:@"%@.%@", key, target];
+}
+
 - (NSString *)preferredScreenDefaultsKey
 {
 	NSString *target = [self credentialTarget];
@@ -4139,40 +4121,52 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 
 	NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
 	mfContext *mfc = (mfContext *)context;
+	NSString *windowShadowsKey = [self settingsDefaultsKeyForKey:MRDPWindowShadowsEnabledKey];
+	NSString *dragTitlebarKey = [self settingsDefaultsKeyForKey:MRDPWindowDragTitlebarHeightKey];
+	NSString *keyswapModeKey = [self settingsDefaultsKeyForKey:MRDPModifierKeyswapModeKey];
+	NSString *keyswapFilterKey = [self settingsDefaultsKeyForKey:MRDPModifierKeyswapFilterKey];
+	NSString *chromaEnabledKey = [self settingsDefaultsKeyForKey:MRDPChromaKeyEnabledKey];
+	NSString *chromaFeatherKey = [self settingsDefaultsKeyForKey:MRDPChromaKeyFeatheringEnabledKey];
+	NSString *chromaColorKey = [self settingsDefaultsKeyForKey:MRDPChromaKeyColorKey];
+	NSString *chromaToleranceKey = [self settingsDefaultsKeyForKey:MRDPChromaKeyToleranceKey];
+	NSString *additionalColorsKey =
+	    [self settingsDefaultsKeyForKey:MRDPAdditionalTransparencyColorsKey];
+	NSString *additionalLevelsKey =
+	    [self settingsDefaultsKeyForKey:MRDPAdditionalTransparencyLevelsKey];
+	NSString *additionalTolerancesKey =
+	    [self settingsDefaultsKeyForKey:MRDPAdditionalTransparencyTolerancesKey];
+	NSString *additionalBlurKey = [self settingsDefaultsKeyForKey:MRDPAdditionalTransparencyBlurKey];
 
-	mfc->windowShadowsEnabled = [defaults boolForKey:MRDPWindowShadowsEnabledKey];
-	if ([defaults objectForKey:MRDPWindowDragTitlebarHeightKey])
+	mfc->windowShadowsEnabled = [defaults boolForKey:windowShadowsKey];
+	if ([defaults objectForKey:dragTitlebarKey])
 	{
-		NSInteger height = [defaults integerForKey:MRDPWindowDragTitlebarHeightKey];
+		NSInteger height = [defaults integerForKey:dragTitlebarKey];
 		mfc->windowDragTitlebarHeight = (UINT32)MIN(MAX(height, 1), 200);
 	}
-	if ([defaults objectForKey:MRDPModifierKeyswapModeKey])
+	if ([defaults objectForKey:keyswapModeKey])
 	{
-		NSInteger mode = [defaults integerForKey:MRDPModifierKeyswapModeKey];
+		NSInteger mode = [defaults integerForKey:keyswapModeKey];
 		mfc->modifierKeyswapMode = (MF_MODIFIER_KEYSWAP_MODE)MIN(MAX(mode, 0), 2);
 	}
-	if ([defaults objectForKey:MRDPModifierKeyswapFilterKey])
-		mac_set_modifier_keyswap_filter(mfc,
-		                                [defaults stringForKey:MRDPModifierKeyswapFilterKey]);
-	mfc->chromaKeyEnabled = [defaults boolForKey:MRDPChromaKeyEnabledKey];
-	mfc->chromaKeyFeatheringEnabled =
-	    [defaults boolForKey:MRDPChromaKeyFeatheringEnabledKey];
-	if ([defaults objectForKey:MRDPChromaKeyColorKey])
-		mfc->chromaKeyColor = (uint32_t)([defaults integerForKey:MRDPChromaKeyColorKey] & 0xFFFFFF);
-	if ([defaults objectForKey:MRDPChromaKeyToleranceKey])
-		mfc->chromaKeyTolerance = [defaults floatForKey:MRDPChromaKeyToleranceKey];
-	if ([defaults objectForKey:MRDPAdditionalTransparencyColorsKey] &&
-	    [defaults objectForKey:MRDPAdditionalTransparencyLevelsKey])
+	if ([defaults objectForKey:keyswapFilterKey])
+		mac_set_modifier_keyswap_filter(mfc, [defaults stringForKey:keyswapFilterKey]);
+	mfc->chromaKeyEnabled = [defaults boolForKey:chromaEnabledKey];
+	mfc->chromaKeyFeatheringEnabled = [defaults boolForKey:chromaFeatherKey];
+	if ([defaults objectForKey:chromaColorKey])
+		mfc->chromaKeyColor = (uint32_t)([defaults integerForKey:chromaColorKey] & 0xFFFFFF);
+	if ([defaults objectForKey:chromaToleranceKey])
+		mfc->chromaKeyTolerance = [defaults floatForKey:chromaToleranceKey];
+	if ([defaults objectForKey:additionalColorsKey] && [defaults objectForKey:additionalLevelsKey])
 	{
-		NSArray *tolerances = [defaults arrayForKey:MRDPAdditionalTransparencyTolerancesKey];
-		NSArray *blur = [defaults arrayForKey:MRDPAdditionalTransparencyBlurKey];
+		NSArray *tolerances = [defaults arrayForKey:additionalTolerancesKey];
+		NSArray *blur = [defaults arrayForKey:additionalBlurKey];
 		if (!tolerances)
 			tolerances = [NSArray array];
 		if (!blur)
 			blur = [NSArray array];
 		mac_set_additional_transparency_colors_from_arrays(
-		    mfc, [defaults arrayForKey:MRDPAdditionalTransparencyColorsKey],
-		    [defaults arrayForKey:MRDPAdditionalTransparencyLevelsKey], tolerances, blur);
+		    mfc, [defaults arrayForKey:additionalColorsKey],
+		    [defaults arrayForKey:additionalLevelsKey], tolerances, blur);
 	}
 }
 
@@ -4184,10 +4178,12 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	mfContext *mfc = (mfContext *)context;
 	NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
 
-	mfc->spacerEnabled = [defaults boolForKey:@"MRDPSpacerEnabled"];
-	NSInteger spacerPos = [defaults integerForKey:@"MRDPSpacerPosition"];
+	mfc->spacerEnabled = [defaults boolForKey:[self settingsDefaultsKeyForKey:MRDPSpacerEnabledKey]];
+	NSInteger spacerPos =
+	    [defaults integerForKey:[self settingsDefaultsKeyForKey:MRDPSpacerPositionKey]];
 	mfc->spacerPosition = (spacerPos >= 0 && spacerPos <= 3) ? (UINT32)spacerPos : 2;
-	NSInteger spacerSizeVal = [defaults integerForKey:@"MRDPSpacerSize"];
+	NSInteger spacerSizeVal =
+	    [defaults integerForKey:[self settingsDefaultsKeyForKey:MRDPSpacerSizeKey]];
 	mfc->spacerSize = (spacerSizeVal > 0) ? (UINT32)spacerSizeVal : 50;
 
 	[self updateSpacerWindow];
@@ -4201,9 +4197,11 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	mfContext *mfc = (mfContext *)context;
 	NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
 
-	NSInteger taskbarHeightVal = [defaults integerForKey:@"MRDPTaskbarHideHeight"];
+	NSInteger taskbarHeightVal =
+	    [defaults integerForKey:[self settingsDefaultsKeyForKey:MRDPTaskbarHideHeightKey]];
 	mfc->taskbarHideHeight = (taskbarHeightVal > 0 && taskbarHeightVal < 2048) ? (UINT32)taskbarHeightVal : 48;
-	NSInteger taskbarPos = [defaults integerForKey:@"MRDPTaskbarHidePosition"];
+	NSInteger taskbarPos =
+	    [defaults integerForKey:[self settingsDefaultsKeyForKey:MRDPTaskbarHidePositionKey]];
 	mfc->taskbarHidePosition = (taskbarPos >= 0 && taskbarPos <= 3) ? (UINT32)taskbarPos : 1;
 }
 
