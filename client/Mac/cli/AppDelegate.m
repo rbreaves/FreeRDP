@@ -67,6 +67,8 @@ static NSString *mac_display_title(NSScreen *screen, NSInteger screenIndex);
 static DISPLAY_CONTROL_MONITOR_LAYOUT mac_display_layout_for_screen(NSScreen *screen,
 	                                                               BOOL useVisibleFrame,
 	                                                               mfContext *mfc);
+static DISPLAY_CONTROL_MONITOR_LAYOUT mac_display_layout_for_size(NSSize size, NSScreen *screen,
+	                                                             mfContext *mfc);
 static CGRect mac_ax_rect_for_screen_rect(NSScreen *screen, NSRect rect);
 static CGRect mac_spacer_rect_for_screen(NSScreen *screen, UINT32 position, UINT32 size);
 static CGRect mac_available_rect_for_spacer(NSScreen *screen, UINT32 position, UINT32 size);
@@ -1194,6 +1196,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 - (void)switchMonitorFromMenuItem:(NSMenuItem *)menuItem;
 - (void)moveSessionToScreen:(NSScreen *)screen screenIndex:(NSInteger)screenIndex;
 - (BOOL)requestRemoteResizeForScreen:(NSScreen *)screen;
+- (BOOL)requestRemoteResizeForWindowContent;
 - (NSString *)credentialTarget;
 - (NSString *)settingsDefaultsKeyForKey:(NSString *)key;
 - (NSString *)windowAliasFromDefaults;
@@ -1579,6 +1582,14 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		mac_fit_view_to_window_content(context, mrdpView);
 
 	[self broadcastStatusSessionUpdate];
+}
+
+- (void)windowDidEndLiveResize:(NSNotification *)notification
+{
+	if ([notification object] != window)
+		return;
+
+	(void)[self requestRemoteResizeForWindowContent];
 }
 
 - (void)focusClientWindow
@@ -3980,6 +3991,48 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	return (mfc->disp->SendMonitorLayout(mfc->disp, 1, &layout) == CHANNEL_RC_OK) ? YES : NO;
 }
 
+- (BOOL)requestRemoteResizeForWindowContent
+{
+	if (!context || !context->settings || !window || !mrdpView || ![mrdpView is_connected])
+		return NO;
+
+	mfContext *mfc = (mfContext *)context;
+	rdpSettings *settings = context->settings;
+	if (!freerdp_settings_get_bool(settings, FreeRDP_DynamicResolutionUpdate))
+		return NO;
+	if (freerdp_settings_get_bool(settings, FreeRDP_SmartSizing))
+		return NO;
+	if (freerdp_settings_get_bool(settings, FreeRDP_UseMultimon))
+		return NO;
+	if (!mfc->disp || !mfc->disp->SendMonitorLayout)
+		return NO;
+
+	NSView *contentView = [window contentView];
+	if (!contentView)
+		return NO;
+
+	NSSize size = [contentView bounds].size;
+	if ((size.width <= 0) || (size.height <= 0))
+		return NO;
+
+	DISPLAY_CONTROL_MONITOR_LAYOUT layout =
+	    mac_display_layout_for_size(size, mac_preferred_screen(window), mfc);
+	const UINT32 currentWidth = freerdp_settings_get_uint32(settings, FreeRDP_DesktopWidth);
+	const UINT32 currentHeight = freerdp_settings_get_uint32(settings, FreeRDP_DesktopHeight);
+	if ((layout.Width == currentWidth) && (layout.Height == currentHeight))
+		return NO;
+
+	const BOOL sent = (mfc->disp->SendMonitorLayout(mfc->disp, 1, &layout) == CHANNEL_RC_OK);
+	if (sent)
+	{
+		[mrdpView setFrame:[contentView bounds]];
+		[mrdpView setNeedsDisplay:YES];
+		[self broadcastStatusSessionUpdate];
+	}
+
+	return sent;
+}
+
 - (NSString *)credentialTarget
 {
 	if (!context || !context->settings)
@@ -5002,6 +5055,8 @@ void mac_set_view_size(rdpContext *context, MRDPView *view)
 	NSWindow *window = [view window];
 	NSScreen *screen = mac_preferred_screen(window);
 	const BOOL smartSizing = freerdp_settings_get_bool(context->settings, FreeRDP_SmartSizing);
+	const BOOL dynamicResolution =
+	    freerdp_settings_get_bool(context->settings, FreeRDP_DynamicResolutionUpdate);
 	const BOOL multimon = mac_multimon_enabled(context->settings);
 	// set client area to specified dimensions
 	NSRect innerRect;
@@ -5053,8 +5108,9 @@ void mac_set_view_size(rdpContext *context, MRDPView *view)
 		outerRect.size = [window frameRectForContentRect:innerRect].size;
 	}
 	// we are not in RemoteApp mode, disable larger than resolution
-	[window setContentMaxSize:(smartSizing || multimon) ? NSMakeSize(CGFLOAT_MAX, CGFLOAT_MAX)
-	                                                     : innerRect.size];
+	[window setContentMaxSize:(smartSizing || dynamicResolution || multimon)
+	                              ? NSMakeSize(CGFLOAT_MAX, CGFLOAT_MAX)
+	                              : innerRect.size];
 	// set window to given area
 	[window setFrame:outerRect display:YES];
 	if (primarySlice && !smartSizing)
@@ -5065,7 +5121,7 @@ void mac_set_view_size(rdpContext *context, MRDPView *view)
 		          display:YES];
 	}
 
-	if ((mfc->fullscreen_mode == 2) && [view is_connected])
+	if ((mfc->fullscreen_mode == 2) && [view is_connected] && !dynamicResolution)
 	{
 		mac_maximize_window_minus_menubar(context, window, view);
 	}
@@ -5978,6 +6034,28 @@ static DISPLAY_CONTROL_MONITOR_LAYOUT mac_display_layout_for_screen(NSScreen *sc
 		layout.DesktopScaleFactor = 100;
 	if (layout.DeviceScaleFactor == 0)
 		layout.DeviceScaleFactor = 100;
+
+	return layout;
+}
+
+static DISPLAY_CONTROL_MONITOR_LAYOUT mac_display_layout_for_size(NSSize size, NSScreen *screen,
+	                                                             mfContext *mfc)
+{
+	if (!screen)
+		screen = [NSScreen mainScreen];
+
+	DISPLAY_CONTROL_MONITOR_LAYOUT layout =
+	    mac_display_layout_for_screen(screen, FALSE, mfc);
+	const CGFloat width = MIN(MAX(size.width, DISPLAY_CONTROL_MIN_MONITOR_WIDTH),
+	                          DISPLAY_CONTROL_MAX_MONITOR_WIDTH);
+	const CGFloat height = MIN(MAX(size.height, DISPLAY_CONTROL_MIN_MONITOR_HEIGHT),
+	                           DISPLAY_CONTROL_MAX_MONITOR_HEIGHT);
+	layout.Left = 0;
+	layout.Top = 0;
+	layout.Width = (UINT32)lrint(width);
+	layout.Height = (UINT32)lrint(height);
+	layout.Orientation =
+	    (layout.Height > layout.Width) ? ORIENTATION_PORTRAIT : ORIENTATION_LANDSCAPE;
 
 	return layout;
 }
