@@ -1096,14 +1096,14 @@ DWORD WINAPI mac_client_thread(void *param)
 		[dynamicTitlebarTintView setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
 		[dynamicTitlebarTintView setWantsLayer:YES];
 		[frameView addSubview:dynamicTitlebarTintView
-		           positioned:NSWindowBelow
+		           positioned:NSWindowAbove
 		           relativeTo:contentView];
 	}
 	else if ([dynamicTitlebarTintView superview] != frameView)
 	{
 		[dynamicTitlebarTintView removeFromSuperview];
 		[frameView addSubview:dynamicTitlebarTintView
-		           positioned:NSWindowBelow
+		           positioned:NSWindowAbove
 		           relativeTo:contentView];
 	}
 
@@ -1113,10 +1113,13 @@ DWORD WINAPI mac_client_thread(void *param)
 
 	if (!sameColor)
 	{
+		const int correctedR = MIN(MAX((int)lrint((double)newR * (30.0 / 39.0)), 0), 255);
+		const int correctedG = MIN(MAX((int)lrint((double)newG * (29.0 / 41.0)), 0), 255);
+		const int correctedB = MIN(MAX((int)lrint((double)newB * (63.0 / 76.0)), 0), 255);
 		NSColor *color =
-		    [NSColor colorWithCalibratedRed:(CGFloat)newR / 255.0
-		                              green:(CGFloat)newG / 255.0
-		                               blue:(CGFloat)newB / 255.0
+		    [NSColor colorWithCalibratedRed:(CGFloat)correctedR / 255.0
+		                              green:(CGFloat)correctedG / 255.0
+		                               blue:(CGFloat)correctedB / 255.0
 		                              alpha:1.0];
 		[[dynamicTitlebarTintView layer] setBackgroundColor:[color CGColor]];
 		dynamicTitlebarTintRGB = rgb;
