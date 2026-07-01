@@ -1413,7 +1413,6 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	_singleDelegate = self;
 	[self loadPreferredScreenFromDefaults];
 	[self CreateContext];
-	[self loadChromaKeySettingsFromDefaults];
 	[self loadSpacerSettingsFromDefaults];
 	[self loadTaskbarSettingsFromDefaults];
 	[self ensureClientWindow];
@@ -2517,6 +2516,25 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 			                                                   additionalTolerances,
 			                                                   additionalBlur);
 		}
+
+		NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+		[defaults setBool:mfc->chromaKeyEnabled
+		        forKey:[self settingsDefaultsKeyForKey:MRDPChromaKeyEnabledKey]];
+		[defaults setBool:mfc->chromaKeyFeatheringEnabled
+		           forKey:[self settingsDefaultsKeyForKey:MRDPChromaKeyFeatheringEnabledKey]];
+		[defaults setInteger:(NSInteger)mfc->chromaKeyColor
+		               forKey:[self settingsDefaultsKeyForKey:MRDPChromaKeyColorKey]];
+		[defaults setFloat:mfc->chromaKeyTolerance
+		            forKey:[self settingsDefaultsKeyForKey:MRDPChromaKeyToleranceKey]];
+		[defaults setObject:mac_hex_color_number_array(mfc)
+		             forKey:[self settingsDefaultsKeyForKey:MRDPAdditionalTransparencyColorsKey]];
+		[defaults setObject:mac_transparency_number_array(mfc)
+		             forKey:[self settingsDefaultsKeyForKey:MRDPAdditionalTransparencyLevelsKey]];
+		[defaults setObject:mac_tolerance_number_array(mfc)
+		             forKey:[self settingsDefaultsKeyForKey:MRDPAdditionalTransparencyTolerancesKey]];
+		[defaults setObject:mac_blur_number_array(mfc)
+		             forKey:[self settingsDefaultsKeyForKey:MRDPAdditionalTransparencyBlurKey]];
+		[defaults synchronize];
 
 		if (mrdpView)
 			[mrdpView refreshBitmap];
@@ -4529,22 +4547,25 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 
 	mfContext *mfc = (mfContext *)context;
 	int filtered_argc = 1;
+	BOOL hasChromaKeyOverride = FALSE;
+	BOOL hasChromaToleranceOverride = FALSE;
+	uint32_t chromaKeyOverride = mfc->chromaKeyColor;
+	float chromaToleranceOverride = mfc->chromaKeyTolerance;
 	for (int j = 1; j < i; j++)
 	{
 		if (strcmp(context->argv[j], "--chroma-key") == 0 && j + 1 < i)
 		{
-			mfc->chromaKeyEnabled = TRUE;
+			hasChromaKeyOverride = TRUE;
 			j++;
 			unsigned int colorVal;
 			if (sscanf(context->argv[j], "#%x", &colorVal) == 1 || sscanf(context->argv[j], "%x", &colorVal) == 1)
-			{
-				mfc->chromaKeyColor = colorVal;
-			}
+				chromaKeyOverride = colorVal & 0xFFFFFF;
 		}
 		else if (strcmp(context->argv[j], "--chroma-tolerance") == 0 && j + 1 < i)
 		{
 			j++;
-			mfc->chromaKeyTolerance = (float)atof(context->argv[j]);
+			hasChromaToleranceOverride = TRUE;
+			chromaToleranceOverride = (float)atof(context->argv[j]);
 		}
 		else if (strcmp(context->argv[j], "/f:2") == 0 || strcmp(context->argv[j], "-f:2") == 0)
 		{
@@ -4601,6 +4622,18 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	                                                    context->argv, FALSE);
 	freerdp_client_settings_command_line_status_print(context->settings, status, context->argc,
 	                                                  context->argv);
+
+	if (status == 0)
+	{
+		[self loadChromaKeySettingsFromDefaults];
+		if (hasChromaKeyOverride)
+		{
+			mfc->chromaKeyEnabled = TRUE;
+			mfc->chromaKeyColor = chromaKeyOverride;
+		}
+		if (hasChromaToleranceOverride)
+			mfc->chromaKeyTolerance = chromaToleranceOverride;
+	}
 
 	return status;
 }
