@@ -1191,6 +1191,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 - (void)sendPasswordAccountFromMenuItem:(NSMenuItem *)menuItem;
 - (void)sendCtrlAltDelFromMenuItem:(id)sender;
 - (void)sendRemoteKeyFromMenuItem:(NSMenuItem *)menuItem;
+- (void)sendRemoteAltTabFromMenuItem:(id)sender;
 - (void)sendRemoteBreakFromMenuItem:(id)sender;
 - (void)showAboutPanel:(id)sender;
 - (void)switchMonitorFromMenuItem:(NSMenuItem *)menuItem;
@@ -2227,6 +2228,8 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	                                             keyEquivalent:@""] autorelease];
 	NSMenu *sendKeysMenu = [[[NSMenu alloc] initWithTitle:@"Send Keys"] autorelease];
 	NSArray *keyEntries = [NSArray arrayWithObjects:
+	    [NSDictionary dictionaryWithObjectsAndKeys:@"Alt+Tab", @"title", @(-2), @"tag", nil],
+	    [NSNull null],
 	    [NSDictionary dictionaryWithObjectsAndKeys:@"Home", @"title", @(RDP_SCANCODE_HOME), @"tag", nil],
 	    [NSDictionary dictionaryWithObjectsAndKeys:@"End", @"title", @(RDP_SCANCODE_END), @"tag", nil],
 	    [NSDictionary dictionaryWithObjectsAndKeys:@"Forward Delete", @"title", @(RDP_SCANCODE_DELETE), @"tag", nil],
@@ -2258,8 +2261,11 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		NSDictionary *definition = (NSDictionary *)entry;
 		NSString *title = [definition objectForKey:@"title"];
 		NSInteger tag = [[definition objectForKey:@"tag"] integerValue];
-		SEL action = (tag == -1) ? @selector(sendRemoteBreakFromMenuItem:)
-		                        : @selector(sendRemoteKeyFromMenuItem:);
+		SEL action = @selector(sendRemoteKeyFromMenuItem:);
+		if (tag == -1)
+			action = @selector(sendRemoteBreakFromMenuItem:);
+		else if (tag == -2)
+			action = @selector(sendRemoteAltTabFromMenuItem:);
 		NSMenuItem *keyItem = [[[NSMenuItem alloc] initWithTitle:title
 		                                                   action:action
 		                                            keyEquivalent:@""] autorelease];
@@ -3882,6 +3888,13 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 {
 	[self focusClientWindow];
 	[mrdpView sendRemoteKeyScancode:(UINT32)[menuItem tag]];
+}
+
+- (void)sendRemoteAltTabFromMenuItem:(id)sender
+{
+	(void)sender;
+	[self focusClientWindow];
+	[mrdpView sendRemoteAltTab];
 }
 
 - (void)sendRemoteBreakFromMenuItem:(id)sender

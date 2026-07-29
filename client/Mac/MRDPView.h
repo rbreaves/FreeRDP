@@ -97,6 +97,7 @@
 - (void)sendStoredPasswordForServer:(NSString *)serverName username:(NSString *)username domain:(NSString *)domain;
 - (NSCursor *)currentRemoteCursor;
 - (void)sendRemoteKeyScancode:(UINT32)rdpScancode;
+- (void)sendRemoteAltTab;
 - (void)sendRemoteCtrlAltDel;
 - (void)sendRemoteBreakKey;
 - (void)refreshBitmap;

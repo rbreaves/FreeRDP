@@ -1360,7 +1360,9 @@ DWORD WINAPI mac_client_thread(void *param)
 
 	const MF_MODIFIER_KEYSWAP_MODE keyswapMode =
 	    mac_modifier_keyswap_mode(mfc, instance->context->settings);
-	if (keyswapMode == MF_MODIFIER_KEYSWAP_NONE)
+	const BOOL grabKeyboard =
+	    freerdp_settings_get_bool(instance->context->settings, FreeRDP_GrabKeyboard);
+	if ((keyswapMode == MF_MODIFIER_KEYSWAP_NONE) && !grabKeyboard)
 		return [super performKeyEquivalent:event];
 
 	const DWORD modFlags = [event modifierFlags] & NSEventModifierFlagDeviceIndependentFlagsMask;
@@ -2799,6 +2801,18 @@ static BOOL mac_send_rdp_scancode(rdpInput *input, UINT32 rdpScancode)
 	}
 
 	(void)mac_send_rdp_scancode(input, rdpScancode);
+}
+
+- (void)sendRemoteAltTab
+{
+	if (![self canSendRemoteInput])
+		return;
+
+	rdpInput *input = instance->context->input;
+	(void)freerdp_input_send_keyboard_event_ex(input, TRUE, FALSE, RDP_SCANCODE_LMENU);
+	(void)freerdp_input_send_keyboard_event_ex(input, TRUE, FALSE, RDP_SCANCODE_TAB);
+	(void)freerdp_input_send_keyboard_event_ex(input, FALSE, FALSE, RDP_SCANCODE_TAB);
+	(void)freerdp_input_send_keyboard_event_ex(input, FALSE, FALSE, RDP_SCANCODE_LMENU);
 }
 
 - (void)sendRemoteCtrlAltDel
