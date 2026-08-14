@@ -3202,14 +3202,15 @@ static BOOL mac_has_chroma_key_margin(const mfContext *mfc, const rdpGdi *gdi, i
 			if (!mac_additional_transparency_for_pixel(mfc, pixel, &transparency, &blur))
 				continue;
 			UINT32 alpha = 255 - (transparency * 255 / 100);
-			uint32_t color = pixel & 0x00FFFFFF;
+			UINT32 red = ((pixel >> 16) & 0xFF) * alpha / 255;
+			UINT32 green = ((pixel >> 8) & 0xFF) * alpha / 255;
+			UINT32 blue = (pixel & 0xFF) * alpha / 255;
 			if (blur)
 			{
-				color = pixel & 0x00FFFFFF;
 				if (blurMask)
 					blurMask[i] = 0xFF;
 			}
-			buffer[i] = color | (alpha << 24);
+			buffer[i] = (alpha << 24) | (red << 16) | (green << 8) | blue;
 		}
 	}
 

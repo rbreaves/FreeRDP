@@ -12,6 +12,7 @@
 #import <mf_client.h>
 #import <MRDPView.h>
 #import <MacKeychain.h>
+#import "MacVirtualDesktop.h"
 
 #import <winpr/assert.h>
 #import <winpr/string.h>
@@ -64,6 +65,9 @@ static NSString *mac_screen_identifier(NSScreen *screen);
 static NSScreen *mac_screen_for_identifier(NSString *identifier);
 static NSScreen *mac_preferred_screen(NSWindow *window);
 static NSString *mac_display_title(NSScreen *screen, NSInteger screenIndex);
+static NSScreen *mac_screen_for_virtual_desktop(NSDictionary *desktop);
+static NSScreen *mac_screen_for_frame(NSRect frame);
+static NSString *mac_virtual_desktop_title(NSDictionary *desktop, NSUInteger displayCount);
 static DISPLAY_CONTROL_MONITOR_LAYOUT mac_display_layout_for_screen(NSScreen *screen,
 	                                                               BOOL useVisibleFrame,
 	                                                               mfContext *mfc);
@@ -160,8 +164,8 @@ static void mac_apply_startup_background(NSWindow *targetWindow, BOOL connected)
 static BOOL mac_parse_hex_color_text(NSString *text, uint32_t *color);
 static BOOL mac_parse_chroma_key_text(NSString *text, uint32_t *color, float *tolerance);
 static BOOL mac_parse_hex_alpha_list(NSString *text, uint32_t *colors, UINT32 *transparencies,
-                                     UINT32 *tolerances, BOOL *blur, size_t capacity,
-                                     size_t *count);
+                                     UINT32 *tolerances, BOOL *blur, UINT32 defaultTolerance,
+                                     size_t capacity, size_t *count);
 static NSString *mac_hex_alpha_list_string(const mfContext *mfc);
 static NSArray *mac_hex_color_number_array(const mfContext *mfc);
 static NSArray *mac_transparency_number_array(const mfContext *mfc);
@@ -881,8 +885,8 @@ static BOOL mac_parse_chroma_key_text(NSString *text, uint32_t *color, float *to
 }
 
 static BOOL mac_parse_hex_alpha_list(NSString *text, uint32_t *colors, UINT32 *transparencies,
-                                     UINT32 *tolerances, BOOL *blur, size_t capacity,
-                                     size_t *count)
+                                     UINT32 *tolerances, BOOL *blur, UINT32 defaultTolerance,
+                                     size_t capacity, size_t *count)
 {
 	NSCharacterSet *separators = [NSCharacterSet characterSetWithCharactersInString:@",;\r\n"];
 	NSArray *parts = [text componentsSeparatedByCharactersInSet:separators];
@@ -899,7 +903,18 @@ static BOOL mac_parse_hex_alpha_list(NSString *text, uint32_t *colors, UINT32 *t
 
 		NSRange equalsRange = [trimmed rangeOfString:@"="];
 		if (equalsRange.location == NSNotFound)
-			return FALSE;
+		{
+			float parsedTolerance = (float)MIN(defaultTolerance, 255);
+			if (!mac_parse_chroma_key_text(trimmed, &colors[parsedCount], &parsedTolerance))
+				return FALSE;
+
+			transparencies[parsedCount] = 100;
+			tolerances[parsedCount] =
+			    (UINT32)lrintf(fminf(fmaxf(parsedTolerance, 0.0f), 255.0f));
+			blur[parsedCount] = FALSE;
+			parsedCount++;
+			continue;
+		}
 
 		NSString *colorText = [trimmed substringToIndex:equalsRange.location];
 		NSString *valuesText = [trimmed substringFromIndex:equalsRange.location + 1];
@@ -1121,6 +1136,11 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	NSTextField *passwordAccountsPlainPasswordField;
 	NSTextField *passwordAccountsHelpLabel;
 	NSDictionary *passwordAccountsSelectedAccount;
+	NSNumber *assignedVirtualDesktopID;
+	NSDictionary *virtualDesktopAssignments;
+	NSString *requestedVirtualDesktopSpec;
+	BOOL virtualDesktopVisibleOnAllSpaces;
+	BOOL virtualDesktopRequestApplied;
 }
 - (void)ensureClientWindow;
 - (void)startLeftEdgeFocusMonitor;
@@ -1196,6 +1216,25 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 - (void)showAboutPanel:(id)sender;
 - (void)switchMonitorFromMenuItem:(NSMenuItem *)menuItem;
 - (void)moveSessionToScreen:(NSScreen *)screen screenIndex:(NSInteger)screenIndex;
+- (void)moveSessionToCurrentVirtualDesktopFromMenuItem:(NSMenuItem *)menuItem;
+- (void)toggleSessionOnAllVirtualDesktopsFromMenuItem:(NSMenuItem *)menuItem;
+- (void)switchVirtualDesktopFromMenuItem:(NSMenuItem *)menuItem;
+- (void)moveSessionToCurrentVirtualDesktop;
+- (void)setSessionVisibleOnAllVirtualDesktops:(BOOL)visibleOnAll;
+- (void)moveSessionToVirtualDesktopID:(NSNumber *)spaceID;
+- (NSArray *)sessionWindows;
+- (BOOL)sessionUsesNativeFullscreen;
+- (NSNumber *)currentVirtualDesktopID;
+- (BOOL)hasVirtualDesktopAssignment;
+- (BOOL)canRaiseSessionWindow:(NSWindow *)sessionWindow;
+- (NSScreen *)screenForSessionWindow:(NSWindow *)sessionWindow;
+- (NSNumber *)virtualDesktopForSessionWindow:(NSWindow *)sessionWindow;
+- (BOOL)assignSessionWindowsToVirtualDesktop:(NSNumber *)targetSpaceID;
+- (void)enforceVirtualDesktopAssignment;
+- (void)clearVirtualDesktopAssignment;
+- (void)applyVirtualDesktopPolicyToWindow:(NSWindow *)targetWindow;
+- (NSDictionary *)virtualDesktopForSpecification:(NSString *)specification;
+- (void)applyRequestedVirtualDesktop;
 - (BOOL)requestRemoteResizeForScreen:(NSScreen *)screen;
 - (BOOL)requestRemoteResizeForWindowContent;
 - (NSString *)credentialTarget;
@@ -1249,6 +1288,9 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	[taskbarSliceViews release];
 	[passwordAccountsEditorTarget release];
 	[passwordAccountsSelectedAccount release];
+	[assignedVirtualDesktopID release];
+	[virtualDesktopAssignments release];
+	[requestedVirtualDesktopSpec release];
 	[super dealloc];
 }
 
@@ -1296,9 +1338,12 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	}
 
 	window = newWindow;
+	[self applyVirtualDesktopPolicyToWindow:window];
 
 	if (wasVisible)
 		[window orderFront:self];
+
+	[self enforceVirtualDesktopAssignment];
 }
 
 - (void)applyWindowDecorationsFromSettings
@@ -1598,6 +1643,10 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	if (!window)
 		return;
 
+	/* Activating would drag the user back to the session's desktop, or the session to theirs. */
+	if (![self canRaiseSessionWindow:window])
+		return;
+
 	const BOOL connected = !mrdpView || [mrdpView is_connected];
 
 	[NSApp activateIgnoringOtherApps:YES];
@@ -1626,17 +1675,19 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 
 - (void)raiseSessionWindowsForTaskbarClick
 {
-	if (window && [window isVisible])
+	if (window && [window isVisible] && [self canRaiseSessionWindow:window])
 		[window orderFront:self];
 
 	if (monitorWindows)
 	{
 		for (NSWindow *monitorWindow in monitorWindows)
 		{
-			if ([monitorWindow isVisible])
+			if ([monitorWindow isVisible] && [self canRaiseSessionWindow:monitorWindow])
 				[monitorWindow orderFront:self];
 		}
 	}
+
+	[self enforceVirtualDesktopAssignment];
 }
 
 - (void)closeMultimonWindows
@@ -1838,6 +1889,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 			[monitorWindow setBackgroundColor:[NSColor clearColor]];
 			[monitorWindows addObject:monitorWindow];
 			[monitorSliceViews addObject:sliceView];
+			[self applyVirtualDesktopPolicyToWindow:monitorWindow];
 		}
 
 		[sliceView setAppliesSmartSizing:taskbarHide];
@@ -1853,8 +1905,11 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		                                                             [slice objectForKey:@"screen"],
 		                                                             decorated)
 		                display:YES];
-		[monitorWindow orderFront:self];
+		if ([self canRaiseSessionWindow:monitorWindow])
+			[monitorWindow orderFront:self];
 	}
+
+	[self enforceVirtualDesktopAssignment];
 }
 
 - (void)syncTaskbarHideWindows
@@ -1978,6 +2033,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 			[taskbarWindow setLevel:taskbarWindowLevel];
 			[taskbarWindows addObject:taskbarWindow];
 			[taskbarSliceViews addObject:sliceView];
+			[self applyVirtualDesktopPolicyToWindow:taskbarWindow];
 		}
 
 		[taskbarWindow setStyleMask:NSWindowStyleMaskBorderless];
@@ -2001,7 +2057,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		    taskbarWasVisible
 		        ? mouseInsideTaskbar
 		        : mac_taskbar_mouse_should_reveal(mouse, taskbarFrame, taskbarPosition);
-		if (shouldReveal)
+		if (shouldReveal && [self canRaiseSessionWindow:taskbarWindow])
 		{
 			[taskbarWindow orderFrontRegardless];
 		}
@@ -2010,6 +2066,8 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 			[taskbarWindow orderOut:self];
 		}
 	}
+
+	[self enforceVirtualDesktopAssignment];
 }
 
 - (void)closeTaskbarHideWindows
@@ -2434,6 +2492,22 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		NSScreen *screen = mac_screen_for_index([screenIndex integerValue]);
 		[self moveSessionToScreen:screen screenIndex:[screenIndex integerValue]];
 	}
+	else if ([command isEqualToString:@"desktopCurrent"])
+	{
+		[self moveSessionToCurrentVirtualDesktop];
+	}
+	else if ([command isEqualToString:@"desktopAll"])
+	{
+		NSNumber *visibleOnAll = [info objectForKey:@"value"];
+		if (visibleOnAll)
+			[self setSessionVisibleOnAllVirtualDesktops:[visibleOnAll boolValue]];
+	}
+	else if ([command isEqualToString:@"desktop"])
+	{
+		NSNumber *spaceID = [info objectForKey:@"value"];
+		if (spaceID)
+			[self moveSessionToVirtualDesktopID:spaceID];
+	}
 	else if ([command isEqualToString:@"spacerPosition"])
 	{
 		NSNumber *position = [info objectForKey:@"value"];
@@ -2595,11 +2669,15 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 - (NSDictionary *)statusSessionInfo
 {
 	mfContext *mfc = (mfContext *)context;
+	NSNumber *spaceID = [self currentVirtualDesktopID] ?: @0;
 
 	return [NSDictionary dictionaryWithObjectsAndKeys:
 	                         [self localStatusSessionPID], @"pid",
 	                         [self sessionMenuTitle], @"title",
 	                         @([self currentScreenIndex]), @"currentScreen",
+	                         spaceID, @"virtualDesktopSpaceID",
+	                         @(virtualDesktopVisibleOnAllSpaces), @"virtualDesktopVisibleOnAll",
+	                         @([self sessionUsesNativeFullscreen]), @"nativeFullscreen",
 	                         @(mfc ? mfc->spacerPosition : 0), @"spacerPosition",
 	                         @(mfc ? mfc->spacerEnabled : NO), @"spacerEnabled",
 	                         @(mfc ? mfc->taskbarHidePosition : 1), @"taskbarHidePosition",
@@ -2772,6 +2850,113 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 
 	if ([screens count] > 0)
 		[menu addItem:[NSMenuItem separatorItem]];
+
+	BOOL visibleOnAll = localSession ? virtualDesktopVisibleOnAllSpaces
+	                                : [[session objectForKey:@"virtualDesktopVisibleOnAll"] boolValue];
+	BOOL nativeFullscreen = localSession ? [self sessionUsesNativeFullscreen]
+	                                    : [[session objectForKey:@"nativeFullscreen"] boolValue];
+	NSNumber *currentSpaceID = localSession ? [self currentVirtualDesktopID]
+	                                        : [session objectForKey:@"virtualDesktopSpaceID"];
+	NSArray *virtualDesktops = mac_virtual_desktops();
+	NSMutableSet *managedDisplays = [NSMutableSet set];
+	for (NSDictionary *desktop in virtualDesktops)
+		[managedDisplays addObject:[desktop objectForKey:MRDPVirtualDesktopDisplayIdentifierKey] ?: @""];
+
+	NSMenuItem *virtualDesktopItem =
+	    [[[NSMenuItem alloc] initWithTitle:@"Virtual Desktop"
+	                               action:nil
+	                        keyEquivalent:@""] autorelease];
+	NSMenu *virtualDesktopMenu = [[[NSMenu alloc] initWithTitle:@"Virtual Desktop"] autorelease];
+	/* Automatic validation would re-enable the items we grey out for native fullscreen. */
+	[virtualDesktopMenu setAutoenablesItems:NO];
+	NSMenuItem *moveHereItem =
+	    [[[NSMenuItem alloc] initWithTitle:@"Move to This Desktop"
+	                               action:(localSession
+	                                           ? @selector(moveSessionToCurrentVirtualDesktopFromMenuItem:)
+	                                           : @selector(remoteStatusCommandFromMenuItem:))
+	                        keyEquivalent:@""] autorelease];
+	[moveHereItem setTarget:self];
+	[moveHereItem setEnabled:!nativeFullscreen];
+	if (!localSession)
+		[moveHereItem setRepresentedObject:[NSDictionary dictionaryWithObjectsAndKeys:
+		                                                session, @"session", @"desktopCurrent",
+		                                                @"command", nil]];
+	[virtualDesktopMenu addItem:moveHereItem];
+
+	NSMenuItem *allDesktopsItem =
+	    [[[NSMenuItem alloc] initWithTitle:@"Show on All Desktops"
+	                               action:(localSession
+	                                           ? @selector(toggleSessionOnAllVirtualDesktopsFromMenuItem:)
+	                                           : @selector(remoteStatusCommandFromMenuItem:))
+	                        keyEquivalent:@""] autorelease];
+	[allDesktopsItem setTarget:self];
+	[allDesktopsItem setEnabled:!nativeFullscreen];
+	[allDesktopsItem setState:visibleOnAll ? NSControlStateValueOn : NSControlStateValueOff];
+	if (!localSession)
+		[allDesktopsItem setRepresentedObject:[NSDictionary dictionaryWithObjectsAndKeys:
+		                                                   session, @"session", @"desktopAll",
+		                                                   @"command", @(!visibleOnAll), @"value", nil]];
+	[virtualDesktopMenu addItem:allDesktopsItem];
+
+	if ([virtualDesktops count] > 0 && mac_virtual_desktop_assignment_available())
+	{
+		[virtualDesktopMenu addItem:[NSMenuItem separatorItem]];
+		for (NSDictionary *desktop in virtualDesktops)
+		{
+			NSNumber *spaceID = [desktop objectForKey:MRDPVirtualDesktopIDKey];
+			NSMenuItem *desktopItem =
+			    [[[NSMenuItem alloc]
+			        initWithTitle:mac_virtual_desktop_title(desktop, [managedDisplays count])
+			                action:(localSession ? @selector(switchVirtualDesktopFromMenuItem:)
+			                                     : @selector(remoteStatusCommandFromMenuItem:))
+			         keyEquivalent:@""] autorelease];
+			[desktopItem setTarget:self];
+			[desktopItem setEnabled:!nativeFullscreen];
+			[desktopItem setRepresentedObject:
+			                 localSession ? (id)spaceID
+			                              : (id)[NSDictionary dictionaryWithObjectsAndKeys:
+			                                                     session, @"session", @"desktop",
+			                                                     @"command", spaceID, @"value", nil]];
+			[desktopItem setState:(!visibleOnAll && [spaceID isEqualToNumber:currentSpaceID])
+			                            ? NSControlStateValueOn
+			                            : NSControlStateValueOff];
+			[virtualDesktopMenu addItem:desktopItem];
+		}
+	}
+	else if ([virtualDesktops count] > 0)
+	{
+		[virtualDesktopMenu addItem:[NSMenuItem separatorItem]];
+		if (!visibleOnAll && currentSpaceID)
+		{
+			for (NSDictionary *desktop in virtualDesktops)
+			{
+				if (![[desktop objectForKey:MRDPVirtualDesktopIDKey]
+				        isEqualToNumber:currentSpaceID])
+					continue;
+				NSString *assignedTitle = [NSString
+				    stringWithFormat:@"Assigned: %@",
+				                     mac_virtual_desktop_title(desktop, [managedDisplays count])];
+				NSMenuItem *assignedItem = [[[NSMenuItem alloc] initWithTitle:assignedTitle
+				                                                        action:nil
+				                                                 keyEquivalent:@""] autorelease];
+				[assignedItem setEnabled:NO];
+				[virtualDesktopMenu addItem:assignedItem];
+				break;
+			}
+		}
+		NSString *fallbackTitle = nativeFullscreen
+		                              ? @"Native fullscreen already uses a dedicated Desktop"
+		                              : @"Switch desktops, then use Move to This Desktop";
+		NSMenuItem *fallbackItem =
+		    [[[NSMenuItem alloc] initWithTitle:fallbackTitle
+		                               action:nil
+		                        keyEquivalent:@""] autorelease];
+		[fallbackItem setEnabled:NO];
+		[virtualDesktopMenu addItem:fallbackItem];
+	}
+	[virtualDesktopItem setSubmenu:virtualDesktopMenu];
+	[menu addItem:virtualDesktopItem];
+	[menu addItem:[NSMenuItem separatorItem]];
 
 	mfContext *mfc = (mfContext *)context;
 	NSInteger spacerPosition = localSession ? (mfc ? (NSInteger)mfc->spacerPosition : 0)
@@ -3162,7 +3347,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	[accessoryView addSubview:additionalInput];
 
 	NSTextField *hintLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(130, 30, 230, 18)];
-	[hintLabel setStringValue:@"Use #RRGGBB=alpha:tolerance:blur"];
+	[hintLabel setStringValue:@"Bare #RRGGBB = full chromakey"];
 	[hintLabel setFont:[NSFont systemFontOfSize:[NSFont smallSystemFontSize]]];
 	[hintLabel setTextColor:[NSColor secondaryLabelColor]];
 	[hintLabel setEditable:NO];
@@ -3203,7 +3388,7 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 		BOOL validAdditionalColors =
 		    mac_parse_hex_alpha_list([additionalInput stringValue], additionalColors,
 		                             additionalTransparencies, additionalTolerances,
-		                             additionalBlur,
+		                             additionalBlur, (UINT32)lrintf(chromaTolerance),
 		                             sizeof(additionalColors) / sizeof(additionalColors[0]),
 		                             &additionalColorCount);
 
@@ -3277,6 +3462,14 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 			if (mrdpView)
 				[mrdpView setNeedsDisplay:YES];
 			NSBeep();
+			NSAlert *validationAlert = [[NSAlert alloc] init];
+			[validationAlert setMessageText:@"Invalid chroma key settings"];
+			[validationAlert
+			    setInformativeText:@"Use #RRGGBB or #RRGGBB:tolerance for a fully transparent "
+			                       @"extra color. Advanced entries use "
+			                       @"#RRGGBB=transparency:tolerance:blur."];
+			[validationAlert runModal];
+			[validationAlert release];
 		}
 	}
 	else
@@ -3910,6 +4103,403 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	NSScreen *screen = mac_screen_for_index(screenIndex);
 
 	[self moveSessionToScreen:screen screenIndex:screenIndex];
+}
+
+- (void)moveSessionToCurrentVirtualDesktopFromMenuItem:(NSMenuItem *)menuItem
+{
+	(void)menuItem;
+	[self moveSessionToCurrentVirtualDesktop];
+}
+
+- (void)toggleSessionOnAllVirtualDesktopsFromMenuItem:(NSMenuItem *)menuItem
+{
+	(void)menuItem;
+	[self setSessionVisibleOnAllVirtualDesktops:!virtualDesktopVisibleOnAllSpaces];
+}
+
+- (void)switchVirtualDesktopFromMenuItem:(NSMenuItem *)menuItem
+{
+	NSNumber *spaceID = [menuItem representedObject];
+	if ([spaceID isKindOfClass:[NSNumber class]])
+		[self moveSessionToVirtualDesktopID:spaceID];
+}
+
+- (NSArray *)sessionWindows
+{
+	NSMutableArray *windows = [NSMutableArray array];
+	if (window)
+		[windows addObject:window];
+	NSWindow *viewWindow = [mrdpView window];
+	if (viewWindow && ![windows containsObject:viewWindow])
+		[windows addObject:viewWindow];
+	for (NSWindow *candidate in monitorWindows)
+	{
+		if (candidate && ![windows containsObject:candidate])
+			[windows addObject:candidate];
+	}
+	for (NSWindow *candidate in taskbarWindows)
+	{
+		if (candidate && ![windows containsObject:candidate])
+			[windows addObject:candidate];
+	}
+	return windows;
+}
+
+- (BOOL)sessionUsesNativeFullscreen
+{
+	if (!context || !context->settings || !mrdpView)
+		return NO;
+
+	mfContext *mfc = (mfContext *)context;
+	return freerdp_settings_get_bool(context->settings, FreeRDP_Fullscreen) &&
+	       (mfc->fullscreen_mode != 2) && [mrdpView isInFullScreenMode];
+}
+
+- (NSNumber *)currentVirtualDesktopID
+{
+	if (virtualDesktopVisibleOnAllSpaces)
+		return nil;
+
+	if (assignedVirtualDesktopID)
+		return assignedVirtualDesktopID;
+
+	NSWindow *desktopWindow = [mrdpView window] ?: window;
+	return mac_virtual_desktop_for_window(desktopWindow);
+}
+
+- (BOOL)hasVirtualDesktopAssignment
+{
+	return !virtualDesktopVisibleOnAllSpaces && ([virtualDesktopAssignments count] > 0);
+}
+
+- (NSScreen *)screenForSessionWindow:(NSWindow *)sessionWindow
+{
+	return [sessionWindow screen] ?: mac_screen_for_frame([sessionWindow frame])
+	                                    ?: [self preferredScreen];
+}
+
+- (NSNumber *)virtualDesktopForSessionWindow:(NSWindow *)sessionWindow
+{
+	if (![self hasVirtualDesktopAssignment])
+		return nil;
+
+	NSString *display =
+	    mac_virtual_desktop_display_identifier([self screenForSessionWindow:sessionWindow]);
+	return display ? [virtualDesktopAssignments objectForKey:display] : nil;
+}
+
+/*
+ * orderFront:/orderFrontRegardless: drag a window onto the Space the user is looking at, so every
+ * raise has to be suppressed while the session's desktop is hidden. Without this the taskbar
+ * overlay (re-ordered every 100 ms) and the multimon windows leak onto every desktop.
+ */
+- (BOOL)canRaiseSessionWindow:(NSWindow *)sessionWindow
+{
+	if (!sessionWindow)
+		return NO;
+	if (![self hasVirtualDesktopAssignment])
+		return YES;
+
+	NSNumber *spaceID = [self virtualDesktopForSessionWindow:sessionWindow];
+	return !spaceID || mac_virtual_desktop_is_current(spaceID);
+}
+
+/*
+ * Groups the session windows by display and moves each group onto targetSpaceID when the display
+ * owns that Space, or onto the Space that display is currently showing otherwise. macOS keeps a
+ * separate Space list per display, so a single identifier cannot cover a multimon session.
+ */
+- (BOOL)assignSessionWindowsToVirtualDesktop:(NSNumber *)targetSpaceID
+{
+	NSString *targetDisplay =
+	    targetSpaceID ? mac_virtual_desktop_display_for_space(targetSpaceID) : nil;
+	NSMutableDictionary *assignments = [NSMutableDictionary dictionary];
+	NSMutableDictionary *groups = [NSMutableDictionary dictionary];
+
+	for (NSWindow *sessionWindow in [self sessionWindows])
+	{
+		NSScreen *screen = [self screenForSessionWindow:sessionWindow];
+		NSString *display = mac_virtual_desktop_display_identifier(screen);
+		if (!display)
+			continue;
+
+		NSNumber *spaceID = [assignments objectForKey:display];
+		if (!spaceID)
+		{
+			if (targetSpaceID &&
+			    (!targetDisplay ||
+			     ([targetDisplay caseInsensitiveCompare:display] == NSOrderedSame)))
+				spaceID = targetSpaceID;
+			else
+				spaceID = mac_current_virtual_desktop_for_screen(screen);
+		}
+		if (!spaceID)
+			continue;
+
+		[assignments setObject:spaceID forKey:display];
+		NSMutableArray *group = [groups objectForKey:spaceID];
+		if (!group)
+		{
+			group = [NSMutableArray array];
+			[groups setObject:group forKey:spaceID];
+		}
+		[group addObject:sessionWindow];
+	}
+
+	BOOL moved = NO;
+	for (NSNumber *spaceID in groups)
+	{
+		if (mac_move_windows_to_virtual_desktop([groups objectForKey:spaceID], spaceID))
+			moved = YES;
+	}
+
+	if (!moved)
+		return NO;
+
+	virtualDesktopVisibleOnAllSpaces = NO;
+	[virtualDesktopAssignments release];
+	virtualDesktopAssignments = [assignments copy];
+
+	NSWindow *primaryWindow = [mrdpView window] ?: window;
+	NSNumber *primarySpaceID = [self virtualDesktopForSessionWindow:primaryWindow];
+	[assignedVirtualDesktopID release];
+	assignedVirtualDesktopID = [(primarySpaceID ?: targetSpaceID) retain];
+	return YES;
+}
+
+- (void)enforceVirtualDesktopAssignment
+{
+	if (![self hasVirtualDesktopAssignment])
+		return;
+
+	NSMutableDictionary *groups = [NSMutableDictionary dictionary];
+	for (NSWindow *sessionWindow in [self sessionWindows])
+	{
+		NSNumber *spaceID = [self virtualDesktopForSessionWindow:sessionWindow];
+		if (!spaceID)
+			continue;
+
+		NSMutableArray *group = [groups objectForKey:spaceID];
+		if (!group)
+		{
+			group = [NSMutableArray array];
+			[groups setObject:group forKey:spaceID];
+		}
+		[group addObject:sessionWindow];
+	}
+
+	for (NSNumber *spaceID in groups)
+	{
+		NSArray *drifted =
+		    mac_windows_not_on_virtual_desktop([groups objectForKey:spaceID], spaceID);
+		if ([drifted count] > 0)
+			(void)mac_move_windows_to_virtual_desktop(drifted, spaceID);
+	}
+}
+
+- (void)clearVirtualDesktopAssignment
+{
+	[assignedVirtualDesktopID release];
+	assignedVirtualDesktopID = nil;
+	[virtualDesktopAssignments release];
+	virtualDesktopAssignments = nil;
+}
+
+- (void)applyVirtualDesktopPolicyToWindow:(NSWindow *)targetWindow
+{
+	if (!targetWindow)
+		return;
+
+	if (virtualDesktopVisibleOnAllSpaces)
+	{
+		mac_set_windows_visible_on_all_virtual_desktops(@[ targetWindow ], YES);
+		return;
+	}
+
+	NSNumber *spaceID = [self virtualDesktopForSessionWindow:targetWindow];
+	if (!spaceID)
+	{
+		/* A window created on a display the session has not covered yet still needs a Space. */
+		NSScreen *screen = [self screenForSessionWindow:targetWindow];
+		NSString *display = mac_virtual_desktop_display_identifier(screen);
+		if (![self hasVirtualDesktopAssignment] || !display)
+			return;
+
+		spaceID = mac_current_virtual_desktop_for_screen(screen);
+		if (!spaceID)
+			return;
+
+		NSMutableDictionary *assignments =
+		    [NSMutableDictionary dictionaryWithDictionary:virtualDesktopAssignments];
+		[assignments setObject:spaceID forKey:display];
+		[virtualDesktopAssignments release];
+		virtualDesktopAssignments = [assignments copy];
+	}
+
+	(void)mac_move_windows_to_virtual_desktop(@[ targetWindow ], spaceID);
+}
+
+- (void)moveSessionToCurrentVirtualDesktop
+{
+	if ([self sessionUsesNativeFullscreen])
+	{
+		NSLog(@"Native fullscreen already owns a dedicated virtual desktop; exit fullscreen "
+		       @"before reassigning the session");
+		NSBeep();
+		return;
+	}
+
+	virtualDesktopVisibleOnAllSpaces = NO;
+	[self clearVirtualDesktopAssignment];
+
+	/* Passing nil pins every window to whatever Space its own display is showing right now. */
+	if ([self assignSessionWindowsToVirtualDesktop:nil])
+	{
+		[self focusClientWindow];
+		[self broadcastStatusSessionUpdate];
+		return;
+	}
+
+	/* No Spaces API: fall back to the public MoveToActiveSpace behavior. */
+	mac_move_windows_to_current_virtual_desktop([self sessionWindows]);
+	/* Focus while MoveToActiveSpace is still installed; taskbar-hide refreshes every 100 ms. */
+	[self focusClientWindow];
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+	               dispatch_get_main_queue(), ^{
+		               NSWindow *desktopWindow = [mrdpView window] ?: window;
+		               NSNumber *spaceID = mac_virtual_desktop_for_window(desktopWindow);
+		               if (spaceID)
+		               {
+			               [assignedVirtualDesktopID release];
+			               assignedVirtualDesktopID = [spaceID retain];
+		               }
+		               [self broadcastStatusSessionUpdate];
+	               });
+}
+
+- (void)setSessionVisibleOnAllVirtualDesktops:(BOOL)visibleOnAll
+{
+	if ([self sessionUsesNativeFullscreen])
+	{
+		NSLog(@"Native fullscreen already owns a dedicated virtual desktop; exit fullscreen "
+		       @"before changing desktop visibility");
+		NSBeep();
+		return;
+	}
+
+	virtualDesktopVisibleOnAllSpaces = visibleOnAll;
+	[self clearVirtualDesktopAssignment];
+
+	mac_set_windows_visible_on_all_virtual_desktops([self sessionWindows], visibleOnAll);
+	if (!visibleOnAll)
+	{
+		[self moveSessionToCurrentVirtualDesktop];
+		return;
+	}
+
+	[self focusClientWindow];
+	[self broadcastStatusSessionUpdate];
+}
+
+- (void)moveSessionToVirtualDesktopID:(NSNumber *)spaceID
+{
+	if (![spaceID isKindOfClass:[NSNumber class]] || ([spaceID unsignedLongLongValue] == 0))
+		return;
+	if ([self sessionUsesNativeFullscreen])
+	{
+		NSLog(@"Native fullscreen already owns a dedicated virtual desktop; exit fullscreen "
+		       @"before reassigning the session");
+		NSBeep();
+		return;
+	}
+
+	virtualDesktopVisibleOnAllSpaces = NO;
+	[self clearVirtualDesktopAssignment];
+
+	if (![self assignSessionWindowsToVirtualDesktop:spaceID])
+	{
+		NSLog(@"Unable to move the remote session to virtual desktop %@", spaceID);
+		NSBeep();
+		return;
+	}
+
+	[self broadcastStatusSessionUpdate];
+}
+
+- (NSDictionary *)virtualDesktopForSpecification:(NSString *)specification
+{
+	NSString *trimmed = [[specification
+	    stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]]
+	    lowercaseString];
+	if ([trimmed length] == 0 || [trimmed isEqualToString:@"current"] ||
+	    [trimmed isEqualToString:@"all"])
+		return nil;
+
+	NSArray *parts = [trimmed componentsSeparatedByString:@"."];
+	if ([parts count] > 2)
+		return nil;
+
+	NSCharacterSet *nonDigits = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
+	for (NSString *part in parts)
+	{
+		if ([part length] == 0 || [part rangeOfCharacterFromSet:nonDigits].location != NSNotFound)
+			return nil;
+	}
+
+	NSInteger first = [[parts objectAtIndex:0] integerValue];
+	if (first <= 0)
+		return nil;
+
+	for (NSDictionary *desktop in mac_virtual_desktops())
+	{
+		if ([parts count] == 1 &&
+		    [[desktop objectForKey:MRDPVirtualDesktopGlobalIndexKey] integerValue] == first)
+			return desktop;
+
+		if ([parts count] == 2)
+		{
+			NSInteger desktopIndex = [[parts objectAtIndex:1] integerValue];
+			NSInteger displayIndex =
+			    [[desktop objectForKey:MRDPVirtualDesktopDisplayIndexKey] integerValue] + 1;
+			if (first == displayIndex &&
+			    desktopIndex == [[desktop objectForKey:MRDPVirtualDesktopIndexKey] integerValue])
+				return desktop;
+		}
+	}
+
+	return nil;
+}
+
+- (void)applyRequestedVirtualDesktop
+{
+	if (virtualDesktopRequestApplied || [requestedVirtualDesktopSpec length] == 0)
+		return;
+
+	virtualDesktopRequestApplied = YES;
+	NSString *specification = [requestedVirtualDesktopSpec lowercaseString];
+	if ([specification isEqualToString:@"current"])
+	{
+		[self moveSessionToCurrentVirtualDesktop];
+		return;
+	}
+	if ([specification isEqualToString:@"all"])
+	{
+		[self setSessionVisibleOnAllVirtualDesktops:YES];
+		return;
+	}
+
+	NSDictionary *desktop = [self virtualDesktopForSpecification:specification];
+	NSNumber *spaceID = [desktop objectForKey:MRDPVirtualDesktopIDKey];
+	if (!spaceID || !mac_virtual_desktop_assignment_available())
+	{
+		(void)fprintf(stderr,
+		              "macfreerdp: virtual desktop '%s' is not available; keeping the current "
+		              "desktop\n",
+		              [requestedVirtualDesktopSpec UTF8String]);
+		return;
+	}
+
+	[self moveSessionToVirtualDesktopID:spaceID];
 }
 
 - (void)moveSessionToScreen:(NSScreen *)screen screenIndex:(NSInteger)screenIndex
@@ -4659,7 +5249,31 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	float chromaToleranceOverride = mfc->chromaKeyTolerance;
 	for (int j = 1; j < i; j++)
 	{
-		if (strcmp(context->argv[j], "--chroma-key") == 0 && j + 1 < i)
+		const char *desktopValue = NULL;
+		if ((strcmp(context->argv[j], "--desktop") == 0 ||
+		     strcmp(context->argv[j], "-desktop") == 0) &&
+		    j + 1 < i)
+		{
+			desktopValue = context->argv[++j];
+		}
+		else if (strncmp(context->argv[j], "/desktop:", 9) == 0 ||
+		         strncmp(context->argv[j], "-desktop:", 9) == 0)
+		{
+			desktopValue = context->argv[j] + 9;
+		}
+		else if (strncmp(context->argv[j], "--desktop:", 10) == 0 ||
+		         strncmp(context->argv[j], "--desktop=", 10) == 0)
+		{
+			desktopValue = context->argv[j] + 10;
+		}
+
+		if (desktopValue)
+		{
+			NSString *specification = [NSString stringWithUTF8String:desktopValue];
+			[requestedVirtualDesktopSpec release];
+			requestedVirtualDesktopSpec = [specification copy];
+		}
+		else if (strcmp(context->argv[j], "--chroma-key") == 0 && j + 1 < i)
 		{
 			hasChromaKeyOverride = TRUE;
 			j++;
@@ -4728,6 +5342,22 @@ static void mac_set_modifier_keyswap_filter(mfContext *mfc, NSString *filter)
 	                                                    context->argv, FALSE);
 	freerdp_client_settings_command_line_status_print(context->settings, status, context->argc,
 	                                                  context->argv);
+	if (status == COMMAND_LINE_STATUS_PRINT_HELP)
+	{
+		(void)fprintf(stdout,
+		              "\nMac virtual desktop options:\n"
+		              "    --desktop <current|all|n|display.desktop>\n"
+		              "                                      Pin the session to the current macOS "
+		              "desktop, to all\n"
+		              "                                      desktops, to the 1-based desktop n, or "
+		              "to desktop\n"
+		              "                                      <desktop> of display <display>. "
+		              "/desktop:<value>\n"
+		              "                                      is also accepted. The same choices are "
+		              "in the\n"
+		              "                                      Virtual Desktop submenu of the "
+		              "MacFreeRDP status menu.\n");
+	}
 
 	if (status == 0)
 	{
@@ -4964,6 +5594,7 @@ void AppDelegate_ConnectionResultEventHandler(void *ctx, const ConnectionResultE
 					if (!mac_multimon_enabled(context->settings))
 						[_singleDelegate moveSessionToScreen:screen screenIndex:screenIndex];
 					[_singleDelegate syncMultimonWindows];
+					[_singleDelegate applyRequestedVirtualDesktop];
 					[_singleDelegate focusClientWindow];
 				}
 			});
@@ -5852,6 +6483,65 @@ static NSScreen *mac_preferred_screen(NSWindow *window)
 		return [window screen];
 
 	return mac_screen_for_index(NSNotFound);
+}
+
+/* -[NSWindow screen] is nil until the window is ordered in, so fall back to geometry. */
+static NSScreen *mac_screen_for_frame(NSRect frame)
+{
+	NSScreen *best = nil;
+	CGFloat bestArea = 0.0;
+
+	for (NSScreen *screen in [NSScreen screens])
+	{
+		NSRect intersection = NSIntersectionRect(frame, [screen frame]);
+		const CGFloat area = NSWidth(intersection) * NSHeight(intersection);
+		if (area > bestArea)
+		{
+			bestArea = area;
+			best = screen;
+		}
+	}
+	return best;
+}
+
+static NSScreen *mac_screen_for_virtual_desktop(NSDictionary *desktop)
+{
+	NSString *identifier = [desktop objectForKey:MRDPVirtualDesktopDisplayIdentifierKey];
+	if ([identifier length] > 0 &&
+	    [identifier caseInsensitiveCompare:@"Main"] == NSOrderedSame)
+		return [NSScreen mainScreen];
+
+	for (NSScreen *screen in [NSScreen screens])
+	{
+		NSString *screenIdentifier = mac_virtual_desktop_display_identifier(screen);
+		if (screenIdentifier &&
+		    ([screenIdentifier caseInsensitiveCompare:identifier] == NSOrderedSame))
+			return screen;
+	}
+
+	NSInteger displayIndex =
+	    [[desktop objectForKey:MRDPVirtualDesktopDisplayIndexKey] integerValue];
+	NSArray *screens = [NSScreen screens];
+	if (displayIndex >= 0 && displayIndex < (NSInteger)[screens count])
+		return [screens objectAtIndex:(NSUInteger)displayIndex];
+	return nil;
+}
+
+static NSString *mac_virtual_desktop_title(NSDictionary *desktop, NSUInteger displayCount)
+{
+	NSInteger desktopIndex = [[desktop objectForKey:MRDPVirtualDesktopIndexKey] integerValue];
+	NSMutableString *title =
+	    [NSMutableString stringWithFormat:@"Desktop %ld", (long)desktopIndex];
+	if (displayCount > 1)
+	{
+		NSScreen *screen = mac_screen_for_virtual_desktop(desktop);
+		NSInteger displayIndex = mac_screen_index_for_screen(screen);
+		if (displayIndex == NSNotFound)
+			displayIndex =
+			    [[desktop objectForKey:MRDPVirtualDesktopDisplayIndexKey] integerValue];
+		[title appendFormat:@" — Display %ld", (long)displayIndex + 1];
+	}
+	return title;
 }
 
 static NSString *mac_display_title(NSScreen *screen, NSInteger screenIndex)

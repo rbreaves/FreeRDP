@@ -34,11 +34,11 @@ set(XIBS)  # XIB files require full Xcode (not CLT)
 
 set(SOURCES "")
 
-set(OBJECTIVE_SOURCES main.m AppDelegate.m)
+set(OBJECTIVE_SOURCES main.m AppDelegate.m MacVirtualDesktop.m)
 
 list(APPEND SOURCES ${OBJECTIVE_SOURCES})
 
-set(HEADERS AppDelegate.h)
+set(HEADERS AppDelegate.h MacVirtualDesktop.h)
 
 set(RESOURCES "en.lproj/InfoPlist.strings" ${MACOSX_BUNDLE_ICON_FILE}
               "../../../resources/freerdp_minimal.svg"
